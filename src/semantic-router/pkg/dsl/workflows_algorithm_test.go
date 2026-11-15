@@ -37,8 +37,7 @@ ROUTE flow_code {
 	if len(cfg.Decisions) != 1 {
 		t.Fatalf("decisions = %d", len(cfg.Decisions))
 	}
-	workflows := cfg.Decisions[0].Algorithm.Workflows
-	assertWorkflowsDynamicConfig(t, workflows)
+	assertWorkflowsDynamicConfig(t, cfg.Decisions[0].Algorithm)
 }
 
 func TestCompileWorkflowsDynamicPlannerDottedField(t *testing.T) {
@@ -59,6 +58,37 @@ ROUTE flow_code {
 	workflows := cfg.Decisions[0].Algorithm.Workflows
 	if workflows == nil || workflows.Planner.Model != "qwen-coordinator" {
 		t.Fatalf("workflows planner = %#v", workflows)
+	}
+}
+
+func TestWorkflowsPlannerCompletionLimitRoundTrips(t *testing.T) {
+	input := `
+ROUTE flow_code {
+  PRIORITY 10
+  MODEL "qwen-coordinator", "deepseek-worker"
+  ALGORITHM workflows {
+    mode: "dynamic"
+    planner: {
+      model: "qwen-coordinator",
+      max_completion_tokens: 2048
+    }
+  }
+}`
+	cfg, errs := Compile(input)
+	if len(errs) > 0 {
+		t.Fatalf("compile errors: %v", errs)
+	}
+	workflows := cfg.Decisions[0].Algorithm.Workflows
+	if workflows == nil || workflows.Planner.MaxCompletionTokens != 2048 {
+		t.Fatalf("planner = %#v", workflows)
+	}
+
+	source, err := DecompileRouting(cfg)
+	if err != nil {
+		t.Fatalf("decompile: %v", err)
+	}
+	if !strings.Contains(source, "max_completion_tokens: 2048") {
+		t.Fatalf("decompiled planner omitted completion limit:\n%s", source)
 	}
 }
 
@@ -111,7 +141,8 @@ func TestDecompileWorkflowsDynamicAlgorithmRoundTrip(t *testing.T) {
 						{Model: "claude-worker"},
 					},
 					Algorithm: &config.AlgorithmConfig{
-						Type: "workflows",
+						Type:    "workflows",
+						OnError: "fail",
 						Workflows: &config.WorkflowsAlgorithmConfig{
 							Mode:                         "dynamic",
 							Template:                     "micro_agent",
@@ -123,7 +154,6 @@ func TestDecompileWorkflowsDynamicAlgorithmRoundTrip(t *testing.T) {
 							MinSuccessfulResponses:       2,
 							Temperature:                  &temperature,
 							IncludeIntermediateResponses: &includeTrace,
-							OnError:                      "fail",
 						},
 					},
 				},
@@ -153,7 +183,7 @@ func TestDecompileWorkflowsDynamicAlgorithmRoundTrip(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("round-trip compile errors: %v\n%s", errs, dslText)
 	}
-	assertWorkflowsDynamicConfig(t, roundTripped.Decisions[0].Algorithm.Workflows)
+	assertWorkflowsDynamicConfig(t, roundTripped.Decisions[0].Algorithm)
 }
 
 func TestDecompileWorkflowsStaticRolesAlgorithmRoundTrip(t *testing.T) {
@@ -211,12 +241,16 @@ func TestDecompileWorkflowsStaticRolesAlgorithmRoundTrip(t *testing.T) {
 	}
 }
 
-func assertWorkflowsDynamicConfig(t *testing.T, workflows *config.WorkflowsAlgorithmConfig) {
+func assertWorkflowsDynamicConfig(t *testing.T, algorithm *config.AlgorithmConfig) {
 	t.Helper()
+	workflows := algorithm.Workflows
 	if workflows == nil {
 		t.Fatal("expected workflows config")
 	}
 	assertWorkflowsDynamicIdentity(t, workflows)
+	if algorithm.OnError != "fail" {
+		t.Fatalf("on_error = %q", algorithm.OnError)
+	}
 	assertWorkflowsDynamicLimits(t, workflows)
 }
 
@@ -246,8 +280,5 @@ func assertWorkflowsDynamicLimits(t *testing.T, workflows *config.WorkflowsAlgor
 	}
 	if workflows.IncludeIntermediateResponses == nil || !*workflows.IncludeIntermediateResponses {
 		t.Fatalf("include_intermediate_responses = %#v", workflows.IncludeIntermediateResponses)
-	}
-	if workflows.OnError != "fail" {
-		t.Fatalf("on_error = %q", workflows.OnError)
 	}
 }

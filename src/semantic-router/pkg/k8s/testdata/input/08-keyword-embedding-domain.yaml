@@ -8,7 +8,8 @@ spec:
   defaultModel: "qwen-2.5-32b"
   models:
     - name: "qwen-2.5-32b"
-      reasoningFamily: "qwen3"
+      reasoning:
+        family: "qwen3"
       pricing:
         inputTokenPrice: 0.000002    # $2 per 1M - balanced for multi-signal routing
         outputTokenPrice: 0.000004   # $4 per 1M
@@ -17,7 +18,8 @@ spec:
           description: "Multi-domain specialist"
 
     - name: "qwen-2.5-72b"
-      reasoningFamily: "qwen3"
+      reasoning:
+        family: "qwen3"
       pricing:
         inputTokenPrice: 0.000003    # $3 per 1M - for complex multi-signal queries
         outputTokenPrice: 0.000006   # $6 per 1M
@@ -38,15 +40,11 @@ spec:
         operator: "OR"
         keywords: ["urgent", "emergency", "critical"]
         caseSensitive: false
-
-    embeddings:
       - name: "technical_help"
-        threshold: 0.75
-        candidates:
-          - "I need technical assistance with this problem"
-          - "Can you help me debug this issue?"
-          - "Something is broken and needs fixing"
-        aggregationMethod: "max"
+        operator: "OR"
+        keywords: ["I need technical assistance with this problem", "Can you help me debug this issue?", "Something is broken and needs fixing"]
+        caseSensitive: false
+
 
     domains:
       - name: "computer science"
@@ -65,7 +63,7 @@ spec:
         conditions:
           - type: "keyword"
             name: "urgent"
-          - type: "embedding"
+          - type: "keyword"
             name: "technical_help"
           - type: "domain"
             name: "computer science"
@@ -80,7 +78,7 @@ spec:
       signals:
         operator: "AND"
         conditions:
-          - type: "embedding"
+          - type: "keyword"
             name: "technical_help"
           - type: "domain"
             name: "engineering"

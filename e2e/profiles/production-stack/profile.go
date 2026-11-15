@@ -14,18 +14,18 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"github.com/vllm-project/semantic-router/e2e/pkg/framework"
 	"github.com/vllm-project/semantic-router/e2e/pkg/helm"
 	"github.com/vllm-project/semantic-router/e2e/pkg/helpers"
 	gatewaystack "github.com/vllm-project/semantic-router/e2e/pkg/stacks/gateway"
 	"github.com/vllm-project/semantic-router/e2e/pkg/testmatrix"
-
 	// Import testcases package to register all test cases via their init() functions
 	_ "github.com/vllm-project/semantic-router/e2e/testcases"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -81,8 +81,12 @@ func NewProfile() *Profile {
 			SemanticRouterSet: map[string]string{
 				"replicaCount": "1",
 			},
-			ResourceManifests: resourceManifests,
-			WaitDeployments:   waitDeployments,
+			// provider-mocker serves the System One and embedding fixtures,
+			// which the Router prepares as it starts.
+			PrerequisiteManifests: []string{"deploy/kubernetes/hallucination/provider-mocker.yaml"},
+			PrerequisiteWaits:     []helpers.DeploymentRef{{Namespace: namespaceDefault, Name: "provider-mocker"}},
+			ResourceManifests:     resourceManifests,
+			WaitDeployments:       waitDeployments,
 		}),
 	}
 }
@@ -156,13 +160,6 @@ func (p *Profile) GetTestCases() []string {
 			"multi-replica-health",
 			"load-balancing-verification",
 			"failover-during-traffic",
-			"performance-throughput",
-			"resource-utilization-monitoring",
-			// Router intelligence layer — all configured in values.yaml
-			"domain-classify",
-			"pii-detection",
-			"jailbreak-detection",
-			"semantic-cache",
 		},
 	)
 }
@@ -214,6 +211,9 @@ func (p *Profile) deployPrometheus(ctx context.Context, opts *framework.SetupOpt
 	if err := p.kubectlApplyWithNamespace(ctx, opts.KubeConfig, namespaceDefault, prometheusDir+"/configmap.yaml"); err != nil {
 		return fmt.Errorf("failed to apply prometheus configmap: %w", err)
 	}
+	if err := p.kubectlApplyWithNamespace(ctx, opts.KubeConfig, namespaceDefault, prometheusDir+"/rules.yaml"); err != nil {
+		return fmt.Errorf("failed to apply prometheus rules: %w", err)
+	}
 
 	updatedConfig, err := os.ReadFile(prometheusConfigFile)
 	if err != nil {
@@ -255,6 +255,7 @@ func (p *Profile) cleanupPrometheus(ctx context.Context, opts *framework.Teardow
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/service.yaml", "-n", namespaceDefault, "--ignore-not-found=true")
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/deployment.yaml", "-n", namespaceDefault, "--ignore-not-found=true")
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/pvc.yaml", "-n", namespaceDefault, "--ignore-not-found=true")
+	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/rules.yaml", "-n", namespaceDefault, "--ignore-not-found=true")
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/configmap.yaml", "-n", namespaceDefault, "--ignore-not-found=true")
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "-f", prometheusDir+"/rbac.yaml", "--ignore-not-found=true")
 	_ = p.kubectl(ctx, opts.KubeConfig, "delete", "serviceaccount", "prometheus", "-n", namespaceDefault, "--ignore-not-found=true")
@@ -532,7 +533,7 @@ func availablePort() (string, error) {
 
 func sendGatewayProbeRequest(ctx context.Context, httpClient *http.Client, baseURL string, requestID int) error {
 	requestBody := map[string]interface{}{
-		"model": "MoM",
+		"model": "vllm-sr/auto",
 		"messages": []map[string]string{
 			{"role": "user", "content": fmt.Sprintf("Warm up the production-stack gateway path. Request %d.", requestID)},
 		},

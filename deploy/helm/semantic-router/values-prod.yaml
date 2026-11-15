@@ -7,7 +7,7 @@ image:
 
 resources:
   limits:
-    memory: "8Gi"
+    memory: "12Gi"
     cpu: "4"
   requests:
     memory: "4Gi"
@@ -42,10 +42,6 @@ readinessProbe:
   initialDelaySeconds: 30
   periodSeconds: 15
   failureThreshold: 3
-
-securityContext:
-  runAsNonRoot: true
-  allowPrivilegeEscalation: false
 
 dependencies:
   observability:

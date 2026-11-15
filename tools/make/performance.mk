@@ -2,7 +2,32 @@
 # =   Performance testing related targets   =
 # ============== performance.mk ==============
 
+PERF_BASE_REF ?= HEAD^
+PERF_MODEL_BASELINE_DIR ?= $(CURDIR)/reports
+PERF_MODEL_BASELINE ?= $(PERF_MODEL_BASELINE_DIR)/model-baseline.json
+# Benchmarks serve the pinned catalog models through the model runtime
+# (make model-runtime-install); the base revision runs its own runtime source.
+perf-%: export PERF_RUNTIME_PYTHON ?= $(AGENT_VENV)/bin/python
+perf-%: export VLLM_SRUN_COMMAND ?= $(PERF_RUNTIME_PYTHON) -m vllm_srun
+
+perf-model-baseline: ## Measure the same pinned models on PERF_BASE_REF
+	@bash perf/scripts/compare-model-baseline.sh \
+		"$(PERF_BASE_REF)" "$(PERF_MODEL_BASELINE_DIR)"
+
+.PHONY: perf-model-baseline
+
 ##@ Performance Testing
+
+perf-test-unit: ## Test benchmark parsing, artifact identity, and regression contracts
+	@$(LOG_TARGET)
+	@cd perf && go test ./pkg/... ./cmd/...
+
+.PHONY: perf-test-unit
+
+perf-test-benchmark-contracts: ## Test benchmark owners and device selection without checkpoint inference
+	@cd perf && go test -count=1 ./benchmarks/...
+
+.PHONY: perf-test-benchmark-contracts
 
 # Create reports directory if it doesn't exist
 .PHONY: ensure-reports-dir
@@ -11,58 +36,75 @@ ensure-reports-dir:
 
 # Run all performance benchmarks
 perf-bench: ## Run all performance benchmarks
-perf-bench: build-router ensure-reports-dir
+perf-bench: ensure-reports-dir
 	@$(LOG_TARGET)
 	@echo "Running performance benchmarks..."
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=. -benchmem -benchtime=10s ./benchmarks/... \
+	@cd perf && go test -run "^$$" -bench=. -benchmem -benchtime=10s ./benchmarks/... \
 	  -cpuprofile=../reports/cpu.prof \
 	  -memprofile=../reports/mem.prof \
 	  -timeout=30m
 
 # Run quick performance benchmarks (shorter benchtime for faster iteration)
 perf-bench-quick: ## Run quick performance benchmarks (3s benchtime)
-perf-bench-quick: build-router ensure-reports-dir
+perf-bench-quick: ensure-reports-dir
 	@$(LOG_TARGET)
 	@echo "Running quick performance benchmarks..."
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=. -benchmem -benchtime=3s ./benchmarks/... \
+	@cd perf && go test -run "^$$" -bench=. -benchmem -benchtime=3s ./benchmarks/... \
 	  -timeout=15m
 
 # Run specific benchmark suite
 perf-bench-classification: ## Run classification benchmarks
-perf-bench-classification: build-router ensure-reports-dir
+perf-bench-classification: ensure-reports-dir
 	@$(LOG_TARGET)
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=BenchmarkClassify.* -benchmem -benchtime=10s ./benchmarks/
+	@cd perf && go test -run "^$$" -bench=BenchmarkClassify.* -benchmem -benchtime=10s ./benchmarks/
 
 perf-bench-decision: ## Run decision engine benchmarks
-perf-bench-decision: build-router ensure-reports-dir
+perf-bench-decision: ensure-reports-dir
 	@$(LOG_TARGET)
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=BenchmarkEvaluate.* -benchmem -benchtime=10s ./benchmarks/
+	@cd perf && go test -run "^$$" -bench=BenchmarkEvaluate.* -benchmem -benchtime=10s ./benchmarks/
 
 perf-bench-cache: ## Run cache benchmarks
-perf-bench-cache: build-router ensure-reports-dir
+perf-bench-cache: ensure-reports-dir
 	@$(LOG_TARGET)
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=BenchmarkCache.* -benchmem -benchtime=10s ./benchmarks/
+	@cd perf && go test -run "^$$" -bench=BenchmarkCache.* -benchmem -benchtime=10s ./benchmarks/
+
+# Run Looper family benchmarks. Unlike the other component benchmarks, the
+# Looper/Fusion/Flow/ReMoM benches live in the main module (src/semantic-router)
+# next to the unexported hot-path functions they measure, so go test runs there.
+perf-bench-looper: ## Run Looper family (ReMoM/Fusion/Flow/Base) benchmarks
+perf-bench-looper: ensure-reports-dir
+	@$(LOG_TARGET)
+	@cd src/semantic-router && bash -o pipefail -c \
+	  'go test -run "^$$" -bench="^Benchmark(ReMoM|Fusion|Flow|Base)" -benchmem -benchtime=10s ./pkg/looper/... | tee ../../reports/bench-results-looper.txt'
 
 # Run E2E performance tests
 perf-e2e: ## Run E2E performance tests
 perf-e2e: build-e2e ensure-reports-dir
 	@$(LOG_TARGET)
 	@echo "Running E2E performance tests..."
-	@./bin/e2e -profile=kubernetes \
+	@./bin/e2e -profile=envoy-ai-gateway \
 	  -tests=performance-throughput,performance-latency,performance-resource
 
-# Compare against baseline
-perf-compare: ## Compare current performance against baseline
+# Compare against baseline (report only; use perf-check to fail on regression).
+# Consumes reports/bench-output.txt (a captured benchmark run — 'make perf-check'
+# writes it, or tee one there yourself; CI also produces it), turns it into
+# reports/current.json, and diffs it against every per-suite baseline in
+# perf/testdata/baselines.
+perf-compare: ## Compare current benchmark output against baseline (report only)
 perf-compare: ensure-reports-dir
 	@$(LOG_TARGET)
+	@test -f reports/bench-output.txt || { \
+	  echo "reports/bench-output.txt not found — run 'make perf-check' (runs benchmarks + gates), or capture a run first: make perf-bench-quick 2>&1 | tee reports/bench-output.txt"; \
+	  exit 1; }
+	@echo "Building current results from benchmark output..."
+	@cd perf && go run cmd/perftest/main.go \
+	  --parse-bench=../reports/bench-output.txt \
+	  --output=../reports/current.json
 	@echo "Comparing performance against baseline..."
 	@cd perf && go run cmd/perftest/main.go \
 	  --compare-baseline=testdata/baselines/ \
+	  --model-baseline="$(PERF_MODEL_BASELINE)" \
+	  --current=../reports/current.json \
 	  --threshold-file=config/thresholds.yaml \
 	  --output=../reports/comparison.json
 
@@ -92,9 +134,11 @@ perf-baseline-update: ## Update performance baselines
 perf-baseline-update: ensure-reports-dir
 	@$(LOG_TARGET)
 	@echo "Running benchmarks to update baseline..."
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	cd perf && go test -bench=. -benchmem -benchtime=30s ./benchmarks/... \
-	  | tee ../reports/bench-results.txt
+	@cd perf && bash -o pipefail -c \
+	  'go test -run "^$$" -bench=. -benchmem -benchtime=30s ./benchmarks/... | tee ../reports/bench-results.txt'
+	@echo "Running Looper family benchmarks to update baseline..."
+	@cd src/semantic-router && bash -o pipefail -c \
+	  'go test -run "^$$" -bench="^Benchmark(ReMoM|Fusion|Flow|Base)" -benchmem -benchtime=30s ./pkg/looper/... | tee -a ../../reports/bench-results.txt'
 	@echo "Updating baselines..."
 	@cd perf/scripts && ./update-baseline.sh
 
@@ -126,23 +170,37 @@ perf-watch: ## Continuously run quick benchmarks on file changes
 
 # Performance test with specific concurrency
 perf-bench-concurrency: ## Run benchmarks with specific concurrency (e.g., CONCURRENCY=4)
-perf-bench-concurrency: build-router ensure-reports-dir
+perf-bench-concurrency: ensure-reports-dir
 	@$(LOG_TARGET)
-	@export LD_LIBRARY_PATH=${PWD}/candle-binding/target/release:${PWD}/nlp-binding/target/release && \
-	export GOMAXPROCS=$${CONCURRENCY:-4} && \
-	cd perf && go test -bench=.*Parallel -benchmem -benchtime=10s ./benchmarks/...
+	@export GOMAXPROCS=$${CONCURRENCY:-4} && \
+	cd perf && go test -run "^$$" -bench=.*Parallel -benchmem -benchtime=10s ./benchmarks/...
 
-# Run performance regression check (exits with error if regressions found)
-perf-check: ## Run benchmarks and fail if regressions detected
-perf-check: perf-bench perf-compare
+# Run benchmarks and fail if any benchmark regresses beyond its threshold.
+# Compares against the committed baselines in perf/testdata/baselines — refresh
+# them for your hardware with 'make perf-baseline-update' before trusting a
+# local pass/fail. Model paths use the same current harness and artifacts on
+# PERF_BASE_REF; other components retain reviewed committed baselines. Time is
+# advisory; the gate measures Go allocations, not native allocator/RSS memory.
+perf-check: ## Run benchmarks and fail if regressions exceed thresholds
+perf-check: ensure-reports-dir perf-model-baseline
 	@$(LOG_TARGET)
-	@if grep -q '"has_regressions": true' reports/comparison.json 2>/dev/null; then \
-		echo "❌ Performance regressions detected!"; \
-		cat reports/comparison.json; \
-		exit 1; \
-	else \
-		echo "No performance regressions detected"; \
-	fi
+	@echo "Running benchmarks for regression check..."
+	@cd perf && bash -o pipefail -c \
+	  'go test -run "^$$" -bench=. -benchmem -benchtime=10s ./benchmarks/... | tee ../reports/bench-output.txt'
+	@cd src/semantic-router && bash -o pipefail -c \
+	  'go test -run "^$$" -bench="^Benchmark(ReMoM|Fusion|Flow|Base)" -benchmem -benchtime=10s ./pkg/looper/... | tee -a ../../reports/bench-output.txt'
+	@echo "Building current results and comparing against baseline..."
+	@cd perf && go run cmd/perftest/main.go \
+	  --parse-bench=../reports/bench-output.txt \
+	  --output=../reports/current.json
+	@cd perf && go run cmd/perftest/main.go \
+	  --compare-baseline=testdata/baselines/ \
+	  --model-baseline="$(PERF_MODEL_BASELINE)" \
+	  --current=../reports/current.json \
+	  --threshold-file=config/thresholds.yaml \
+	  --output=../reports/comparison.json \
+	  --inventory=config/benchmark-inventory.json \
+	  --fail-on-regression
 
 # Show performance test help
 perf-help: ## Show performance testing help

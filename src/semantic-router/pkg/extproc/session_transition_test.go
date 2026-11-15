@@ -5,385 +5,208 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ir"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/responseapi"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
 
-func TestPopulateSessionTransitionFields_ResponseAPI(t *testing.T) {
-	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-123",
-			PreviousResponseID:   "resp-abc",
-			ConversationHistory: []*responseapi.StoredResponse{
-				{Model: "deepseek-v3"},
-				{Model: "deepseek-r1"},
-			},
+func TestPopulateSessionTransitionFieldsUsesRetainedObjectHistory(t *testing.T) {
+	ctx := &RequestContext{ResponseObjectState: &ResponseObjectState{
+		ConversationID:     "conv-123",
+		SessionTrackingID:  "respapi:conversation:conv-123",
+		PreviousResponseID: "resp-abc",
+		ConversationHistory: []*responseapi.StoredResponse{
+			{Model: "model-a", Usage: &responseapi.Usage{InputTokens: 100, OutputTokens: 50}},
+			{Model: "model-b", Usage: &responseapi.Usage{InputTokens: 20, OutputTokens: 10}},
 		},
-	}
-
+	}}
 	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "conv-123", ctx.SessionID)
-	assert.Equal(t, 2, ctx.TurnIndex)
-	assert.Equal(t, "deepseek-r1", ctx.PreviousModel)
-	assert.Equal(t, "resp-abc", ctx.PreviousResponseID)
+	if ctx.SessionID != "respapi:conversation:conv-123" || ctx.PreviousResponseID != "resp-abc" ||
+		ctx.PreviousModel != "model-b" || ctx.TurnIndex != 2 || ctx.HistoryTokenCount != 180 {
+		t.Fatalf("object session state = %+v", ctx)
+	}
+	if ctx.SessionProvenance != SessionProvenanceResponseAPI {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceResponseAPI)
+	}
 }
 
-func TestPopulateSessionTransitionFields_ResponseAPI_HistoryTokens_UsagePresent(t *testing.T) {
-	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-tok",
-			ConversationHistory: []*responseapi.StoredResponse{
-				{
-					Model: "model-a",
-					Usage: &responseapi.Usage{InputTokens: 100, OutputTokens: 50},
-				},
-				{
-					Model: "model-a",
-					Usage: &responseapi.Usage{InputTokens: 200, OutputTokens: 80},
-				},
-			},
-		},
-	}
-
+// TestPopulateSessionTransitionFieldsUsesTrackingIDWhenConversationEmpty
+// covers a previous_response_id-only continuation: ConversationID is empty
+// (strict external membership), but ctx.SessionID must still come from the
+// non-empty internal SessionTrackingID rather than going blank.
+func TestPopulateSessionTransitionFieldsUsesTrackingIDWhenConversationEmpty(t *testing.T) {
+	ctx := &RequestContext{ResponseObjectState: &ResponseObjectState{
+		ConversationID:      "",
+		SessionTrackingID:   "respapi:lineage:resp-root",
+		PreviousResponseID:  "resp-abc",
+		ConversationHistory: []*responseapi.StoredResponse{{Model: "model-a"}},
+	}}
 	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, 430, ctx.HistoryTokenCount)
+	if ctx.SessionID != "respapi:lineage:resp-root" {
+		t.Fatalf("session id = %q, want internal tracking id despite empty ConversationID", ctx.SessionID)
+	}
+	if ctx.SessionProvenance != SessionProvenanceResponseAPI {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceResponseAPI)
+	}
 }
 
-func TestPopulateSessionTransitionFields_ResponseAPI_HistoryTokens_FallbackIncludesInputAndOutput(t *testing.T) {
+func TestPopulateSessionTransitionFieldsUsesNeutralMessages(t *testing.T) {
 	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-fallback",
-			ConversationHistory: []*responseapi.StoredResponse{
-				{
-					Model: "model-a",
-					Input: []responseapi.InputItem{{
-						Type:    responseapi.ItemTypeMessage,
-						Role:    responseapi.RoleUser,
-						Content: json.RawMessage(`"abcdefgh"`),
-					}},
-					OutputText: "abcdefgh",
-				},
-			},
-		},
+		SemanticRequest: &llmprotocol.Request{Generation: 1, Messages: []llmprotocol.Message{
+			{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "first"}}},
+			{Role: llmprotocol.RoleAssistant, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "answer"}}},
+			{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "second"}}},
+		}},
 	}
-
 	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, 4, ctx.HistoryTokenCount)
+	if ctx.SessionID == "" || ctx.TurnIndex != 1 || ctx.HistoryTokenCount != 2 {
+		t.Fatalf("neutral session state = %+v", ctx)
+	}
+	// No AuthzUserID header, so extractUserID returns "" and the session
+	// falls to the conversation-start fingerprint, not the userID+message
+	// hash — both are SessionProvenanceMessageHash regardless.
+	if ctx.SessionProvenance != SessionProvenanceMessageHash {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceMessageHash)
+	}
 }
 
-func TestPopulateSessionTransitionFields_ResponseAPI_NilResponseInHistory(t *testing.T) {
+// A request pins its session with x-vsr-session-id, else with the first
+// client header session_id_headers accepts; the Anthropic metadata user id
+// is derived only when no header pins one.
+func TestSessionIdentityPriority(t *testing.T) {
+	request := &llmprotocol.Request{Generation: 1, Metadata: map[string]string{"user_id": "semantic-user"}}
+	ctx := &RequestContext{Headers: map[string]string{}, SemanticRequest: request}
+	if got := deriveSessionIDFromAnthropicSignals(ctx); got != "ant-md-semantic-user" {
+		t.Fatalf("semantic metadata session = %q", got)
+	}
+	for _, step := range []struct{ header, value string }{
+		{headers.XClaudeCodeSessionID, "claude-session"},
+		{headers.XSessionID, "client-session"},
+		{headers.VSRSessionID, "pinned"},
+	} {
+		ctx.Headers[step.header] = step.value
+		populateSessionTransitionFields(ctx)
+		if ctx.SessionID != step.value || ctx.SessionIDHeader != step.header || ctx.SessionProvenance != SessionProvenanceHeader {
+			t.Fatalf("with %s: session %q from %q (%s), want %q from it", step.header, ctx.SessionID, ctx.SessionIDHeader, ctx.SessionProvenance, step.value)
+		}
+	}
+}
+
+func TestOperatorsChooseTheAcceptedSessionHeaders(t *testing.T) {
 	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-nil",
-			ConversationHistory: []*responseapi.StoredResponse{
-				nil,
-				{Model: "model-a", Usage: &responseapi.Usage{InputTokens: 50, OutputTokens: 20}},
-			},
-		},
+		Headers:          map[string]string{headers.XClaudeCodeSessionID: "claude-session", "x-tenant-thread": "thread-7"},
+		sessionIDHeaders: config.RouterHeadersConfig{SessionIDHeaders: []string{"x-tenant-thread"}}.SessionIDHeaderNames(),
 	}
-
-	require.NotPanics(t, func() { populateSessionTransitionFields(ctx) })
-	assert.Equal(t, 70, ctx.HistoryTokenCount)
-}
-
-func TestPopulateSessionTransitionFields_ResponseAPI_NilLastEntryDoesNotPanic(t *testing.T) {
-	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-nil-last",
-			ConversationHistory: []*responseapi.StoredResponse{
-				{Model: "model-a", Usage: &responseapi.Usage{InputTokens: 50, OutputTokens: 20}},
-				nil,
-			},
-		},
+	if sid, header := pinnedSessionID(ctx); sid != "thread-7" || header != "x-tenant-thread" {
+		t.Fatalf("pinned session = %q from %q, want the configured header's", sid, header)
 	}
-
-	require.NotPanics(t, func() { populateSessionTransitionFields(ctx) })
-	assert.Equal(t, "model-a", ctx.PreviousModel)
-	assert.Equal(t, 70, ctx.HistoryTokenCount)
 }
 
-func TestHistoryTokensFromStoredResponses_CapsAtHistoryTokensCap(t *testing.T) {
-	bigUsage := &responseapi.Usage{InputTokens: 5000, OutputTokens: 4000}
-	history := []*responseapi.StoredResponse{
-		{Model: "m", Usage: bigUsage},
-		{Model: "m", Usage: bigUsage},
-		{Model: "m", Usage: bigUsage},
-	}
-	assert.Equal(t, historyTokensCap, historyTokensFromStoredResponses(history))
-}
-
-func TestPopulateSessionTransitionFields_ChatCompletionsFirstTurnIgnoresSystemMessages(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			"x-authz-user-id": "user-123",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "system", Content: "You are helpful"},
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	require.NotEmpty(t, ctx.SessionID)
-	assert.Equal(t, deriveSessionIDFromMessages(ctx.ChatCompletionMessages, "user-123"), ctx.SessionID)
-	assert.Equal(t, 0, ctx.TurnIndex)
-	assert.Empty(t, ctx.PreviousModel)
-}
-
-func TestPopulateSessionTransitionFields_ChatCompletionsCountsPriorAssistantTurns(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			"x-authz-user-id": "user-123",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "system", Content: "You are helpful"},
-			{Role: "user", Content: "First question"},
-			{Role: "assistant", Content: "First answer"},
-			{Role: "user", Content: "Second question"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, 1, ctx.TurnIndex)
-	assert.Empty(t, ctx.PreviousModel)
-}
-
-func TestPopulateSessionTransitionFields_XSessionIDHeaderOverridesDerivation(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			headers.AuthzUserID: "user-123",
-			headers.XSessionID:  "client-defined-session",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "client-defined-session", ctx.SessionID)
-	assert.Equal(t, 0, ctx.TurnIndex)
-}
-
-func TestPopulatePinnedSessionFromHeadersReadsRouterMemoryBeforeParsing(t *testing.T) {
-	sessiontelemetry.ResetRouterSessionMemoryForTesting()
-	t.Cleanup(sessiontelemetry.ResetRouterSessionMemoryForTesting)
-	sessiontelemetry.RecordSessionDecision(sessiontelemetry.SessionDecisionParams{
-		SessionID:     "client-defined-session",
-		SelectedModel: "cheap-agent",
-	})
-
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			headers.XSessionID: "client-defined-session",
-		},
-	}
-
-	populatePinnedSessionFromHeaders(ctx)
-
-	assert.Equal(t, "client-defined-session", ctx.SessionID)
-	assert.Equal(t, "cheap-agent", ctx.PreviousModel)
-	assert.True(t, ctx.SessionIdleKnown)
-}
-
-func TestPopulateSessionTransitionFields_ChatCompletionsNoUserUsesStructureHash(t *testing.T) {
-	ctx := &RequestContext{
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello without auth header"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	require.True(t, strings.HasPrefix(ctx.SessionID, "cc-full-"))
-	assert.Equal(t, 0, ctx.TurnIndex)
-}
-
-func TestPopulateSessionTransitionFields_ChatCompletionsEmptyThreadUsesRidFromRequestID(t *testing.T) {
-	ctx := &RequestContext{
-		RequestID: "upstream-req-abc",
-		Headers: map[string]string{
-			headers.RequestID: "hdr-req-xyz",
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	require.True(t, strings.HasPrefix(ctx.SessionID, "rid-"))
-}
-
-func TestHistoryTokensFromChatMessages_Empty(t *testing.T) {
-	assert.Equal(t, 0, historyTokensFromChatMessages(nil))
-	assert.Equal(t, 0, historyTokensFromChatMessages([]ChatCompletionMessage{}))
-}
-
-func TestHistoryTokensFromChatMessages_ExcludesLastUserTurn(t *testing.T) {
-	msgs := []ChatCompletionMessage{
-		{Role: "system", Content: "abcd"},
-		{Role: "user", Content: "abcdefgh"},
-		{Role: "assistant", Content: "abcdefghij"},
-		{Role: "user", Content: "current"},
-	}
-	assert.Equal(t, 5, historyTokensFromChatMessages(msgs))
-}
-
-func TestHistoryTokensFromChatMessages_SingleUserMessage_ZeroHistory(t *testing.T) {
-	msgs := []ChatCompletionMessage{
-		{Role: "user", Content: "hello world"},
-	}
-	assert.Equal(t, 0, historyTokensFromChatMessages(msgs))
-}
-
-func TestEstimateTokenLength(t *testing.T) {
-	assert.Equal(t, 0, estimateTokenLength(""))
-	assert.Equal(t, 1, estimateTokenLength("abcd"))
-	assert.Equal(t, 3, estimateTokenLength("abcdefghijkl"))
-}
-
-func TestPopulateSessionTransitionFields_ClaudeCodeSessionID_UsedWhenXSessionIDAbsent(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			headers.XClaudeCodeSessionID: "cc-uuid-1",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "cc-uuid-1", ctx.SessionID)
-}
-
-func TestPopulateSessionTransitionFields_XSessionIDOutranksClaudeCodeSessionID(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			headers.XSessionID:           "pinned",
-			headers.XClaudeCodeSessionID: "cc-uuid-2",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "pinned", ctx.SessionID)
-}
-
-func TestPopulateSessionTransitionFields_ClaudeCodeSessionIDOutranksMetadataUserID(t *testing.T) {
-	ctx := &RequestContext{
-		Headers: map[string]string{
-			headers.XClaudeCodeSessionID: "cc-uuid-3",
-		},
-		IRExtensions: &ir.IRExtensions{
-			MetadataUserID: "user-zzz",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "cc-uuid-3", ctx.SessionID)
-}
-
-func TestPopulateSessionTransitionFields_MetadataUserIDSeedsSessionWhenNoTransportHeader(t *testing.T) {
-	ctx := &RequestContext{
-		IRExtensions: &ir.IRExtensions{
-			MetadataUserID: "user-abc",
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "Hello"},
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "ant-md-user-abc", ctx.SessionID)
-}
-
-func TestPopulateSessionTransitionFields_ResponseAPIConversationOutranksAnthropicSignals(t *testing.T) {
-	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-			ConversationID:       "conv-1",
-		},
-		Headers: map[string]string{
-			headers.XClaudeCodeSessionID: "cc-uuid-4",
-		},
-		IRExtensions: &ir.IRExtensions{
-			MetadataUserID: "user-xyz",
-		},
-	}
-
-	populateSessionTransitionFields(ctx)
-
-	assert.Equal(t, "conv-1", ctx.SessionID)
-}
-
-func TestPopulateSessionTransitionFields_ClaudeCodeSessionID_StableAcrossRequests(t *testing.T) {
-	uuid := "cc-uuid-stable"
-	ctxA := &RequestContext{
-		Headers: map[string]string{
-			headers.XClaudeCodeSessionID: uuid,
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "first"},
-		},
-	}
-	ctxB := &RequestContext{
-		Headers: map[string]string{
-			headers.XClaudeCodeSessionID: uuid,
-		},
-		ChatCompletionMessages: []ChatCompletionMessage{
-			{Role: "user", Content: "second"},
-		},
-	}
-
-	populateSessionTransitionFields(ctxA)
-	populateSessionTransitionFields(ctxB)
-
-	assert.Equal(t, ctxA.SessionID, ctxB.SessionID)
-}
-
-func TestDeriveSessionIDFromAnthropicSignals_NilSafe(t *testing.T) {
-	assert.Empty(t, deriveSessionIDFromAnthropicSignals(nil))
-	assert.Empty(t, deriveSessionIDFromAnthropicSignals(&RequestContext{}))
-}
-
-func TestEstimateStoredResponseTokens_FallsBackToOutputItems(t *testing.T) {
+func TestHistoryTokenFallbackUsesInputAndOutput(t *testing.T) {
 	stored := &responseapi.StoredResponse{
 		Input: []responseapi.InputItem{{
-			Type:    responseapi.ItemTypeMessage,
-			Role:    responseapi.RoleUser,
+			Type: responseapi.ItemTypeMessage, Role: responseapi.RoleUser,
 			Content: json.RawMessage(`"abcdefgh"`),
 		}},
-		Output: []responseapi.OutputItem{{
-			Type: responseapi.ItemTypeMessage,
-			Role: responseapi.RoleAssistant,
-			Content: []responseapi.ContentPart{{
-				Type: responseapi.ContentTypeOutputText,
-				Text: "abcdefgh",
-			}},
+		OutputText: "abcdefgh",
+	}
+	if got := estimateStoredResponseTokens(stored); got != 4 {
+		t.Fatalf("estimated tokens = %d", got)
+	}
+	if got := historyTokensFromStoredResponses([]*responseapi.StoredResponse{nil, stored}); got != 4 {
+		t.Fatalf("history tokens = %d", got)
+	}
+}
+
+func TestEmptyNeutralThreadUsesRequestFallback(t *testing.T) {
+	ctx := &RequestContext{RequestID: "request-123"}
+	populateSessionTransitionFields(ctx)
+	if !strings.HasPrefix(ctx.SessionID, "rid-") {
+		t.Fatalf("session id = %q", ctx.SessionID)
+	}
+	if ctx.SessionProvenance != SessionProvenanceRequestID {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceRequestID)
+	}
+}
+
+func TestPopulateSessionTransitionFieldsAnthropicProvenance(t *testing.T) {
+	ctx := &RequestContext{
+		Headers:         map[string]string{},
+		SemanticRequest: &llmprotocol.Request{Generation: 1, Metadata: map[string]string{"user_id": "claude-user"}},
+	}
+	populateSessionTransitionFields(ctx)
+	if ctx.SessionID != "ant-md-claude-user" {
+		t.Fatalf("session id = %q, want the Anthropic metadata user id", ctx.SessionID)
+	}
+	if ctx.SessionProvenance != SessionProvenanceAnthropicPromptCache {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceAnthropicPromptCache)
+	}
+}
+
+func TestPopulateSessionTransitionFieldsMessageHashWithUserIDProvenance(t *testing.T) {
+	ctx := &RequestContext{
+		Headers: map[string]string{headers.AuthzUserID: "user-42"},
+		SemanticRequest: &llmprotocol.Request{Generation: 1, Messages: []llmprotocol.Message{
+			{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "hello"}}},
 		}},
 	}
+	populateSessionTransitionFields(ctx)
+	if ctx.SessionID == "" {
+		t.Fatal("expected a non-empty session id")
+	}
+	if ctx.SessionProvenance != SessionProvenanceMessageHash {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceMessageHash)
+	}
+}
 
-	assert.Equal(t, 4, estimateStoredResponseTokens(stored))
+func TestPopulateSessionTransitionFieldsAuthenticatedPrincipal(t *testing.T) {
+	t.Run("present auth header", func(t *testing.T) {
+		ctx := &RequestContext{Headers: map[string]string{headers.AuthzUserID: "user-42"}}
+		populateSessionTransitionFields(ctx)
+		if ctx.AuthenticatedPrincipal != "user-42" {
+			t.Fatalf("AuthenticatedPrincipal = %q, want %q", ctx.AuthenticatedPrincipal, "user-42")
+		}
+	})
+	t.Run("absent auth header", func(t *testing.T) {
+		ctx := &RequestContext{}
+		populateSessionTransitionFields(ctx)
+		if ctx.AuthenticatedPrincipal != "" {
+			t.Fatalf("AuthenticatedPrincipal = %q, want empty with no auth header", ctx.AuthenticatedPrincipal)
+		}
+	})
+}
+
+func TestPopulatePinnedSessionFromHeadersProvenanceAndPrincipal(t *testing.T) {
+	ctx := &RequestContext{Headers: map[string]string{
+		headers.XSessionID:  "pinned-session",
+		headers.AuthzUserID: "user-42",
+	}}
+	populatePinnedSessionFromHeaders(ctx)
+	if ctx.SessionID != "pinned-session" {
+		t.Fatalf("session id = %q", ctx.SessionID)
+	}
+	if ctx.SessionProvenance != SessionProvenanceHeader {
+		t.Fatalf("provenance = %q, want %q", ctx.SessionProvenance, SessionProvenanceHeader)
+	}
+	if ctx.AuthenticatedPrincipal != "user-42" {
+		t.Fatalf("AuthenticatedPrincipal = %q, want %q", ctx.AuthenticatedPrincipal, "user-42")
+	}
+}
+
+func TestPopulatePinnedSessionFromHeaders_NoSessionHeader_ProvenanceStaysNone(t *testing.T) {
+	ctx := &RequestContext{Headers: map[string]string{headers.AuthzUserID: "user-42"}}
+	populatePinnedSessionFromHeaders(ctx)
+	if ctx.SessionID != "" {
+		t.Fatalf("session id = %q, want empty with no x-session-id header", ctx.SessionID)
+	}
+	if ctx.SessionProvenance != SessionProvenanceNone {
+		t.Fatalf("provenance = %q, want %q (unset)", ctx.SessionProvenance, SessionProvenanceNone)
+	}
+	// AuthenticatedPrincipal is populated regardless of whether a session
+	// was pinned — the fast-extract path needs it available as early as
+	// the session header itself.
+	if ctx.AuthenticatedPrincipal != "user-42" {
+		t.Fatalf("AuthenticatedPrincipal = %q, want %q", ctx.AuthenticatedPrincipal, "user-42")
+	}
 }

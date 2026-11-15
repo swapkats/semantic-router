@@ -1,6 +1,8 @@
 package dsl
 
 import (
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -9,41 +11,48 @@ import (
 
 func TestDecompileRoutingPreservesRawPluginConfigMaps(t *testing.T) {
 	cfg := mustParseRoutingPluginConfigTest(t, `
-version: v0.3
-routing:
-  modelCards:
-    - name: "test-model"
-  signals:
-    domains:
-      - name: test
-        description: test
-  decisions:
-    - name: plugin_route
-      priority: 100
-      rules:
-        operator: AND
-        conditions:
-          - type: domain
-            name: test
-      modelRefs:
-        - model: test-model
-      plugins:
-        - type: semantic-cache
-          configuration:
-            enabled: true
-            similarity_threshold: 0.81
-        - type: router_replay
-          configuration:
-            enabled: true
-            max_records: 1000
-            capture_request_body: true
-            capture_response_body: true
-            max_body_bytes: 4096
+version: v0.5
+recipes:
+  - name: default
+    signals:
+      domains:
+        - name: test
+          labels: [other]
+          description: test
+    decisions:
+      - name: plugin_route
+        priority: 100
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: test
+        modelRefs:
+          - model: test-model
+        plugins:
+          - type: response_cache
+            configuration:
+              enabled: true
+              semantic:
+                match:
+                  recall: {top_k: 3, min_similarity: 0.81}
+                  judge: {preset: same_request, min_score: 0.9}
+          - type: router_replay
+            configuration:
+              enabled: true
+              max_records: 1000
+              capture_request_body: true
+              capture_response_body: true
+              max_body_bytes: 4096
+providers:
+  models:
+    - name: test-model
 `)
 
 	dslText := mustDecompileRoutingPluginConfigTest(t, cfg)
 	assertDecompiledPluginConfigContains(t, dslText, []string{
-		`similarity_threshold: 0.81`,
+		`min_similarity: 0.81`,
+		`preset: "same_request"`,
 		`enabled: true`,
 		`max_records: 1000`,
 		`capture_request_body: true`,
@@ -55,60 +64,108 @@ routing:
 	assertRouterReplayPluginRoundTrip(t, compiled.Decisions[0])
 }
 
-func TestDecompileRoutingRoundTripsToolsDynamicRetrievalPluginConfig(t *testing.T) {
+func TestDecompileRoutingRoundTripsHeaderAndResponsePlugins(t *testing.T) {
+	headerPayload := config.MustStructuredPayload(
+		config.HeaderMutationPluginConfig{
+			Add:    []config.HeaderPair{{Name: "x-policy", Value: "strict"}},
+			Delete: []string{"x-remove"},
+		},
+	)
+	guard := config.ResponseGuardPluginConfig{
+		Rules: []config.ResponseGuardRule{
+			{When: config.RuleNode{Type: config.SignalTypeJailbreak, Name: "unsafe_completion"}, Action: config.ResponseGuardBlock},
+			{When: config.RuleNode{Operator: config.RuleOperatorAnd, Conditions: []config.RuleNode{
+				{Type: config.SignalTypeFactCheck, Name: "needs_fact_check"},
+				{Type: config.SignalTypeHallucination, Name: "ungrounded"},
+			}}, Action: config.ResponseGuardAnnotate, Details: true},
+		},
+		OnUnknown: config.ResponseGuardNone,
+	}
+	cfg := &config.RouterConfig{IntelligentRouting: config.IntelligentRouting{
+		Decisions: []config.Decision{{
+			Name:      "plugins",
+			ModelRefs: []config.ModelRef{{Model: "model-a"}},
+			Plugins: []config.DecisionPlugin{
+				{Type: config.DecisionPluginHeaderMutation, Configuration: headerPayload},
+				{Type: config.DecisionPluginResponseGuard, Configuration: config.MustStructuredPayload(guard)},
+			},
+		}},
+	}}
+
+	source := mustDecompileRoutingPluginConfigTest(t, cfg)
+	compiled := mustCompileRoutingPluginConfigTest(t, source)
+	decision := compiled.Decisions[0]
+	header := decision.GetHeaderMutationConfig()
+	if header == nil || len(header.Add) != 1 ||
+		header.Add[0].Name != "x-policy" ||
+		len(header.Delete) != 1 {
+		t.Fatalf("header mutation round trip = %#v", header)
+	}
+	if got := decision.GetResponseGuardConfig(); got == nil || !reflect.DeepEqual(*got, guard) {
+		t.Fatalf("response guard round trip = %#v, want %#v", got, guard)
+	}
+}
+
+func TestDecompileRoutingRoundTripsToolsPluginConfig(t *testing.T) {
 	cfg := mustParseRoutingPluginConfigTest(t, `
-version: v0.3
-routing:
-  modelCards:
-    - name: "test-model"
-  signals:
-    domains:
-      - name: test
-        description: test
-  decisions:
-    - name: plugin_route
-      priority: 100
-      rules:
-        operator: AND
-        conditions:
-          - type: domain
-            name: test
-      modelRefs:
-        - model: test-model
-      plugins:
-        - type: tools
-          configuration:
-            enabled: true
-            mode: passthrough
-            semantic_selection: true
-            strategy: custom
-            dynamic_retrieval:
+version: v0.5
+recipes:
+  - name: default
+    signals:
+      domains:
+        - name: test
+          labels: [other]
+          description: test
+    decisions:
+      - name: plugin_route
+        priority: 100
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: test
+        modelRefs:
+          - model: test-model
+        plugins:
+          - type: tools
+            configuration:
               enabled: true
-              strategy: hybrid_history
-              history_window: 8
-              min_history_confidence: 0.4
-              fallback_on_low_confidence: true
-              weights:
-                semantic: 1.0
-                history: 0.7
-                decision_prior: 0.2
-                repetition_penalty: 0.1
+              policy:
+                mode: filtered
+                allow_tools: [docs.search, tickets.lookup]
+              select:
+                mode: filter
+                match:
+                  judge: {preset: tool_rank, top_k: 4, min_ratio: 0.2}
+                need_threshold: 0.6
+                preserve_count: 1
+                on_error: strip
+                input: {history: true}
+providers:
+  models:
+    - name: test-model
 `)
 
 	dslText := mustDecompileRoutingPluginConfigTest(t, cfg)
 	assertDecompiledPluginConfigContains(t, dslText, []string{
 		`PLUGIN tools`,
-		`strategy: "custom"`,
-		`dynamic_retrieval: {`,
-		`strategy: "hybrid_history"`,
-		`history_window: 8`,
-		`min_history_confidence: 0.4`,
-		`fallback_on_low_confidence: true`,
-		`weights: { decision_prior: 0.2, history: 0.7, repetition_penalty: 0.1, semantic: 1 }`,
+		`policy: { allow_tools: ["docs.search", "tickets.lookup"], mode: "filtered" }`,
+		`judge: { min_ratio: 0.2, preset: "tool_rank", top_k: 4 }`,
+		`need_threshold: 0.6`,
 	})
 
 	compiled := mustCompileRoutingPluginConfigTest(t, dslText)
-	assertToolsPluginDynamicRetrievalRoundTrip(t, compiled.Decisions[0])
+	plugin := findDecisionPluginForTest(t, compiled.Decisions[0], "tools")
+	var pluginConfig config.ToolsPluginConfig
+	if err := config.UnmarshalPluginConfig(plugin.Configuration, &pluginConfig); err != nil {
+		t.Fatalf("tools decode error: %v", err)
+	}
+	spec := pluginConfig.Select
+	if !pluginConfig.Enabled || pluginConfig.Policy.EffectiveMode() != config.ToolsPolicyModeFiltered || spec == nil ||
+		spec.Match.Judge.TopK != 4 || spec.EffectiveNeedThreshold() != 0.6 || spec.PreserveCount != 1 ||
+		spec.EffectiveOnError() != config.ToolsSelectOnErrorStrip || !spec.Input.History {
+		t.Fatalf("round-tripped tools plugin = %+v / %+v", pluginConfig.Policy, spec)
+	}
 }
 
 func mustParseRoutingPluginConfigTest(t *testing.T, configYAML string) *config.RouterConfig {
@@ -157,16 +214,17 @@ func mustCompileRoutingPluginConfigTest(t *testing.T, dslText string) *config.Ro
 func assertSemanticCachePluginRoundTrip(t *testing.T, decision config.Decision) {
 	t.Helper()
 
-	plugin := findDecisionPluginForTest(t, decision, "semantic-cache")
-	var pluginConfig config.SemanticCachePluginConfig
+	plugin := findDecisionPluginForTest(t, decision, "response_cache")
+	var pluginConfig config.ResponseCachePluginConfig
 	if err := config.UnmarshalPluginConfig(plugin.Configuration, &pluginConfig); err != nil {
-		t.Fatalf("semantic-cache decode error: %v", err)
+		t.Fatalf("response_cache decode error: %v", err)
 	}
 	if !pluginConfig.Enabled {
-		t.Fatalf("semantic-cache.enabled = false, want true")
+		t.Fatalf("response_cache.enabled = false, want true")
 	}
-	if pluginConfig.SimilarityThreshold == nil || *pluginConfig.SimilarityThreshold != 0.81 {
-		t.Fatalf("semantic-cache.similarity_threshold = %#v", pluginConfig.SimilarityThreshold)
+	match := pluginConfig.SemanticMatch()
+	if match == nil || match.Recall == nil || *match.Recall.MinSimilarity != 0.81 || match.Judge == nil || match.Judge.Preset != "same_request" {
+		t.Fatalf("response_cache.semantic.match = %#v", match)
 	}
 }
 
@@ -186,31 +244,249 @@ func assertRouterReplayPluginRoundTrip(t *testing.T, decision config.Decision) {
 	}
 }
 
-func assertToolsPluginDynamicRetrievalRoundTrip(t *testing.T, decision config.Decision) {
-	t.Helper()
-
-	plugin := findDecisionPluginForTest(t, decision, "tools")
-	var pluginConfig config.ToolsPluginConfig
-	if err := config.UnmarshalPluginConfig(plugin.Configuration, &pluginConfig); err != nil {
-		t.Fatalf("tools decode error: %v", err)
+func TestContextCompressNestedRoundTrip(t *testing.T) {
+	cfg := &config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Decisions: []config.Decision{{
+				Name:      "compress",
+				ModelRefs: []config.ModelRef{{Model: "model"}},
+				Plugins: []config.DecisionPlugin{{
+					Type: config.DecisionPluginContext,
+					Configuration: config.MustStructuredPayload(map[string]interface{}{
+						"enabled": true,
+						"compress": map[string]interface{}{
+							"mode": "auto",
+							"targets": map[string]interface{}{
+								"tool_outputs": map[string]interface{}{
+									"mode":          "extractive",
+									"min_tokens":    2000,
+									"target_tokens": 1000,
+								},
+								"rag":          map[string]interface{}{"mode": "preserve"},
+								"current_user": map[string]interface{}{"mode": "truncate"},
+							},
+							"request_controls": map[string]interface{}{
+								"enabled": true,
+								"allowed": []string{"bypass", "target"},
+							},
+						},
+					}),
+				}},
+			}},
+		},
 	}
-	if !pluginConfig.Enabled {
-		t.Fatal("tools.enabled = false, want true")
+	dslText := mustDecompileRoutingPluginConfigTest(t, cfg)
+	assertDecompiledPluginConfigContains(t, dslText, []string{
+		"PLUGIN context",
+		"tool_outputs:",
+		"request_controls:",
+	})
+	compiled := mustCompileRoutingPluginConfigTest(t, dslText)
+	plugin := compiled.Decisions[0].GetContextConfig()
+	if plugin == nil || plugin.Compress == nil || plugin.Compress.Targets == nil ||
+		plugin.Compress.Targets.ToolOutputs.TargetTokens != 1000 ||
+		plugin.Compress.Targets.CurrentUser.Mode != "truncate" {
+		t.Fatalf("context compress = %#v", plugin)
 	}
-	assertRoundTripToolsPluginBasics(t, &pluginConfig)
-	assertDynamicRetrievalConfig(t, pluginConfig.DynamicRetrieval)
 }
 
-func assertRoundTripToolsPluginBasics(t *testing.T, cfg *config.ToolsPluginConfig) {
-	t.Helper()
+func TestPromptCachePluginRoundTrip(t *testing.T) {
+	cfg := &config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Decisions: []config.Decision{{
+				Name:      "cache-prefix",
+				ModelRefs: []config.ModelRef{{Model: "model"}},
+				Plugins: []config.DecisionPlugin{{
+					Type: config.DecisionPluginPromptCache,
+					Configuration: config.MustStructuredPayload(
+						config.PromptCachePluginConfig{
+							Enabled: true,
+							TTL:     "1h",
+							Targets: []string{
+								config.PromptCacheTargetInstructions,
+								config.PromptCacheTargetTools,
+							},
+							OnUnsupported: config.PromptCacheUnsupportedReject,
+						},
+					),
+				}},
+			}},
+		},
+	}
+	dslText := mustDecompileRoutingPluginConfigTest(t, cfg)
+	assertDecompiledPluginConfigContains(t, dslText, []string{
+		"PLUGIN prompt_cache",
+		`ttl: "1h"`,
+		`on_unsupported: "reject"`,
+		`targets: ["instructions", "tools"]`,
+	})
+	compiled := mustCompileRoutingPluginConfigTest(t, dslText)
+	plugin := findDecisionPluginForTest(
+		t,
+		compiled.Decisions[0],
+		config.DecisionPluginPromptCache,
+	)
+	var pluginConfig config.PromptCachePluginConfig
+	if err := config.UnmarshalPluginConfig(plugin.Configuration, &pluginConfig); err != nil {
+		t.Fatalf("prompt_cache decode error: %v", err)
+	}
+	if !pluginConfig.Enabled ||
+		pluginConfig.TTL != "1h" ||
+		pluginConfig.OnUnsupported != config.PromptCacheUnsupportedReject ||
+		len(pluginConfig.Targets) != 2 {
+		t.Fatalf("prompt_cache config = %#v", pluginConfig)
+	}
+}
 
-	if cfg.Mode != config.ToolsPluginModePassthrough {
-		t.Fatalf("tools.mode = %q", cfg.Mode)
+func TestPromptCachePluginRejectsEmptyTargets(t *testing.T) {
+	_, errs := Compile(`
+ROUTE empty_prompt_cache_targets {
+  PRIORITY 1
+  MODEL "model"
+  PLUGIN prompt_cache {
+    enabled: true
+    targets: []
+  }
+}
+`)
+	if len(errs) == 0 {
+		t.Fatal("expected empty prompt_cache targets to fail")
 	}
-	if cfg.SemanticSelection == nil || !*cfg.SemanticSelection {
-		t.Fatalf("tools.semantic_selection = %#v", cfg.SemanticSelection)
+	for _, err := range errs {
+		if strings.Contains(err.Error(), "targets must not be empty") {
+			return
+		}
 	}
-	assertToolsPluginStrategy(t, cfg)
+	t.Fatalf("compile errors = %v", errs)
+}
+
+func TestPromptCachePluginRejectsInvalidFields(t *testing.T) {
+	tests := []struct {
+		name       string
+		pluginBody string
+		wantError  string
+	}{
+		{
+			name:       "unknown field",
+			pluginBody: `on_unsuported: "reject"`,
+			wantError:  `unknown field "on_unsuported"`,
+		},
+		{
+			name:       "invalid ttl",
+			pluginBody: `ttl: "10m"`,
+			wantError:  "ttl must be 5m or 1h",
+		},
+		{
+			name:       "invalid target",
+			pluginBody: `targets: ["messages"]`,
+			wantError:  "targets must contain only instructions or tools",
+		},
+		{
+			name:       "duplicate target",
+			pluginBody: `targets: ["tools", "tools"]`,
+			wantError:  "targets must not contain duplicates",
+		},
+		{
+			name:       "invalid unsupported behavior",
+			pluginBody: `on_unsupported: "ignore"`,
+			wantError:  "on_unsupported must be skip or reject",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := `
+ROUTE invalid_prompt_cache {
+  PRIORITY 1
+  MODEL "model"
+  PLUGIN prompt_cache {
+    enabled: true
+    ` + test.pluginBody + `
+  }
+}
+`
+			_, errs := Compile(source)
+			if !slices.ContainsFunc(errs, func(err error) bool {
+				return strings.Contains(err.Error(), test.wantError)
+			}) {
+				t.Fatalf("compile errors = %v, want substring %q", errs, test.wantError)
+			}
+
+			diagnostics, parseErrs := Validate(source)
+			if len(parseErrs) != 0 {
+				t.Fatalf("parse errors = %v", parseErrs)
+			}
+			if !slices.ContainsFunc(diagnostics, func(diagnostic Diagnostic) bool {
+				return strings.Contains(diagnostic.Message, test.wantError)
+			}) {
+				t.Fatalf("validation diagnostics = %v, want substring %q", diagnostics, test.wantError)
+			}
+		})
+	}
+}
+
+func TestPromptCachePluginRejectsInvalidTemplateOverride(t *testing.T) {
+	source := `
+PLUGIN cached prompt_cache {
+  enabled: true
+  ttl: "5m"
+}
+
+ROUTE invalid_prompt_cache {
+  PRIORITY 1
+  MODEL "model"
+  PLUGIN cached {
+    ttl: "10m"
+  }
+}
+`
+	_, errs := Compile(source)
+	if !slices.ContainsFunc(errs, func(err error) bool {
+		return strings.Contains(err.Error(), "ttl must be 5m or 1h")
+	}) {
+		t.Fatalf("compile errors = %v", errs)
+	}
+
+	diagnostics, parseErrs := Validate(source)
+	if len(parseErrs) != 0 {
+		t.Fatalf("parse errors = %v", parseErrs)
+	}
+	if !slices.ContainsFunc(diagnostics, func(diagnostic Diagnostic) bool {
+		return strings.Contains(diagnostic.Message, "ttl must be 5m or 1h")
+	}) {
+		t.Fatalf("validation diagnostics = %v", diagnostics)
+	}
+}
+
+func TestDecompileRoutingRoundTripsToolsStripHistory(t *testing.T) {
+	cfg := mustParseRoutingPluginConfigTest(t, `
+version: v0.5
+recipes:
+  - name: default
+    decisions:
+      - name: privacy_route
+        priority: 100
+        modelRefs:
+          - model: local-guard
+        plugins:
+          - type: tools
+            configuration:
+              enabled: true
+              policy: {mode: none, strip_tool_history: true}
+providers:
+  models:
+    - name: local-guard
+`)
+
+	dslText := mustDecompileRoutingPluginConfigTest(t, cfg)
+	assertDecompiledPluginConfigContains(t, dslText, []string{
+		`PLUGIN tools`,
+		`policy: { mode: "none", strip_tool_history: true }`,
+	})
+	compiled := mustCompileRoutingPluginConfigTest(t, dslText)
+	if policy := compiled.Decisions[0].GetToolsConfig().ActivePolicy(); policy == nil || !policy.StripToolHistory {
+		t.Fatal("tools.strip_tool_history was not preserved")
+	}
 }
 
 func findDecisionPluginForTest(t *testing.T, decision config.Decision, pluginType string) config.DecisionPlugin {

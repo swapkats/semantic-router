@@ -5,7 +5,7 @@
 ##@ E2E Testing
 
 # E2E test configuration
-E2E_PROFILE ?= kubernetes
+E2E_PROFILE ?= envoy-ai-gateway
 E2E_CLUSTER_NAME ?= semantic-router-e2e
 E2E_IMAGE_TAG ?= e2e-test
 E2E_KEEP_CLUSTER ?= false
@@ -16,15 +16,28 @@ E2E_TESTS ?=
 E2E_SETUP_ONLY ?= false
 E2E_SKIP_SETUP ?= false
 E2E_USE_WORKSPACE_MODELS ?= false
+E2E_UNIT_REPORT_DIR ?= $(CURDIR)/.agent-harness/e2e-unit
+
+.PHONY: test-e2e-unit
+test-e2e-unit: $(HARNESS_VENV_DEPS) ## Test E2E framework helpers and profiles without starting a cluster
+	@$(LOG_TARGET)
+	@"$(AGENT_PYTHON)" tools/ci/run_e2e_unit.py --output "$(E2E_UNIT_REPORT_DIR)"
 
 # Build the E2E test binary
 build-e2e: ## Build the E2E test binary
 	@$(LOG_TARGET)
 	@echo "Building E2E test binary..."
 	@cd e2e && go build -o ../bin/e2e ./cmd/e2e
+	@$(MAKE) e2e-coverage-check
+
+.PHONY: e2e-coverage-check
+e2e-coverage-check: ## Run the runtime-derived E2E coverage drift gates (no cluster required)
+	@$(LOG_TARGET)
+	@echo "Running E2E coverage drift gates..."
+	@cd e2e && go test -count=1 ./pkg/verification/
 
 # Run E2E tests
-e2e-test: ## Run E2E tests (PROFILE=kubernetes by default)
+e2e-test: ## Run E2E tests (PROFILE=envoy-ai-gateway by default)
 e2e-test: build-e2e
 	@$(LOG_TARGET)
 	@echo "Running E2E tests with profile: $(E2E_PROFILE)"
@@ -41,20 +54,18 @@ e2e-test: build-e2e
 		-skip-setup=$(E2E_SKIP_SETUP) \
 		$(if $(E2E_TESTS),-tests=$(E2E_TESTS),)
 
-# Run E2E tests with the default Kubernetes baseline profile
-e2e-test-kubernetes: ## Run E2E tests with the Kubernetes baseline profile
-e2e-test-kubernetes: E2E_PROFILE=kubernetes
+# Run E2E tests with the Envoy AI Gateway baseline profile
+e2e-test-envoy-ai-gateway: ## Run E2E tests with Envoy AI Gateway
+e2e-test-envoy-ai-gateway: E2E_PROFILE=envoy-ai-gateway
+e2e-test-envoy-ai-gateway: e2e-test
+
+# Backward-compatible aliases for former profile and target names.
+e2e-test-kubernetes: E2E_PROFILE=envoy-ai-gateway
 e2e-test-kubernetes: e2e-test
 
-# Backward-compatible alias for the former profile name.
 e2e-test-ai-gateway:
-e2e-test-ai-gateway: E2E_PROFILE=kubernetes
+e2e-test-ai-gateway: E2E_PROFILE=envoy-ai-gateway
 e2e-test-ai-gateway: e2e-test
-
-# Run E2E tests with Dynamo profile (requires GPU)
-e2e-test-dynamo: ## Run E2E tests with Dynamo profile (requires 3+ GPUs)
-e2e-test-dynamo: E2E_PROFILE=dynamo
-e2e-test-dynamo: e2e-test
 
 # Run E2E tests with RAG hybrid search profile (multi-store, BM25 + n-gram + vector)
 e2e-test-rag-hybrid-search: ## Run E2E tests with RAG hybrid search profile
@@ -126,18 +137,13 @@ e2e-help: ## Show help for E2E testing
 	@echo "E2E Testing Framework"
 	@echo ""
 	@echo "Available Profiles:"
-	@echo "  kubernetes       - Test Semantic Router with the default Kubernetes baseline"
-	@echo "  agentgateway			 - Test Semantic Router with agentgateway gateway controller"
-	@echo "  aibrix           - Test Semantic Router with vLLM AIBrix"F
-	@echo "  dynamo           - Test Semantic Router with Nvidia Dynamo (requires 3+ GPUs)"
-	@echo "  istio            - Test Semantic Router with Istio service mesh"
-	@echo "  llm-d            - Test Semantic Router with LLM-D"
+	@echo "  envoy-ai-gateway - Test the baseline contract through Envoy AI Gateway"
 	@echo "  production-stack - Test Semantic Router in production-like stack (HA/LB/Obs)"
 	@echo "  rag-hybrid-search - Test RAG multi-store and hybrid search (BM25 + n-gram + vector)"
 	@echo "  response-api     - Test Response API endpoints (POST/GET/DELETE /v1/responses)"
 	@echo ""
 	@echo "Environment Variables:"
-	@echo "  E2E_PROFILE              - Test profile to run (default: kubernetes)"
+	@echo "  E2E_PROFILE              - Test profile to run (default: envoy-ai-gateway)"
 	@echo "  E2E_CLUSTER_NAME         - Kind cluster name (default: semantic-router-e2e)"
 	@echo "  E2E_IMAGE_TAG            - Docker image tag (default: e2e-test)"
 	@echo "  E2E_KEEP_CLUSTER         - Keep cluster and deployed profile after tests (default: false)"
@@ -151,10 +157,9 @@ e2e-help: ## Show help for E2E testing
 	@echo ""
 	@echo "Common Commands:"
 	@echo "  make e2e-test                                    # Run all tests with default profile"
-	@echo "  make e2e-test E2E_PROFILE=kubernetes             # Run default Kubernetes baseline tests"
-	@echo "  make e2e-test E2E_PROFILE=kubernetes E2E_USE_WORKSPACE_MODELS=true"
+	@echo "  make e2e-test E2E_PROFILE=envoy-ai-gateway       # Run baseline Envoy AI Gateway tests"
+	@echo "  make e2e-test E2E_PROFILE=envoy-ai-gateway E2E_USE_WORKSPACE_MODELS=true"
 	@echo "  make e2e-test-response-api-suite                 # Run response-api + Redis + Redis Cluster suite"
-	@echo "  make e2e-test-dynamo                             # Run Dynamo tests (requires GPU)"
 	@echo "  make e2e-test-debug                              # Run tests and keep cluster + deployed profile"
 	@echo "  make e2e-test-specific E2E_TESTS=\"test1,test2\"   # Run specific tests"
 	@echo "  make e2e-cleanup                                 # Clean up test cluster"

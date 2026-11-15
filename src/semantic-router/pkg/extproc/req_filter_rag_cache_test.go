@@ -119,7 +119,8 @@ func TestRAGCache_EvictionOrder_WriteLRU(t *testing.T) {
 func TestRAGCache_TTLExpiry_MapAndListConsistency(t *testing.T) {
 	r := &OpenAIRouter{}
 	ttlSec := 1
-	cfg := &config.RAGPluginConfig{
+	cfg := &config.ContextSource{
+		Type:            config.ContextSourceRAG,
 		Backend:         "ttltest",
 		CacheResults:    true,
 		CacheTTLSeconds: &ttlSec,
@@ -130,7 +131,7 @@ func TestRAGCache_TTLExpiry_MapAndListConsistency(t *testing.T) {
 
 	// Inject an entry directly with a RetrievedAt already 2 hours in the past,
 	// so it is expired relative to the 1-second TTL.
-	key := r.buildRAGCacheKey("expired-query", cfg)
+	key := r.buildRAGCacheKey(config.DefaultRecipeName, "expired-query", cfg)
 	expiredEntry := &RAGCacheEntry{
 		Context:     "stale-context",
 		RetrievedAt: time.Now().Add(-2 * time.Hour),
@@ -142,7 +143,7 @@ func TestRAGCache_TTLExpiry_MapAndListConsistency(t *testing.T) {
 
 	// Call the real production function — it must detect expiry, remove the
 	// entry from both cache.cache and cache.lru, and return a miss.
-	ctx, ok := r.getRAGCache("expired-query", cfg)
+	ctx, ok := r.getRAGCache(config.DefaultRecipeName, "expired-query", cfg)
 	if ok || ctx != "" {
 		t.Fatalf("expected miss for expired entry, got ok=%v ctx=%q", ok, ctx)
 	}
@@ -218,8 +219,8 @@ func TestRAGCache_ConcurrentReadsDontDeadlock(t *testing.T) {
 // immediately when CacheResults is false, without touching the singleton.
 func TestGetRAGCache_CacheDisabled(t *testing.T) {
 	r := &OpenAIRouter{}
-	cfg := &config.RAGPluginConfig{CacheResults: false}
-	ctx, ok := r.getRAGCache("query", cfg)
+	cfg := &config.ContextSource{Type: config.ContextSourceRAG, CacheResults: false}
+	ctx, ok := r.getRAGCache(config.DefaultRecipeName, "query", cfg)
 	if ok || ctx != "" {
 		t.Errorf("expected miss when CacheResults=false, got ok=%v ctx=%q", ok, ctx)
 	}

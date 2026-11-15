@@ -58,7 +58,7 @@ func GenerateReport(comparisons []ComparisonResult, metadata ReportMetadata) *Re
 
 // SaveJSON saves the report as JSON
 func (r *Report) SaveJSON(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create report directory: %w", err)
 	}
 
@@ -67,7 +67,7 @@ func (r *Report) SaveJSON(path string) error {
 		return fmt.Errorf("failed to marshal report: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("failed to write report file: %w", err)
 	}
 
@@ -77,7 +77,7 @@ func (r *Report) SaveJSON(path string) error {
 
 // SaveMarkdown saves the report as Markdown
 func (r *Report) SaveMarkdown(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create report directory: %w", err)
 	}
 
@@ -117,7 +117,7 @@ func (r *Report) SaveMarkdown(path string) error {
 		}
 
 		// ns/op row
-		md.WriteString(fmt.Sprintf("| %s | ns/op | %d | %d | %+.2f%% | %s |\n",
+		md.WriteString(fmt.Sprintf("| %s | ns/op | %.1f | %.1f | %+.2f%% | %s |\n",
 			comp.BenchmarkName,
 			comp.Baseline.NsPerOp,
 			comp.Current.NsPerOp,
@@ -146,7 +146,7 @@ func (r *Report) SaveMarkdown(path string) error {
 		}
 	}
 
-	if err := os.WriteFile(path, []byte(md.String()), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(md.String()), 0o644); err != nil {
 		return fmt.Errorf("failed to write markdown report: %w", err)
 	}
 
@@ -156,7 +156,7 @@ func (r *Report) SaveMarkdown(path string) error {
 
 // SaveHTML saves the report as HTML
 func (r *Report) SaveHTML(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create report directory: %w", err)
 	}
 
@@ -222,7 +222,7 @@ func (r *Report) SaveHTML(path string) error {
 			statusText = "IMPROVED"
 		}
 
-		html.WriteString(fmt.Sprintf(`            <tr><td>%s</td><td>ns/op</td><td>%d</td><td>%d</td><td>%+.2f%%</td><td class="%s">%s</td></tr>`,
+		html.WriteString(fmt.Sprintf(`            <tr><td>%s</td><td>ns/op</td><td>%.1f</td><td>%.1f</td><td>%+.2f%%</td><td class="%s">%s</td></tr>`,
 			comp.BenchmarkName,
 			comp.Baseline.NsPerOp,
 			comp.Current.NsPerOp,
@@ -237,7 +237,7 @@ func (r *Report) SaveHTML(path string) error {
 	html.WriteString(`</body>`)
 	html.WriteString(`</html>`)
 
-	if err := os.WriteFile(path, []byte(html.String()), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(html.String()), 0o644); err != nil {
 		return fmt.Errorf("failed to write HTML report: %w", err)
 	}
 

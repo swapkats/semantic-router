@@ -4,8 +4,6 @@
 
 `system_prompt` is a route-local plugin for inserting or modifying the system prompt on matched traffic.
 
-It aligns to `config/plugin/system-prompt/expert.yaml`.
-
 ## Key Advantages
 
 - Keeps instruction shaping local to the route.
@@ -24,13 +22,27 @@ Some routes need a different instruction layer than the router default. `system_
 
 ## Configuration
 
-Use this fragment under `routing.decisions[].plugins`:
+Add the plugin under `recipes[].decisions[].plugins`:
 
 ```yaml
-plugin:
-  type: system_prompt
-  configuration:
-    enabled: true
-    mode: insert
-    system_prompt: You are a domain expert. Answer precisely, state tradeoffs, and keep the response actionable.
+plugins:
+  - type: system_prompt
+    configuration:
+      enabled: true
+      mode: insert
+      system_prompt: You are a domain expert. Answer precisely and state tradeoffs.
 ```
+
+`mode: insert` (the default) puts this prompt before the caller's system
+prompt. `mode: replace` drops every system and developer instruction the
+caller sent, including the Responses `instructions` field, and sends this
+prompt in their place, followed by any context a `context` plugin injected
+into the system prompt. Any other mode fails at load, and
+`vllm-sr config migrate` writes it as `replace`. Such a mode replaced only
+the caller's first system message, so after the rewrite the caller's other
+system and developer instructions are dropped as well.
+
+The inserted text is sent to the selected model and can change cache identity
+and model behavior. Keep secrets and untrusted caller text out of it. See a
+complete example:
+[`config/fragments/plugin/system-prompt/expert.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/plugin/system-prompt/expert.yaml).

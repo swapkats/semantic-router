@@ -1,6 +1,10 @@
 package dsl
 
-import "github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+import (
+	"gopkg.in/yaml.v2"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
 
 func (c *Compiler) compileRoutes() {
 	for _, r := range c.prog.Routes {
@@ -15,6 +19,13 @@ func (c *Compiler) compileRoute(r *RouteDecl) config.Decision {
 		Priority:    r.Priority,
 		Tier:        r.Tier,
 		Rules:       c.compileRouteRules(r),
+	}
+	decision.Rules.OnUnknown = config.UnknownPolicy(r.OnUnknown)
+	if r.Action != nil {
+		decision.Action = &config.DecisionAction{
+			Type:        r.Action.Type,
+			Destination: r.Action.Destination,
+		}
 	}
 
 	for _, m := range r.Models {
@@ -41,7 +52,8 @@ func (c *Compiler) compileRoute(r *RouteDecl) config.Decision {
 		}
 	}
 
-	c.compileRouteEmits(r, &decision)
+	c.compileRouteRetention(r, &decision)
+	c.compileRouteOutput(r, &decision)
 	return decision
 }
 
@@ -59,24 +71,6 @@ func (c *Compiler) compileRouteRules(r *RouteDecl) config.RuleCombination {
 	return rules
 }
 
-func (c *Compiler) compileRouteEmits(r *RouteDecl, decision *config.Decision) {
-	seenEmitKinds := make(map[string]bool, len(r.Emits))
-	for _, e := range r.Emits {
-		if e == nil {
-			continue
-		}
-		if seenEmitKinds[e.Kind] {
-			c.addError(e.Pos, "ROUTE %s EMIT: duplicate EMIT kind %q in the same route. Each kind may appear at most once", r.Name, e.Kind)
-			continue
-		}
-		seenEmitKinds[e.Kind] = true
-		if !c.validateEmitForCompile(r, e) {
-			continue
-		}
-		decision.Emits = append(decision.Emits, compileEmitDecl(e))
-	}
-}
-
 func (c *Compiler) appendModelRef(decision *config.Decision, m *ModelRef) {
 	if decision == nil || m == nil {
 		return
@@ -91,6 +85,9 @@ func (c *Compiler) appendModelRef(decision *config.Decision, m *ModelRef) {
 	}
 	if m.Effort != "" {
 		ref.ReasoningEffort = m.Effort
+	}
+	if m.Mode != "" {
+		ref.ReasoningMode = m.Mode
 	}
 	decision.ModelRefs = append(decision.ModelRefs, ref)
 
@@ -136,6 +133,9 @@ func (c *Compiler) compileCandidateIteration(iter *CandidateIterationDecl) confi
 		}
 		if model.Effort != "" {
 			ref.ReasoningEffort = model.Effort
+		}
+		if model.Mode != "" {
+			ref.ReasoningMode = model.Mode
 		}
 		compiled.Models = append(compiled.Models, ref)
 	}
@@ -184,14 +184,40 @@ func (c *Compiler) compileBoolExpr(expr BoolExpr) config.RuleCombination {
 			},
 		}
 	case *SignalRefExpr:
-		return config.RuleCombination{
-			Type: e.SignalType,
-			Name: e.SignalName,
-		}
+		return c.compileSignalRefExpr(e)
 	default:
 		c.addError(Position{}, "unknown bool expression type %T", expr)
 		return config.RuleCombination{}
 	}
+}
+
+func (c *Compiler) compileSignalRefExpr(
+	expr *SignalRefExpr,
+) config.RuleCombination {
+	node := config.RuleCombination{
+		Type: expr.SignalType,
+		Name: expr.SignalName,
+	}
+	if label, ok := getStringField(expr.Fields, "label"); ok {
+		node.Label = label
+	}
+	if onError, ok := getStringField(expr.Fields, "on_error"); ok {
+		node.OnError = onError
+	}
+	if rawPredicate, ok := expr.Fields["predicate"].(ObjectValue); ok {
+		payload, err := yaml.Marshal(fieldsToMap(rawPredicate.Fields))
+		if err != nil {
+			c.addError(expr.Pos, "failed to encode predicate: %v", err)
+			return node
+		}
+		var predicate config.NumericPredicate
+		if err := yaml.Unmarshal(payload, &predicate); err != nil {
+			c.addError(expr.Pos, "failed to decode predicate: %v", err)
+			return node
+		}
+		node.Predicate = &predicate
+	}
+	return node
 }
 
 func (c *Compiler) flattenBoolExpr(
@@ -207,27 +233,4 @@ func (c *Compiler) flattenBoolExpr(
 		return result
 	}
 	return []config.RuleNode{c.compileBoolExpr(expr)}
-}
-
-func compileComposerObj(ov ObjectValue) config.RuleCombination {
-	rc := config.RuleCombination{}
-	if t, ok := getStringField(ov.Fields, "type"); ok {
-		rc.Type = t
-	}
-	if n, ok := getStringField(ov.Fields, "name"); ok {
-		rc.Name = n
-	}
-	if op, ok := getStringField(ov.Fields, "operator"); ok {
-		rc.Operator = op
-	}
-	if arr, ok := ov.Fields["conditions"]; ok {
-		if av, ok := arr.(ArrayValue); ok {
-			for _, item := range av.Items {
-				if obj, ok := item.(ObjectValue); ok {
-					rc.Conditions = append(rc.Conditions, compileComposerObj(obj))
-				}
-			}
-		}
-	}
-	return rc
 }

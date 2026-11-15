@@ -2,9 +2,8 @@
 
 ## Overview
 
-Use `config/decision/composite/` when the policy needs nested `AND`, `OR`, and `NOT` logic in one route.
-
-This is the right shape for realistic production policies where business logic and safety logic have to coexist.
+A composite decision nests `AND`, `OR`, and `NOT` groups in one route. Use it
+when business, operational, and safety requirements must be evaluated together.
 
 ## Key Advantages
 
@@ -17,11 +16,12 @@ This is the right shape for realistic production policies where business logic a
 
 Flat boolean rules stop scaling once a route depends on multiple independent branches, exclusions, and escalation paths.
 
-`composite/` solves that by letting you encode a real match tree instead of forcing complex policy into a simplistic shape.
+Composite decisions encode the policy as a readable match tree instead of
+forcing it into a flat list of conditions.
 
 ## When to Use
 
-Use `composite/` when:
+Use a composite decision when:
 
 - domain-specific routing needs urgency or complexity escalation
 - production safety policy must exclude unsafe traffic
@@ -29,32 +29,38 @@ Use `composite/` when:
 
 ## Configuration
 
-Source fragment: `config/decision/composite/priority-safe-escalation.yaml`
-
 ```yaml
-routing:
-  decisions:
-    - name: priority_safe_escalation_route
-      description: Combine AND, OR, and NOT for a realistic multi-signal routing case.
-      priority: 160
-      rules:
-        operator: AND
-        conditions:
-          - type: domain
-            name: business
-          - operator: OR
-            conditions:
-              - type: keyword
-                name: urgent_keywords
-              - type: complexity
-                name: needs_reasoning:hard
-          - operator: NOT
-            conditions:
-              - type: jailbreak
-                name: prompt_injection
-      modelRefs:
-        - model: qwen2.5:3b
-          use_reasoning: true
+recipes:
+  - name: default
+    decisions:
+      - name: priority_safe_escalation_route
+        description: Combine AND, OR, and NOT for a realistic multi-signal routing case.
+        priority: 160
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: business
+            - operator: OR
+              conditions:
+                - type: keyword
+                  name: urgent_keywords
+                - type: complexity
+                  name: needs_reasoning
+                  label: hard
+            - operator: NOT
+              conditions:
+                - type: jailbreak
+                  name: prompt_injection
+        modelRefs:
+          - model: qwen2.5:3b
+            use_reasoning: true
 ```
 
-If a decision needs nested logic, prefer a `composite/` fragment instead of stretching one flat rule block until it becomes unreadable.
+If a decision needs nested logic, keep the groups explicit instead of
+stretching one flat rule block until it becomes unreadable.
+
+Keep nesting shallow enough to review and test each branch. Signal results can
+be probabilistic, so a complex tree is not a substitute for authorization or
+backend policy. See a complete example:
+[`config/fragments/decision/composite/priority-safe-escalation.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/decision/composite/priority-safe-escalation.yaml).

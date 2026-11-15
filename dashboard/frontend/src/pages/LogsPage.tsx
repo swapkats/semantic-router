@@ -1,14 +1,21 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import DashboardManagerLayout from '../components/DashboardManagerLayout'
+import ProductLoadingState from '../components/ProductLoadingState'
+import ProductIcon from '../components/ProductIcon'
+import { createVisibilityAwareRequest } from './visibilityAwareRequest'
+import {
+  describeLogsAvailability,
+  filterLogs,
+  getLogLevel,
+  type LogEntry,
+  type LogLevel,
+} from './logsPageSupport'
 import styles from './LogsPage.module.css'
-
-interface LogEntry {
-  line: string
-  service?: string
-}
 
 interface LogsResponse {
   deployment_type: string
   service: string
+  supported: boolean
   logs: LogEntry[]
   count: number
   error?: string
@@ -28,47 +35,77 @@ const LogsPage: React.FC = () => {
   const [selectedComponent, setSelectedComponent] = useState<ComponentType>('all')
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [deploymentType, setDeploymentType] = useState<string>('detecting...')
+  const [supported, setSupported] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [autoScroll, setAutoScroll] = useState(true)
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [lines, setLines] = useState(100)
+  const [query, setQuery] = useState('')
+  const [level, setLevel] = useState<LogLevel>('all')
   const logsContainerRef = useRef<HTMLDivElement>(null)
+  const requestControllerRef = useRef<AbortController | null>(null)
 
   const fetchLogs = useCallback(async () => {
+    requestControllerRef.current?.abort()
+    const controller = new AbortController()
+    requestControllerRef.current = controller
     try {
-      const response = await fetch(`/api/logs?component=${selectedComponent}&lines=${lines}`)
+      const response = await fetch(`/api/logs?component=${selectedComponent}&lines=${lines}`, {
+        signal: controller.signal,
+      })
       if (!response.ok) {
         throw new Error(`Failed to fetch logs: ${response.statusText}`)
       }
       const data: LogsResponse = await response.json()
+      if (controller.signal.aborted) return
       setLogs(data.logs || [])
       setDeploymentType(data.deployment_type)
+      setSupported(data.supported)
       setError(data.error || null)
       setMessage(data.message || null)
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
-      setLoading(false)
+      if (requestControllerRef.current === controller) setLoading(false)
     }
   }, [selectedComponent, lines])
 
+  const logsRequest = useMemo(() => createVisibilityAwareRequest(fetchLogs), [fetchLogs])
+
   useEffect(() => {
     setLoading(true)
-    fetchLogs()
+    void logsRequest.run({ allowHidden: true })
+
+    const refreshWhenVisible = () => {
+      if (!document.hidden) void logsRequest.run()
+    }
+    document.addEventListener('visibilitychange', refreshWhenVisible)
 
     if (autoRefresh) {
-      const interval = setInterval(fetchLogs, 5000)
-      return () => clearInterval(interval)
+      const interval = window.setInterval(() => void logsRequest.run(), 5000)
+      return () => {
+        window.clearInterval(interval)
+        document.removeEventListener('visibilitychange', refreshWhenVisible)
+        requestControllerRef.current?.abort()
+      }
     }
-  }, [fetchLogs, autoRefresh])
+
+    return () => {
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      requestControllerRef.current?.abort()
+    }
+  }, [autoRefresh, logsRequest])
+
+  const filteredLogs = useMemo(() => filterLogs(logs, query, level), [level, logs, query])
 
   useEffect(() => {
     if (autoScroll && logsContainerRef.current) {
       logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight
     }
-  }, [logs, autoScroll])
+  }, [filteredLogs, autoScroll])
 
   const formatDeploymentType = (type: string) => {
     if (type === 'none') return 'Not detected'
@@ -79,59 +116,23 @@ const LogsPage: React.FC = () => {
       .join(' ')
   }
 
-  const getLogLevel = (line: string): string => {
-    const lowerLine = line.toLowerCase()
-    if (lowerLine.includes('"level":"error"') || lowerLine.includes('[error]')) return 'error'
-    if (lowerLine.includes('"level":"warn"') || lowerLine.includes('[warn]')) return 'warn'
-    if (lowerLine.includes('"level":"info"') || lowerLine.includes('[info]')) return 'info'
-    if (lowerLine.includes('"level":"debug"') || lowerLine.includes('[debug]')) return 'debug'
-    return ''
-  }
-
   const activeComponentLabel =
     COMPONENT_OPTIONS.find((option) => option.value === selectedComponent)?.label || 'All services'
 
   return (
     <div className={styles.container}>
-      <div className={styles.header}>
-        <div className={styles.headerLeft}>
-          <span className={styles.eyebrow}>Operations</span>
-          <h1 className={styles.title}>System Logs</h1>
-          <p className={styles.subtitle}>View live output from vLLM Semantic Router services and runtime helpers.</p>
-        </div>
-        <div className={styles.headerRight}>
-          <span className={styles.headerMeta}>Active stream: {activeComponentLabel}</span>
-          <span className={styles.headerMeta}>Deployment: {formatDeploymentType(deploymentType)}</span>
-        </div>
-      </div>
-
-      <div className={styles.summaryGrid}>
-        <article className={styles.summaryCard}>
-          <span className={styles.summaryLabel}>Deployment</span>
-          <strong className={styles.summaryValue}>{formatDeploymentType(deploymentType)}</strong>
-          <span className={styles.summaryHint}>Resolved from the active runtime environment.</span>
-        </article>
-        <article className={styles.summaryCard}>
-          <span className={styles.summaryLabel}>Selected source</span>
-          <strong className={styles.summaryValue}>{activeComponentLabel}</strong>
-          <span className={styles.summaryHint}>Switch sources without changing the log viewport width.</span>
-        </article>
-        <article className={styles.summaryCard}>
-          <span className={styles.summaryLabel}>Entries loaded</span>
-          <strong className={styles.summaryValue}>{logs.length}</strong>
-          <span className={styles.summaryHint}>Showing the latest {lines} lines per request.</span>
-        </article>
-      </div>
-
-      <section className={styles.controlPanel}>
-        <div className={styles.controlPanelHeader}>
-          <div>
-            <h2 className={styles.panelTitle}>Stream controls</h2>
-            <p className={styles.panelSubtitle}>Tune source selection, tail length, and live refresh behavior.</p>
-          </div>
-        </div>
-
-        <div className={styles.controls}>
+      <DashboardManagerLayout
+        eyebrow="System"
+        title="System Logs"
+        description="Search live output across the router, gateway, and dashboard."
+        meta={[
+          { label: 'Stream', value: activeComponentLabel },
+          { label: 'Deployment', value: formatDeploymentType(deploymentType) },
+          { label: 'Access', value: describeLogsAvailability(supported) },
+          { label: 'Entries', value: logs.length },
+        ]}
+      >
+        <section className={styles.streamToolbar} aria-label="Log filters">
           <div className={styles.serviceSelector}>
             {COMPONENT_OPTIONS.map((option) => (
               <button
@@ -145,8 +146,32 @@ const LogsPage: React.FC = () => {
           </div>
 
           <div className={styles.controlsRight}>
+            <label className={styles.filterField}>
+              <span className={styles.srOnly}>Search logs</span>
+              <input
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search logs"
+              />
+            </label>
+
+            <label className={styles.filterField}>
+              <span className={styles.srOnly}>Level</span>
+              <select value={level} onChange={(event) => setLevel(event.target.value as LogLevel)}>
+                <option value="all">All levels</option>
+                <option value="error">Error</option>
+                <option value="warn">Warning</option>
+                <option value="info">Info</option>
+                <option value="debug">Debug</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
+
             <div className={styles.linesSelector}>
-              <label htmlFor="logs-lines">Lines</label>
+              <label htmlFor="logs-lines" className={styles.srOnly}>
+                Lines
+              </label>
               <select
                 id="logs-lines"
                 value={lines}
@@ -178,68 +203,86 @@ const LogsPage: React.FC = () => {
               <span>Auto-scroll</span>
             </label>
 
-            <button onClick={fetchLogs} className={styles.refreshButton}>
+            <button
+              onClick={() => void logsRequest.run({ allowHidden: true })}
+              className={styles.refreshButton}
+            >
+              <ProductIcon name="refresh" width={15} height={15} />
               Refresh
             </button>
           </div>
-        </div>
-      </section>
+        </section>
 
-      {error && (
-        <div className={styles.error}>
-          <span className={styles.messageLabel}>Log error</span>
-          <span>{error}</span>
-        </div>
-      )}
-
-      {message && !error && (
-        <div className={styles.info}>
-          <span className={styles.messageLabel}>Notice</span>
-          <span>{message}</span>
-        </div>
-      )}
-
-      <div className={styles.logsSection}>
-        <div className={styles.logsHeader}>
-          <div className={styles.logsHeaderText}>
-            <span className={styles.logsEyebrow}>Live stream</span>
-            <span className={styles.logsTitle}>{activeComponentLabel}</span>
+        {error && (
+          <div className={styles.error}>
+            <span className={styles.messageLabel}>Log error</span>
+            <span>{error}</span>
           </div>
-          <span className={styles.logsCount}>{logs.length} entries</span>
-        </div>
+        )}
 
-        <div ref={logsContainerRef} className={styles.logsContainer}>
-          {loading && logs.length === 0 ? (
-            <div className={styles.loadingLogs}>
-              <div className={styles.spinner}></div>
-              <span>Fetching logs...</span>
+        {message && !error && (
+          <div className={styles.info}>
+            <span className={styles.messageLabel}>Notice</span>
+            <span>{message}</span>
+          </div>
+        )}
+
+        <div className={styles.logsSection}>
+          <div className={styles.logsHeader}>
+            <div className={styles.logsHeaderText}>
+              <span className={styles.logsEyebrow}>Live stream</span>
+              <span className={styles.logsTitle}>{activeComponentLabel}</span>
             </div>
-          ) : logs.length === 0 ? (
-            <div className={styles.noLogs}>
-              <p className={styles.noLogsTitle}>No logs available</p>
-              {deploymentType === 'none' && (
+            <span className={styles.logsCount} aria-live="polite">
+              {filteredLogs.length === logs.length
+                ? `${logs.length} entries`
+                : `${filteredLogs.length} of ${logs.length} entries`}
+            </span>
+          </div>
+
+          <div ref={logsContainerRef} className={styles.logsContainer}>
+            {loading && logs.length === 0 ? (
+              <ProductLoadingState label="Loading logs" compact />
+            ) : supported === false ? (
+              <div className={styles.noLogs}>
+                <p className={styles.noLogsTitle}>Runtime logs unavailable</p>
                 <p className={styles.noLogsHint}>
-                  No running deployment detected. Start the router first.
+                  Start the local split runtime with vllm-sr serve to provision its bounded shared
+                  log spool.
                 </p>
-              )}
-            </div>
-          ) : (
-            <div className={styles.logsList}>
-              {logs.map((log, index) => {
-                const level = getLogLevel(log.line)
-                return (
-                  <div 
-                    key={index} 
-                    className={`${styles.logEntry} ${level ? styles[`level${level.charAt(0).toUpperCase() + level.slice(1)}`] : ''}`}
-                  >
-                    <span className={styles.logLine}>{log.line}</span>
-                  </div>
-                )
-              })}
-            </div>
-          )}
+              </div>
+            ) : logs.length === 0 ? (
+              <div className={styles.noLogs}>
+                <p className={styles.noLogsTitle}>No logs available</p>
+                {deploymentType === 'none' && (
+                  <p className={styles.noLogsHint}>
+                    No running deployment detected. Start the router first.
+                  </p>
+                )}
+              </div>
+            ) : filteredLogs.length === 0 ? (
+              <div className={styles.noLogs}>
+                <p className={styles.noLogsTitle}>No matching logs</p>
+                <p className={styles.noLogsHint}>Change the search or level filter.</p>
+              </div>
+            ) : (
+              <div className={styles.logsList}>
+                {filteredLogs.map((log, index) => {
+                  const level = getLogLevel(log.line)
+                  return (
+                    <div
+                      key={`${log.service ?? 'service'}-${index}-${log.line.slice(0, 32)}`}
+                      className={`${styles.logEntry} ${level !== 'other' ? styles[`level${level.charAt(0).toUpperCase() + level.slice(1)}`] : ''}`}
+                    >
+                      <span className={styles.logLine}>{log.line}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      </DashboardManagerLayout>
     </div>
   )
 }

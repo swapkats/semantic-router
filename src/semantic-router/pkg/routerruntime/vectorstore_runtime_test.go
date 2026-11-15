@@ -1,0 +1,248 @@
+package routerruntime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/embedding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/vectorstore"
+)
+
+// The vector store embeds with the openai_embeddings deployment
+// embeddings.default names, as it did with the deprecated endpoint block.
+func TestVectorStoreEmbedsWithTheEmbeddingsDefaultDeployment(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		requests = append(requests, request.Model)
+		data := make([]map[string]any, len(request.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float32{0, 1}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer server.Close()
+
+	cfg := &config.RouterConfig{VectorStore: &config.VectorStoreConfig{
+		Enabled: true, BackendType: "memory", Embedding: &config.EmbeddingBinding{Dimension: 2},
+		FileStorageDir: t.TempDir(), MetadataStore: "memory",
+	}}
+	cfg.ModelDeployments = map[string]config.ModelDeployment{"remote-embed": {
+		Provider: config.OpenAIEmbeddingsProvider, Endpoint: server.URL, Model: "bge-m3",
+		Capabilities: &config.DeploymentCapabilities{Dimensions: 2},
+	}}
+	cfg.EmbeddingDeployment = "remote-embed"
+	if copied := vectorStoreEmbeddingConfig(cfg); copied.EmbeddingDeployment != "remote-embed" {
+		t.Fatalf("the vector store's configuration lost embeddings.default: %q", copied.EmbeddingDeployment)
+	}
+	runtime, err := NewVectorStoreRuntime(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("the vector store did not prepare the embeddings.default deployment: %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := runtime.Shutdown(); shutdownErr != nil {
+			t.Error(shutdownErr)
+		}
+	})
+	vector, err := runtime.Embedder.Embed(context.Background(), "ingestion query")
+	if err != nil || !reflect.DeepEqual(vector, []float32{0, 1}) {
+		t.Fatalf("embedded %v (err %v), want the remote deployment's vector", vector, err)
+	}
+	if len(requests) == 0 || requests[len(requests)-1] != "bge-m3" {
+		t.Fatalf("the remote deployment was not asked: %v", requests)
+	}
+}
+
+func TestVectorStoreResolvesPreparedOmniWidthBeforeSelectingView(t *testing.T) {
+	for _, size := range []int{384, 768} {
+		provider, _ := embedding.NewFuncProvider("owned-test", size, func(context.Context, string) ([]float32, error) {
+			t.Fatal("preparation ran inference")
+			return nil, nil
+		})
+		prepared := embedding.NewSet(map[string]embedding.Provider{"omni": provider}, "omni")
+		for _, requested := range []int{0, size} {
+			selected, dimension, err := prepareVectorStoreEmbedding(prepared, "omni", requested)
+			if err != nil || dimension != size || selected.Dimension() != size {
+				t.Fatalf("size %d requested %d: %v", size, requested, err)
+			}
+		}
+		for _, requested := range []int{-1, 128} {
+			if _, _, err := prepareVectorStoreEmbedding(prepared, "omni", requested); err == nil {
+				t.Fatal("unchecked option view accepted an unsupported dimension")
+			}
+		}
+	}
+}
+
+func TestVectorStoreRuntimeUsesEndpointWidthForStorage(t *testing.T) {
+	for _, size := range []int{384, 768} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					Input []string `json:"input"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				values := make([]float32, size)
+				values[0] = 1
+				data := make([]map[string]any, len(request.Input))
+				for i := range data {
+					data[i] = map[string]any{"index": i, "embedding": values}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+			}))
+			defer server.Close()
+			makeConfig := func(dimension int) *config.RouterConfig {
+				cfg := &config.RouterConfig{VectorStore: &config.VectorStoreConfig{Enabled: true, BackendType: "memory", Embedding: &config.EmbeddingBinding{Dimension: dimension}, FileStorageDir: filepath.Join(t.TempDir(), "files"), MetadataStore: "memory"}}
+				cfg.EmbeddingDeployment = "prepared"
+				cfg.ModelDeployments = map[string]config.ModelDeployment{"prepared": {
+					Provider: config.OpenAIEmbeddingsProvider, Endpoint: server.URL, Model: "prepared", Capabilities: &config.DeploymentCapabilities{Dimensions: size},
+				}}
+				return cfg
+			}
+			cfg := makeConfig(0)
+			runtime, err := NewVectorStoreRuntime(cfg, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if shutdownErr := runtime.Shutdown(); shutdownErr != nil {
+					t.Error(shutdownErr)
+				}
+			})
+			if runtime.dimension != size || runtime.Embedder.Dimension() != size {
+				t.Fatalf("default width did not resolve to %d", size)
+			}
+			if _, createErr := runtime.Manager.CreateStore(context.Background(), vectorstore.CreateStoreRequest{Name: "actual-width"}); createErr != nil {
+				t.Fatal(createErr)
+			}
+			values, err := runtime.Embedder.Embed(context.Background(), "document")
+			if err != nil || len(values) != size {
+				t.Fatalf("full output lost: %d %v", len(values), err)
+			}
+			bad := makeConfig(128)
+			if _, err := NewVectorStoreRuntime(bad, nil, nil); err == nil {
+				t.Fatal("explicit mismatch accepted")
+			}
+			if _, err := os.Stat(bad.VectorStore.FileStorageDir); !os.IsNotExist(err) {
+				t.Fatal("invalid width opened storage before rejecting")
+			}
+		})
+	}
+}
+
+// runtimeIdentityProvider identifies its vectors as a model runtime
+// embedding does, by package digest and view.
+type runtimeIdentityProvider struct {
+	embedding.Provider
+	digest string
+}
+
+func (p runtimeIdentityProvider) RepresentationIdentity(options embedding.Options, policy string) (embedding.ContentIdentity, error) {
+	return embedding.IdentityForRuntime(embedding.RuntimeDescriptor{
+		ModelType: "mmbert", Runtime: "model_runtime", PoolingContract: "mean",
+		Artifacts: []embedding.ArtifactDigest{{Role: "package", SHA256: p.digest}},
+		Layer:     options.Layer, Dimension: options.Dimension,
+	}, policy)
+}
+
+func TestVectorStoreRejectsStoresOfAnotherRepresentation(t *testing.T) {
+	ctx := context.Background()
+	provider, err := embedding.NewFuncProvider(config.ModelRuntimeProvider, 3, func(context.Context, string) ([]float32, error) {
+		t.Fatal("identity resolution ran inference")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := resolveVectorStoreEmbeddingIdentity(runtimeIdentityProvider{Provider: provider, digest: strings.Repeat("a", 64)}, config.EmbeddingDefaultDeployment, 3)
+	if err != nil || identity.Fingerprint == "" {
+		t.Fatalf("runtime embedding has no vector-store identity: %+v %v", identity, err)
+	}
+	upgraded, err := resolveVectorStoreEmbeddingIdentity(runtimeIdentityProvider{Provider: provider, digest: strings.Repeat("b", 64)}, config.EmbeddingDefaultDeployment, 3)
+	if err != nil || upgraded.Fingerprint == identity.Fingerprint {
+		t.Fatalf("a changed model package kept the vector-store identity: %+v %v", upgraded, err)
+	}
+
+	backend := vectorstore.NewMemoryBackend(vectorstore.MemoryBackendConfig{})
+	registry := vectorstore.NewMemoryMetadataRegistry()
+	old := vectorstore.NewManager(backend, registry, 3, vectorstore.BackendTypeMemory, vectorstore.WithEmbeddingIdentity(identity.Fingerprint))
+	store, err := old.CreateStore(ctx, vectorstore.CreateStoreRequest{Name: "old package"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := vectorstore.EmbeddedChunk{ID: "old", Content: "historical", Embedding: []float32{1, 0, 0}}
+	if err = old.InsertChunks(ctx, store.ID, []vectorstore.EmbeddedChunk{chunk}); err != nil {
+		t.Fatal(err)
+	}
+
+	current := vectorstore.NewManager(backend, registry, 3, vectorstore.BackendTypeMemory, vectorstore.WithEmbeddingIdentity(upgraded.Fingerprint))
+	if err = current.LoadFromRegistry(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = current.Search(ctx, store.ID, chunk.Embedding, 1, 0, nil); !errors.Is(err, vectorstore.ErrEmbeddingIncompatible) {
+		t.Fatalf("a query of the new package compared with vectors of the old one: %v", err)
+	}
+	if err = current.InsertChunks(ctx, store.ID, []vectorstore.EmbeddedChunk{chunk}); !errors.Is(err, vectorstore.ErrEmbeddingIncompatible) {
+		t.Fatalf("a vector of the new package appended to a store of the old one: %v", err)
+	}
+
+	fresh, err := current.CreateStore(ctx, vectorstore.CreateStoreRequest{Name: "new package"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Metadata[vectorstore.EmbeddingIdentityMetadataKey] != upgraded.Fingerprint {
+		t.Fatal("new vector store omitted the representation identity")
+	}
+	if err = current.InsertChunks(ctx, fresh.ID, []vectorstore.EmbeddedChunk{chunk}); err != nil {
+		t.Fatal(err)
+	}
+	restarted := vectorstore.NewManager(backend, registry, 3, vectorstore.BackendTypeMemory, vectorstore.WithEmbeddingIdentity(upgraded.Fingerprint))
+	if err = restarted.LoadFromRegistry(ctx); err != nil {
+		t.Fatal(err)
+	}
+	results, err := restarted.Search(ctx, fresh.ID, chunk.Embedding, 1, 0, nil)
+	if err != nil || len(results) != 1 {
+		t.Fatalf("matching identity could not reuse the new store: %v %v", results, err)
+	}
+	if _, err = restarted.Search(ctx, store.ID, chunk.Embedding, 1, 0, nil); !errors.Is(err, vectorstore.ErrEmbeddingIncompatible) {
+		t.Fatalf("restart adopted the old package's vector store: %v", err)
+	}
+}
+
+// A provider that cannot state a content identity (a remote endpoint) keeps
+// the configured store namespace, whatever the model is called.
+func TestVectorStoreProvidersWithoutContentIdentityKeepTheirNamespace(t *testing.T) {
+	embed := func(context.Context, string) ([]float32, error) { return []float32{1, 0, 0}, nil }
+	for _, backend := range []string{"test", config.EmbeddingBackendOpenAICompatible} {
+		provider, err := embedding.NewFuncProvider(backend, 3, embed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, deployment := range []string{config.EmbeddingDefaultDeployment, "qwen3-embedding"} {
+			identity, err := resolveVectorStoreEmbeddingIdentity(provider, deployment, 3)
+			if err != nil || identity.Fingerprint != "" {
+				t.Fatalf("%s %s acquired a new namespace: %+v %v", backend, deployment, identity, err)
+			}
+		}
+	}
+}

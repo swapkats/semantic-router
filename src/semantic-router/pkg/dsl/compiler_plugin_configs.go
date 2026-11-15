@@ -1,11 +1,13 @@
 package dsl
 
-import "github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+import (
+	"fmt"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
 
 func (c *Compiler) buildDecisionPlugin(pluginType string, fields map[string]Value) *config.DecisionPlugin {
-	if pluginType == "semantic_cache" {
-		pluginType = "semantic-cache"
-	}
+	pluginType = config.NormalizeDecisionPluginType(pluginType)
 	dp := &config.DecisionPlugin{Type: pluginType}
 	cfg, ok := c.buildPluginConfigValue(pluginType, fields)
 	if !ok {
@@ -33,29 +35,26 @@ var pluginConfigCompilers = map[string]pluginConfigCompiler{
 	"system_prompt": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
 		return c.compileSystemPromptPluginConfig(fields), true
 	},
-	"semantic_cache": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileSemanticCachePluginConfig(fields), true
+	"response_cache": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
+		return compileStrictPluginFields(c, "response_cache", fields, &config.ResponseCachePluginConfig{})
 	},
-	"semantic-cache": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileSemanticCachePluginConfig(fields), true
+	"context": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
+		return compileStrictPluginFields(c, "context", fields, &config.ContextPluginConfig{})
 	},
-	"hallucination": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileHallucinationPluginConfig(fields), true
+	"prompt_cache": compilePromptCachePluginConfig,
+	// masking decodes its fields as written: hand-mapping them would only add
+	// a place to forget one (#3566).
+	"masking": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
+		return compileStrictPluginFields(c, "masking", fields, &config.MaskingPluginConfig{})
 	},
-	"memory": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileMemoryPluginConfig(fields), true
-	},
-	"rag": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileRAGPlugin(fields), true
+	"response_guard": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
+		return compileStrictPluginFields(c, "response_guard", fields, &config.ResponseGuardPluginConfig{})
 	},
 	"header_mutation": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return config.HeaderMutationPluginConfig{}, true
+		return c.compileHeaderMutationPluginConfig(fields), true
 	},
 	"router_replay": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileRouterReplayPluginConfig(fields), true
-	},
-	"image_gen": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileImageGenPluginConfig(fields), true
+		return c.compileRouterReplayPluginConfig(fields)
 	},
 	"fast_response": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
 		return c.compileFastResponsePluginConfig(fields), true
@@ -63,17 +62,116 @@ var pluginConfigCompilers = map[string]pluginConfigCompiler{
 	"request_params": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
 		return c.compileRequestParamsPluginConfig(fields), true
 	},
-	"tool_selection": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileToolSelectionPluginConfig(fields), true
-	},
-	"tools": func(c *Compiler, fields map[string]Value) (interface{}, bool) {
-		return c.compileToolsPlugin(fields), true
-	},
+	"tools": compileToolsPluginConfig,
+}
+
+// compileToolsPluginConfig keeps the tools plugin's fields as written, its
+// policy, select and match blocks included, once they decode as one.
+func compileToolsPluginConfig(c *Compiler, fields map[string]Value) (interface{}, bool) {
+	raw := fieldsToMap(fields)
+	payload, err := config.NewStructuredPayload(raw)
+	if err == nil {
+		err = payload.DecodeIntoStrict(&config.ToolsPluginConfig{})
+	}
+	if err != nil {
+		c.addError(Position{}, "invalid tools configuration: %v; the tools plugin takes enabled, policy and select", err)
+		return nil, false
+	}
+	return raw, true
+}
+
+func compilePromptCachePluginConfig(
+	c *Compiler,
+	fields map[string]Value,
+) (interface{}, bool) {
+	cfg, err := decodePromptCachePluginFields(fields)
+	if err != nil {
+		c.addError(Position{}, "%v", err)
+		return nil, false
+	}
+	return cfg, true
+}
+
+func decodePromptCachePluginFields(
+	fields map[string]Value,
+) (*config.PromptCachePluginConfig, error) {
+	payload, err := config.NewStructuredPayload(fieldsToMap(fields))
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode plugin fields: %w", err)
+	}
+	cfg := &config.PromptCachePluginConfig{}
+	if err := payload.DecodeIntoStrict(cfg); err != nil {
+		return nil, fmt.Errorf("failed to decode plugin fields: %w", err)
+	}
+	if err := config.ValidatePromptCachePluginConfig(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (c *Compiler) compileHeaderMutationPluginConfig(fields map[string]Value) config.HeaderMutationPluginConfig {
+	return config.HeaderMutationPluginConfig{
+		Add:    compileHeaderPairs(fields["add"]),
+		Update: compileHeaderPairs(fields["update"]),
+		Delete: stringArrayValue(fields["delete"]),
+	}
+}
+
+func compileHeaderPairs(value Value) []config.HeaderPair {
+	array, ok := value.(ArrayValue)
+	if !ok {
+		return nil
+	}
+	result := make([]config.HeaderPair, 0, len(array.Items))
+	for _, item := range array.Items {
+		object, ok := item.(ObjectValue)
+		if !ok {
+			continue
+		}
+		name, nameOK := getStringField(object.Fields, "name")
+		value, valueOK := getStringField(object.Fields, "value")
+		if nameOK && valueOK {
+			result = append(result, config.HeaderPair{Name: name, Value: value})
+		}
+	}
+	return result
+}
+
+func stringArrayValue(value Value) []string {
+	array, ok := value.(ArrayValue)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(array.Items))
+	for _, item := range array.Items {
+		if text, ok := item.(StringValue); ok {
+			result = append(result, text.V)
+		}
+	}
+	return result
+}
+
+// compileStrictPluginFields decodes a plugin's fields as the Router loads its
+// configuration, refusing a field the payload does not declare.
+func compileStrictPluginFields(c *Compiler, pluginType string, fields map[string]Value, target interface{}) (interface{}, bool) {
+	payload, err := config.NewStructuredPayload(fieldsToMap(fields))
+	if err == nil {
+		err = payload.DecodeIntoStrict(target)
+	}
+	if err != nil {
+		c.addError(Position{}, "invalid %s configuration: %v", pluginType, err)
+		return nil, false
+	}
+	return target, true
 }
 
 func (c *Compiler) buildPluginConfigValue(pluginType string, fields map[string]Value) (interface{}, bool) {
 	if fn, ok := pluginConfigCompilers[pluginType]; ok {
 		return fn(c, fields)
+	}
+	if replacement, retired := config.RemovedPluginTypes[pluginType]; retired {
+		c.addError(Position{}, "plugin %q was removed; write %s", pluginType, replacement)
+		return nil, false
 	}
 	c.addError(Position{}, "unknown plugin type %q", pluginType)
 	return nil, false
@@ -93,81 +191,30 @@ func (c *Compiler) compileSystemPromptPluginConfig(fields map[string]Value) conf
 	return cfg
 }
 
-func (c *Compiler) compileSemanticCachePluginConfig(fields map[string]Value) config.SemanticCachePluginConfig {
-	cfg := config.SemanticCachePluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
+func (c *Compiler) compileRouterReplayPluginConfig(fields map[string]Value) (interface{}, bool) {
+	// Preserve omission and explicit false/zero overrides. Serializing the
+	// effective capture config here would replace inherited global defaults.
+	raw := fieldsToMap(fields)
+	var replay config.RouterReplayPluginConfig
+	payload, err := config.NewStructuredPayload(raw)
+	if err == nil {
+		err = payload.DecodeIntoStrict(&replay)
 	}
-	if v, ok := getFloat32Field(fields, "similarity_threshold"); ok {
-		cfg.SimilarityThreshold = &v
+	if err == nil {
+		err = replay.ValidatePromptCapture()
 	}
-	return cfg
-}
-
-func (c *Compiler) compileHallucinationPluginConfig(fields map[string]Value) config.HallucinationPluginConfig {
-	cfg := config.HallucinationPluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
+	if err != nil {
+		c.addError(Position{}, "invalid router_replay configuration: %v", err)
+		return nil, false
 	}
-	if v, ok := getBoolField(fields, "use_nli"); ok {
-		cfg.UseNLI = v
-	}
-	if v, ok := getStringField(fields, "hallucination_action"); ok {
-		cfg.HallucinationAction = v
-	}
-	return cfg
-}
-
-func (c *Compiler) compileMemoryPluginConfig(fields map[string]Value) config.MemoryPluginConfig {
-	cfg := config.MemoryPluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
-	}
-	if v, ok := getIntField(fields, "retrieval_limit"); ok {
-		cfg.RetrievalLimit = &v
-	}
-	if v, ok := getFloat32Field(fields, "similarity_threshold"); ok {
-		cfg.SimilarityThreshold = &v
-	}
-	if v, ok := getBoolField(fields, "auto_store"); ok {
-		cfg.AutoStore = &v
-	}
-	return cfg
-}
-
-func (c *Compiler) compileRouterReplayPluginConfig(fields map[string]Value) config.RouterReplayPluginConfig {
-	cfg := config.RouterReplayPluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
-	}
-	if v, ok := getIntField(fields, "max_records"); ok {
-		cfg.MaxRecords = v
-	}
-	if v, ok := getBoolField(fields, "capture_request_body"); ok {
-		cfg.CaptureRequestBody = v
-	}
-	if v, ok := getBoolField(fields, "capture_response_body"); ok {
-		cfg.CaptureResponseBody = v
-	}
-	if v, ok := getIntField(fields, "max_body_bytes"); ok {
-		cfg.MaxBodyBytes = v
-	}
-	return cfg
-}
-
-func (c *Compiler) compileImageGenPluginConfig(fields map[string]Value) config.ImageGenPluginConfig {
-	cfg := config.ImageGenPluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
-	}
-	if v, ok := getStringField(fields, "backend"); ok {
-		cfg.Backend = v
-	}
-	return cfg
+	return raw, true
 }
 
 func (c *Compiler) compileFastResponsePluginConfig(fields map[string]Value) config.FastResponsePluginConfig {
 	cfg := config.FastResponsePluginConfig{}
+	if v, ok := getBoolField(fields, "enabled"); ok {
+		cfg.Enabled = &v
+	}
 	if v, ok := getStringField(fields, "message"); ok {
 		cfg.Message = v
 	}
@@ -176,6 +223,15 @@ func (c *Compiler) compileFastResponsePluginConfig(fields map[string]Value) conf
 
 func (c *Compiler) compileRequestParamsPluginConfig(fields map[string]Value) config.RequestParamsPluginConfig {
 	cfg := config.RequestParamsPluginConfig{}
+	if value, exists := fields["default_max_tokens"]; exists {
+		if integer, ok := value.(IntValue); ok && integer.V > 0 {
+			cfg.DefaultMaxTokens = config.FixedOutputTokenDefault(integer.V)
+		} else if text, ok := value.(StringValue); ok && text.V == "auto" {
+			cfg.DefaultMaxTokens = &config.OutputTokenDefault{Auto: true}
+		} else {
+			c.addError(Position{}, "request_params.default_max_tokens must be a positive integer or auto")
+		}
+	}
 	if v, ok := getStringArrayField(fields, "blocked_params"); ok {
 		cfg.BlockedParams = v
 	}
@@ -184,38 +240,6 @@ func (c *Compiler) compileRequestParamsPluginConfig(fields map[string]Value) con
 	}
 	if v, ok := getIntField(fields, "max_n"); ok {
 		cfg.MaxN = &v
-	}
-	if v, ok := getBoolField(fields, "strip_unknown"); ok {
-		cfg.StripUnknown = v
-	}
-	return cfg
-}
-
-func (c *Compiler) compileToolSelectionPluginConfig(fields map[string]Value) config.ToolSelectionPluginConfig {
-	cfg := config.ToolSelectionPluginConfig{}
-	if v, ok := getBoolField(fields, "enabled"); ok {
-		cfg.Enabled = v
-	}
-	if v, ok := getStringField(fields, "mode"); ok {
-		cfg.Mode = v
-	}
-	if v, ok := getIntField(fields, "top_k"); ok {
-		cfg.TopK = v
-	}
-	if v, ok := getFloat32Field(fields, "similarity_threshold"); ok {
-		cfg.SimilarityThreshold = &v
-	}
-	if v, ok := getStringField(fields, "tools_db_path"); ok {
-		cfg.ToolsDBPath = v
-	}
-	if v, ok := getFloat32Field(fields, "relevance_threshold"); ok {
-		cfg.RelevanceThreshold = &v
-	}
-	if v, ok := getIntField(fields, "preserve_count"); ok {
-		cfg.PreserveCount = v
-	}
-	if v, ok := getStringField(fields, "strategy"); ok {
-		cfg.Strategy = v
 	}
 	return cfg
 }

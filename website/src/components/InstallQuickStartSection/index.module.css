@@ -1,125 +1,154 @@
 .section {
-  padding: 5rem 0;
-  border-bottom: 1px solid var(--site-border);
+  position: relative;
+  padding: var(--site-section-pad-top, var(--site-section-pad)) 0 var(--site-section-pad);
 }
 
-.heading {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.32fr) minmax(0, 0.68fr);
-  gap: 2rem;
-  margin-bottom: 2rem;
+.wrap {
+  width: min(100% - 2 * var(--gut), var(--wrap));
+  margin-inline: auto;
 }
 
-.meta,
-.copy {
-  display: grid;
-  align-content: start;
-  gap: 1rem;
-}
-
-.meta p,
-.copy p,
-.note {
-  margin: 0;
-  color: var(--site-muted-bright);
-  line-height: 1.7;
-}
-
-.meta p {
-  max-width: 18rem;
-  font-size: 0.95rem;
-}
-
-.copy h2 {
-  max-width: 12ch;
-  margin: 0;
-  font-size: clamp(2.4rem, 5vw, 4.2rem);
-  line-height: 0.94;
-  letter-spacing: -0.04em;
-}
-
-.copy p {
-  max-width: 42rem;
-}
-
-.frame {
-  display: grid;
-  gap: 1.3rem;
-  padding: 1.5rem;
-  border: 1px solid var(--site-border);
-  border-radius: 1.2rem;
-  background:
-    radial-gradient(circle at top right, rgba(255, 255, 255, 0.04), transparent 34%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 38%),
-    var(--site-surface);
-}
-
-.frameHeader {
+/* Duo's segmented tabs: a soft track, the selected tab on a surface pill. */
+.audienceTabs {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 auto 28px;
+  padding: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
 }
 
-.platform {
-  color: var(--site-muted-bright);
-  font-family: var(--ifm-font-family-monospace);
-  font-size: 0.84rem;
-  letter-spacing: 0.08em;
+.audienceTab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 96px;
+  height: 40px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font: 500 14px/1 var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.35s, background-color 0.35s var(--ease), box-shadow 0.35s var(--ease);
+}
+
+.audienceTab:hover {
+  color: var(--ink);
+}
+
+.audienceTabActive {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(22, 24, 29, 0.1), 0 4px 12px rgba(22, 24, 29, 0.06);
+}
+
+.audienceIcon {
+  width: 16px;
+  height: 16px;
+}
+
+.way {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.5fr);
+  align-items: center;
+  gap: clamp(24px, 4vw, 56px);
+  padding: clamp(22px, 3vw, 36px);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.wayCopy {
+  min-width: 0;
+}
+
+.way .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 16px;
+  color: var(--ink);
+  font: 600 13px/1.2 var(--mono);
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
-.commandBlock {
-  padding: 1.2rem 1.25rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 1rem;
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-    rgba(255, 255, 255, 0.025);
-  background-size: 28px 28px, auto;
+.brand svg {
+  width: 18px;
+  height: 18px;
+  color: var(--ember);
 }
 
-.command {
-  display: block;
-  color: var(--site-text);
-  font-family: var(--ifm-font-family-monospace);
-  font-size: clamp(1rem, 1.85vw, 1.42rem);
-  line-height: 1.65;
-  white-space: pre-wrap;
-  word-break: break-word;
+.way .channelNote {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 15.5px;
+  line-height: 1.6;
 }
 
-.frameFooter {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.note {
-  max-width: 38rem;
+.channelNote strong {
+  color: var(--ink);
+  font-weight: 600;
 }
 
 .actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
+  align-items: center;
+  gap: 14px 22px;
+  margin-top: 22px;
 }
 
-@media (max-width: 996px) {
-  .heading {
-    grid-template-columns: 1fr;
+.guide {
+  display: inline-flex;
+  align-items: center;
+  height: 46px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  font-size: 15.5px;
+  font-weight: 500;
+  text-decoration: none;
+  box-shadow: 0 8px 22px rgba(22, 24, 29, 0.18);
+  transition: background-color 0.2s, transform 0.3s var(--ease);
+}
+
+.guide:hover,
+.guide:focus-visible {
+  background: var(--btn-bg-hover);
+  color: var(--btn-fg);
+  text-decoration: none;
+}
+
+.guide:active {
+  transform: scale(0.98);
+}
+
+@media (max-width: 1000px) {
+  .way {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
-@media (max-width: 768px) {
-  .section {
-    padding: 3.5rem 0;
+@media (max-width: 600px) {
+  .way {
+    padding: 20px 16px;
+    border-radius: 22px;
   }
 
-  .frame {
-    padding: 1.15rem;
+  .audienceTab {
+    min-width: 0;
+    padding: 0 15px;
   }
+}
+
+/* Both audiences keep one height, so switching tabs never moves the page. */
+.terminal pre {
+  min-height: 5.5rem;
 }

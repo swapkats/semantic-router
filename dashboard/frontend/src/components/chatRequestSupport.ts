@@ -1,9 +1,27 @@
-import { CLAW_MODE_SYSTEM_PROMPT, type Message } from './ChatComponentTypes'
-import { buildPromptWithAttachments, type PlaygroundAttachment } from './playgroundFileAttachments'
+import {
+  X_CONVERSATION_ID,
+  X_VSR_COST,
+  X_VSR_COST_CURRENCY,
+  X_VSR_DEBUG,
+  X_VSR_REPLAY_ID,
+  X_VSR_RESPONSE_PATH,
+  X_VSR_SCHEMA_VERSION,
+  X_VSR_SELECTED_DECISION,
+  X_VSR_SELECTED_MODEL,
+  X_VSR_SELECTED_RECIPE,
+  X_VSR_SESSION_ID,
+  X_VSR_TRACE,
+  X_VSR_WARNINGS,
+} from '../generated/vsrHeaders'
+import type { Message } from './ChatComponentTypes'
+import { buildPlaygroundUserContent, type PlaygroundAttachment } from './playgroundFileAttachments'
+import { extractTextToolCalls, normalizeToolCallArguments } from './chatToolCallSupport'
+import { serializeToolResultForModel } from '../tools/toolResultSupport'
+import { expandRoutingHeaders } from './vsrTrace'
 
 export interface OutboundChatMessage {
   role: string
-  content: string | null
+  content: unknown
   tool_calls?: Array<{
     id: string
     type: 'function'
@@ -15,56 +33,40 @@ export interface OutboundChatMessage {
   tool_call_id?: string
 }
 
+export const PLAYGROUND_MAX_REQUEST_BYTES = 10 * 1024 * 1024
+
+export const assertPlaygroundRequestSize = (request: Record<string, unknown>): void => {
+  const bytes = new TextEncoder().encode(JSON.stringify(request)).byteLength
+  if (bytes > PLAYGROUND_MAX_REQUEST_BYTES) {
+    throw new Error('Playground request exceeds the 10 MB request limit.')
+  }
+}
+
+export const buildPlaygroundRequestHeaders = (conversationId: string): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  [X_VSR_SESSION_ID]: conversationId,
+  [X_CONVERSATION_ID]: conversationId,
+  [X_VSR_DEBUG]: 'true',
+})
+
+// The public set of a routed response, and the trace of a caller the Router
+// allows the debug headers.
 const RESPONSE_HEADER_KEYS = [
-  // v0.4 keystone headers (#2203)
-  'x-vsr-schema-version',
-  'x-vsr-response-path',
-  'x-vsr-selected-model',
-  'x-vsr-selected-decision',
-  'x-vsr-selected-modality',
-  'x-vsr-replay-id',
-  'x-vsr-cache-hit',
-  'x-vsr-selected-reasoning',
-  'x-vsr-learning-methods',
-  'x-vsr-learning-actions',
-  'x-vsr-learning-scopes',
-  'x-vsr-learning-reasons',
-  'x-vsr-fast-response',
-  'x-vsr-response-warnings',
-  'x-vsr-matched-keywords',
-  'x-vsr-matched-embeddings',
-  'x-vsr-matched-domains',
-  'x-vsr-matched-fact-check',
-  'x-vsr-matched-user-feedback',
-  'x-vsr-matched-reask',
-  'x-vsr-matched-preference',
-  'x-vsr-matched-language',
-  'x-vsr-matched-context',
-  'x-vsr-matched-structure',
-  'x-vsr-context-token-count',
-  'x-vsr-matched-complexity',
-  'x-vsr-matched-modality',
-  'x-vsr-matched-authz',
-  'x-vsr-matched-jailbreak',
-  'x-vsr-matched-pii',
-  'x-vsr-matched-kb',
-  'x-vsr-matched-conversation',
-  'x-vsr-matched-event',
-  'x-vsr-matched-projections',
-  'x-vsr-looper-model',
-  'x-vsr-looper-models-used',
-  'x-vsr-looper-iterations',
-  'x-vsr-looper-algorithm',
-  'x-vsr-retention-drop',
-  'x-vsr-retention-ttl-turns',
-  'x-vsr-retention-keep-current-model',
-  'x-vsr-retention-prefer-prefix',
+  X_VSR_SCHEMA_VERSION,
+  X_VSR_RESPONSE_PATH,
+  X_VSR_SELECTED_RECIPE,
+  X_VSR_SELECTED_DECISION,
+  X_VSR_SELECTED_MODEL,
+  X_VSR_REPLAY_ID,
+  X_VSR_WARNINGS,
+  X_VSR_COST,
+  X_VSR_COST_CURRENCY,
+  X_VSR_TRACE,
 ] as const
 
 export const buildChatMessages = (
   messages: Message[],
   nextUserMessage: string,
-  enableClawMode: boolean,
   nextUserAttachments: PlaygroundAttachment[] = [],
 ): OutboundChatMessage[] => {
   const chatMessages: OutboundChatMessage[] = []
@@ -73,23 +75,73 @@ export const buildChatMessages = (
     if (message.role === 'user') {
       chatMessages.push({
         role: 'user',
-        content: buildPromptWithAttachments(message.content, message.playgroundAttachments ?? []),
+        content:
+          message.requestContent ??
+          buildPlaygroundUserContent(message.content, message.playgroundAttachments ?? []),
       })
       continue
     }
 
-    if (message.role === 'assistant' && message.content) {
-      chatMessages.push({ role: 'assistant', content: message.content })
+    if (message.role === 'system') {
+      chatMessages.push({
+        role: 'system',
+        content: message.requestContent ?? message.content,
+      })
+      continue
     }
-  }
 
-  if (enableClawMode) {
-    chatMessages.unshift({ role: 'system', content: CLAW_MODE_SYSTEM_PROMPT })
+    if (message.role === 'assistant') {
+      const resultsByCallId = new Map(
+        (message.toolResults ?? []).map((result) => [result.callId, result]),
+      )
+      const completedToolCalls = (message.toolCalls ?? []).filter(
+        (toolCall) =>
+          resultsByCallId.has(toolCall.id) &&
+          Boolean(toolCall.function.name) &&
+          Boolean(toolCall.function.arguments),
+      )
+
+      if (completedToolCalls.length > 0) {
+        chatMessages.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: completedToolCalls.map((toolCall) => ({
+            id: toolCall.id,
+            type: 'function',
+            function: {
+              name: toolCall.function.name,
+              arguments: normalizeToolCallArguments(toolCall.function.arguments),
+            },
+          })),
+        })
+        completedToolCalls.forEach((toolCall) => {
+          const result = resultsByCallId.get(toolCall.id)
+          if (!result) return
+          chatMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: serializeToolResultForModel(result),
+          })
+        })
+      }
+
+      const assistantContent =
+        message.requestContent ??
+        (/<tool_call/i.test(message.content)
+          ? extractTextToolCalls(message.content).content
+          : message.content)
+      if (
+        (typeof assistantContent === 'string' && assistantContent.length > 0) ||
+        (Array.isArray(assistantContent) && assistantContent.length > 0)
+      ) {
+        chatMessages.push({ role: 'assistant', content: assistantContent })
+      }
+    }
   }
 
   chatMessages.push({
     role: 'user',
-    content: buildPromptWithAttachments(nextUserMessage, nextUserAttachments),
+    content: buildPlaygroundUserContent(nextUserMessage, nextUserAttachments),
   })
   return chatMessages
 }
@@ -110,9 +162,29 @@ export const buildChatRequestBody = (
     requestBody.tool_choice = 'auto'
   }
 
+  assertPlaygroundRequestSize(requestBody)
   return requestBody
 }
 
+export const buildExactChatRequestBody = (
+  request: Record<string, unknown>,
+  fallbackModel: string,
+): Record<string, unknown> => {
+  const messages = Array.isArray(request.messages) ? request.messages : []
+  const requestModel = typeof request.model === 'string' ? request.model.trim() : ''
+
+  const result = {
+    ...request,
+    model: requestModel || fallbackModel,
+    messages,
+    stream: true,
+  }
+  assertPlaygroundRequestSize(result)
+  return result
+}
+
+// collectResponseHeaders returns the display entries of a routed response:
+// its public headers, and the details of its trace.
 export const collectResponseHeaders = (response: Response): Record<string, string> => {
   const headers: Record<string, string> = {}
 
@@ -123,5 +195,5 @@ export const collectResponseHeaders = (response: Response): Record<string, strin
     }
   })
 
-  return headers
+  return expandRoutingHeaders(headers)
 }

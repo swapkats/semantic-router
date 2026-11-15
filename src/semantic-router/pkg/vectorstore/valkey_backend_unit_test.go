@@ -64,14 +64,6 @@ var _ = Describe("ValkeyBackend helpers", func() {
 		It("should leave safe strings unchanged", func() { Expect(escapeTagValue("abc123")).To(Equal("abc123")) })
 	})
 
-	Context("distanceToSimilarity", func() {
-		It("COSINE", func() { Expect(distanceToSimilarity("COSINE", 0.2)).To(BeNumerically("~", 0.9, 0.001)) })
-		It("L2", func() { Expect(distanceToSimilarity("L2", 0.3)).To(BeNumerically("~", 0.769, 0.01)) })
-		It("IP", func() { Expect(distanceToSimilarity("IP", 0.95)).To(BeNumerically("~", 0.95, 0.001)) })
-		It("zero distance", func() { Expect(distanceToSimilarity("COSINE", 0.0)).To(BeNumerically("~", 1.0, 0.001)) })
-		It("case-insensitive", func() { Expect(distanceToSimilarity("cosine", 0.2)).To(BeNumerically("~", 0.9, 0.001)) })
-	})
-
 	Context("toInt64", func() {
 		It("int64", func() {
 			value, ok := toInt64(int64(42))
@@ -194,7 +186,7 @@ var _ = Describe("ValkeyBackend parseSearchResults", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(r).To(HaveLen(1))
 		Expect(r[0].FileID).To(Equal("f1"))
-		Expect(r[0].Score).To(BeNumerically("~", 0.9, 0.01))
+		Expect(r[0].Score).To(BeNumerically("~", 0.8, 0.001))
 	})
 	It("all five RETURN fields populated", func() {
 		result := []interface{}{int64(1), map[string]interface{}{
@@ -213,7 +205,7 @@ var _ = Describe("ValkeyBackend parseSearchResults", func() {
 		Expect(r[0].Filename).To(Equal("report.pdf"))
 		Expect(r[0].Content).To(Equal("quarterly results"))
 		Expect(r[0].ChunkIndex).To(Equal(3))
-		Expect(r[0].Score).To(BeNumerically("~", 0.8, 0.01)) // COSINE: 1 - 0.4/2
+		Expect(r[0].Score).To(BeNumerically("~", 0.6, 0.001)) // COSINE: 1 - 0.4
 	})
 	It("non-zero chunk_index parsed correctly", func() {
 		result := []interface{}{int64(1), map[string]interface{}{
@@ -228,9 +220,18 @@ var _ = Describe("ValkeyBackend parseSearchResults", func() {
 	})
 	It("filter below threshold", func() {
 		result := []interface{}{int64(1), map[string]interface{}{
-			"key:1": map[string]interface{}{"file_id": "f1", "content": "hello", "vector_distance": "1.6"},
+			"key:1": map[string]interface{}{"file_id": "f1", "filename": "a.txt", "content": "hello", "chunk_index": "0", "vector_distance": "1.6"},
 		}}
 		r, err := vb.parseSearchResults(result, 0.5)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r).To(BeEmpty())
+	})
+	It("filter a cosine below the threshold", func() {
+		// COSINE distance 0.4 is a cosine of 0.6, below a 0.7 threshold.
+		result := []interface{}{int64(1), map[string]interface{}{
+			"key:1": map[string]interface{}{"file_id": "f1", "filename": "a.txt", "content": "hello", "chunk_index": "0", "vector_distance": "0.4"},
+		}}
+		r, err := vb.parseSearchResults(result, 0.7)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(r).To(BeEmpty())
 	})

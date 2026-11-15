@@ -1,6 +1,10 @@
 package dsl
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
 
 // ---------- AST → JSON serialization ----------
 //
@@ -10,14 +14,34 @@ import "encoding/json"
 
 // ProgramJSON is the JSON-serializable form of Program.
 type ProgramJSON struct {
-	Signals              []*SignalDeclJSON              `json:"signals"`
-	ProjectionPartitions []*ProjectionPartitionDeclJSON `json:"projectionPartitions,omitempty"`
-	ProjectionScores     []*ProjectionScoreDeclJSON     `json:"projectionScores,omitempty"`
-	ProjectionMappings   []*ProjectionMappingDeclJSON   `json:"projectionMappings,omitempty"`
-	Routes               []*RouteDeclJSON               `json:"routes"`
-	Models               []*ModelDeclJSON               `json:"models"`
-	Plugins              []*PluginDeclJSON              `json:"plugins"`
-	TestBlocks           []*TestBlockDeclJSON           `json:"testBlocks,omitempty"`
+	CandidateRequirements *config.CandidateRequirements  `json:"candidateRequirements,omitempty"`
+	ModelBindings         map[string]config.ModelBinding `json:"modelBindings,omitempty"`
+	Strategy              string                         `json:"strategy,omitempty"`
+	Entrypoints           []*EntrypointDeclJSON          `json:"entrypoints,omitempty"`
+	Recipes               []*RecipeDeclJSON              `json:"recipes,omitempty"`
+	Signals               []*SignalDeclJSON              `json:"signals"`
+	ProjectionPartitions  []*ProjectionPartitionDeclJSON `json:"projectionPartitions,omitempty"`
+	ProjectionScores      []*ProjectionScoreDeclJSON     `json:"projectionScores,omitempty"`
+	ProjectionMappings    []*ProjectionMappingDeclJSON   `json:"projectionMappings,omitempty"`
+	Routes                []*RouteDeclJSON               `json:"routes"`
+	Models                []*ModelDeclJSON               `json:"models"`
+	Plugins               []*PluginDeclJSON              `json:"plugins"`
+	TestBlocks            []*TestBlockDeclJSON           `json:"testBlocks,omitempty"`
+}
+
+// EntrypointDeclJSON is the JSON form of a request-facing recipe binding.
+type EntrypointDeclJSON struct {
+	ModelNames []string `json:"modelNames"`
+	Recipe     string   `json:"recipe"`
+	Pos        Position `json:"pos"`
+}
+
+// RecipeDeclJSON is the JSON form of one isolated recipe program.
+type RecipeDeclJSON struct {
+	Name        string       `json:"name"`
+	Description string       `json:"description,omitempty"`
+	Program     *ProgramJSON `json:"program"`
+	Pos         Position     `json:"pos"`
 }
 
 // ProjectionPartitionDeclJSON is the JSON form of ProjectionPartitionDecl.
@@ -40,12 +64,12 @@ type ProjectionScoreDeclJSON struct {
 
 // ProjectionScoreInputJSON is the JSON form of ProjectionScoreInputDecl.
 type ProjectionScoreInputJSON struct {
-	SignalType  string  `json:"signalType"`
-	SignalName  string  `json:"signalName"`
-	Weight      float64 `json:"weight"`
-	ValueSource string  `json:"valueSource,omitempty"`
-	Match       float64 `json:"match,omitempty"`
-	Miss        float64 `json:"miss,omitempty"`
+	SignalType  string   `json:"signalType"`
+	SignalName  string   `json:"signalName"`
+	Weight      float64  `json:"weight"`
+	ValueSource string   `json:"valueSource,omitempty"`
+	Match       *float64 `json:"match,omitempty"`
+	Miss        float64  `json:"miss,omitempty"`
 }
 
 // ProjectionMappingDeclJSON is the JSON form of ProjectionMappingDecl.
@@ -105,24 +129,26 @@ type RouteDeclJSON struct {
 	Models      []*ModelRefJSON  `json:"models"`
 	Algorithm   *AlgoSpecJSON    `json:"algorithm,omitempty"`
 	Plugins     []*PluginRefJSON `json:"plugins"`
-	Emits       []*EmitDeclJSON  `json:"emits,omitempty"`
+	Retention   *RetentionJSON   `json:"retention,omitempty"`
+	Output      *OutputJSON      `json:"output,omitempty"`
 	Pos         Position         `json:"pos"`
 }
 
-// EmitDeclJSON is the JSON form of an EMIT directive on a route.
-type EmitDeclJSON struct {
-	Kind      string                  `json:"kind"`
-	Retention *RetentionDirectiveJSON `json:"retention,omitempty"`
-	Pos       Position                `json:"pos"`
+// OutputJSON is the JSON form of a route's OUTPUT block.
+type OutputJSON struct {
+	Kind   []string `json:"kind,omitempty"`
+	Action string   `json:"action,omitempty"`
+	Pos    Position `json:"pos"`
 }
 
-// RetentionDirectiveJSON is the JSON form of RetentionDirective. All fields
+// RetentionJSON is the JSON form of a route's RETENTION block. All fields
 // are tri-state pointers to preserve "unset" vs explicit zero.
-type RetentionDirectiveJSON struct {
-	Drop                  *bool `json:"drop,omitempty"`
-	TTLTurns              *int  `json:"ttl_turns,omitempty"`
-	KeepCurrentModel      *bool `json:"keep_current_model,omitempty"`
-	PreferPrefixRetention *bool `json:"prefer_prefix_retention,omitempty"`
+type RetentionJSON struct {
+	Drop                  *bool    `json:"drop,omitempty"`
+	TTLTurns              *int     `json:"ttl_turns,omitempty"`
+	KeepCurrentModel      *bool    `json:"keep_current_model,omitempty"`
+	PreferPrefixRetention *bool    `json:"prefer_prefix_retention,omitempty"`
+	Pos                   Position `json:"pos"`
 }
 
 // ModelDeclJSON is the JSON form of ModelDecl.
@@ -136,6 +162,7 @@ type ModelDeclJSON struct {
 type ModelRefJSON struct {
 	Model     string   `json:"model"`
 	Reasoning *bool    `json:"reasoning,omitempty"`
+	Mode      string   `json:"mode,omitempty"`
 	Effort    string   `json:"effort,omitempty"`
 	LoRA      string   `json:"lora,omitempty"`
 	ParamSize string   `json:"paramSize,omitempty"`
@@ -208,6 +235,7 @@ type BoolExprJSON struct {
 	Expr       *BoolExprJSON `json:"expr,omitempty"`
 	SignalType string        `json:"signalType,omitempty"`
 	SignalName string        `json:"signalName,omitempty"`
+	Fields     *JSONObject   `json:"fields,omitempty"`
 	Pos        Position      `json:"pos"`
 }
 
@@ -218,10 +246,28 @@ func ProgramToJSON(prog *Program) *ProgramJSON {
 	}
 
 	result := &ProgramJSON{
-		Signals: make([]*SignalDeclJSON, 0, len(prog.Signals)),
-		Routes:  make([]*RouteDeclJSON, 0, len(prog.Routes)),
-		Models:  make([]*ModelDeclJSON, 0, len(prog.Models)),
-		Plugins: make([]*PluginDeclJSON, 0, len(prog.Plugins)),
+		ModelBindings:         cloneModelBindings(prog.ModelBindings),
+		CandidateRequirements: prog.CandidateRequirements.Clone(),
+		Strategy:              prog.Strategy,
+		Signals:               make([]*SignalDeclJSON, 0, len(prog.Signals)),
+		Routes:                make([]*RouteDeclJSON, 0, len(prog.Routes)),
+		Models:                make([]*ModelDeclJSON, 0, len(prog.Models)),
+		Plugins:               make([]*PluginDeclJSON, 0, len(prog.Plugins)),
+	}
+	for _, entrypoint := range prog.Entrypoints {
+		result.Entrypoints = append(result.Entrypoints, &EntrypointDeclJSON{
+			ModelNames: append([]string(nil), entrypoint.ModelNames...),
+			Recipe:     entrypoint.Recipe,
+			Pos:        entrypoint.Pos,
+		})
+	}
+	for _, recipe := range prog.Recipes {
+		result.Recipes = append(result.Recipes, &RecipeDeclJSON{
+			Name:        recipe.Name,
+			Description: recipe.Description,
+			Program:     ProgramToJSON(recipe.Program),
+			Pos:         recipe.Pos,
+		})
 	}
 	appendSignalDecls(result, prog.Signals)
 	appendProjectionPartitionDecls(result, prog.ProjectionPartitions)
@@ -372,6 +418,7 @@ func routeDeclToJSON(r *RouteDecl) *RouteDeclJSON {
 		rj.Models = append(rj.Models, &ModelRefJSON{
 			Model:     m.Model,
 			Reasoning: m.Reasoning,
+			Mode:      m.Mode,
 			Effort:    m.Effort,
 			LoRA:      m.LoRA,
 			ParamSize: m.ParamSize,
@@ -397,35 +444,19 @@ func routeDeclToJSON(r *RouteDecl) *RouteDeclJSON {
 		}
 		rj.Plugins = append(rj.Plugins, pj)
 	}
-	for _, e := range r.Emits {
-		rj.Emits = append(rj.Emits, emitDeclToJSON(e))
-	}
-	return rj
-}
-
-func emitDeclToJSON(e *EmitDecl) *EmitDeclJSON {
-	if e == nil {
-		return nil
-	}
-	out := &EmitDeclJSON{
-		Kind: e.Kind,
-		Pos:  e.Pos,
-	}
-	if e.Retention != nil {
-		out.Retention = &RetentionDirectiveJSON{
-			Drop:                  clonePtrBoolDSL(e.Retention.Drop),
-			TTLTurns:              clonePtrIntDSL(e.Retention.TTLTurns),
-			KeepCurrentModel:      clonePtrBoolDSL(e.Retention.KeepCurrentModel),
-			PreferPrefixRetention: clonePtrBoolDSL(e.Retention.PreferPrefixRetention),
+	if retention := r.Retention; retention != nil {
+		rj.Retention = &RetentionJSON{
+			Drop:                  clonePtrBool(retention.Drop),
+			TTLTurns:              clonePtrInt(retention.TTLTurns),
+			KeepCurrentModel:      clonePtrBool(retention.KeepCurrentModel),
+			PreferPrefixRetention: clonePtrBool(retention.PreferPrefixRetention),
+			Pos:                   retention.Pos,
 		}
 	}
-	return out
-}
-
-// MarshalProgramJSON marshals a Program to JSON bytes.
-func MarshalProgramJSON(prog *Program) ([]byte, error) {
-	pj := ProgramToJSON(prog)
-	return json.Marshal(pj)
+	if output := r.Output; output != nil {
+		rj.Output = &OutputJSON{Kind: append([]string(nil), output.Kind...), Action: output.Action, Pos: output.Pos}
+	}
+	return rj
 }
 
 func (o JSONObject) MarshalJSON() ([]byte, error) {
@@ -536,9 +567,20 @@ func marshalBoolExpr(expr BoolExpr) *BoolExprJSON {
 			Type:       "signal_ref",
 			SignalType: e.SignalType,
 			SignalName: e.SignalName,
+			Fields:     marshalOptionalObjectFields(e.Fields),
 			Pos:        e.Pos,
 		}
 	default:
 		return nil
 	}
+}
+
+func marshalOptionalObjectFields(
+	fields map[string]Value,
+) *JSONObject {
+	if len(fields) == 0 {
+		return nil
+	}
+	result := marshalObjectFields(fields)
+	return &result
 }

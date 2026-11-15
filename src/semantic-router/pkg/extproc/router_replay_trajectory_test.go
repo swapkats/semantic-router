@@ -10,17 +10,20 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay/store"
 )
 
-// newTrajectoryTestRouter builds a router with two records sharing a session ID.
+// newTrajectoryTestRouter builds a router with two turns sharing a session ID.
 // The first record has a user_input + assistant_tool_call + client_tool_result.
 // The second record has an assistant_final_response.
 func newTrajectoryTestRouter(t *testing.T) (*OpenAIRouter, string) {
 	t.Helper()
 	sessionID := "sess-abc123"
 	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
+	recorder.SetCapturePolicy(true, true, 0)
 
 	_, err := recorder.AddRecord(routerreplay.RoutingRecord{
 		ID:        "traj-1",
-		RequestID: sessionID,
+		RequestID: "request-1",
+		SessionID: sessionID,
+		TurnIndex: 0,
 		Timestamp: time.Unix(1, 0).UTC(),
 		ToolTrace: &routerreplay.ToolTrace{
 			Steps: []routerreplay.ToolTraceStep{
@@ -36,7 +39,9 @@ func newTrajectoryTestRouter(t *testing.T) (*OpenAIRouter, string) {
 
 	_, err = recorder.AddRecord(routerreplay.RoutingRecord{
 		ID:        "traj-2",
-		RequestID: sessionID,
+		RequestID: "request-2",
+		SessionID: sessionID,
+		TurnIndex: 1,
 		Timestamp: time.Unix(2, 0).UTC(),
 		ToolTrace: &routerreplay.ToolTrace{
 			Steps: []routerreplay.ToolTraceStep{
@@ -56,7 +61,7 @@ func newTrajectoryTestRouter(t *testing.T) (*OpenAIRouter, string) {
 func TestHandleRouterReplayTrajectoryConvertsToolTraceToOpenAIMessages(t *testing.T) {
 	router, sessionID := newTrajectoryTestRouter(t)
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/trajectory?session_id="+sessionID)
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory?session_id="+sessionID)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate trajectory response")
 	}
@@ -65,6 +70,7 @@ func TestHandleRouterReplayTrajectoryConvertsToolTraceToOpenAIMessages(t *testin
 	assertStringField(t, body, "object", "router_replay.trajectory")
 	assertStringField(t, body, "session_id", sessionID)
 	assertIntField(t, body, "record_count", 2)
+	assertIntField(t, body, "turn_count", 2)
 
 	messages := mustTrajectoryMessages(t, body)
 	if len(messages) != 4 {
@@ -95,11 +101,13 @@ func TestHandleRouterReplayTrajectoryConvertsToolTraceToOpenAIMessages(t *testin
 
 func TestHandleRouterReplayTrajectoryCoalescesConsecutiveToolCalls(t *testing.T) {
 	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
+	recorder.SetCapturePolicy(true, true, 0)
 	sessionID := "sess-multi-tool"
 
 	_, err := recorder.AddRecord(routerreplay.RoutingRecord{
 		ID:        "traj-multi",
-		RequestID: sessionID,
+		RequestID: "request-multi",
+		SessionID: sessionID,
 		Timestamp: time.Unix(1, 0).UTC(),
 		ToolTrace: &routerreplay.ToolTrace{
 			Steps: []routerreplay.ToolTraceStep{
@@ -120,7 +128,7 @@ func TestHandleRouterReplayTrajectoryCoalescesConsecutiveToolCalls(t *testing.T)
 		ReplayRecorders: map[string]*routerreplay.Recorder{"default": recorder},
 	}
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/trajectory?session_id="+sessionID)
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory?session_id="+sessionID)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate trajectory response")
 	}
@@ -155,8 +163,10 @@ func TestHandleRouterReplayTrajectoryCoalescesConsecutiveToolCalls(t *testing.T)
 	assertStringField(t, messages[4], "content", "done")
 }
 
-func TestHandleRouterReplayTrajectoryFallsBackToBodyParsing(t *testing.T) {
+func TestHandleRouterReplayTrajectoryDoesNotReparseStoredWireBodies(t *testing.T) {
 	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
+	// Body-based trajectory fallback presumes the bodies were captured.
+	recorder.SetCapturePolicy(true, true, 4096)
 	sessionID := "sess-fallback"
 
 	requestBody := `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","tool_calls":[{"id":"call-x","type":"function","function":{"name":"my_tool","arguments":"{}"}}]},{"role":"tool","content":"tool result","tool_call_id":"call-x"}]}`
@@ -164,7 +174,8 @@ func TestHandleRouterReplayTrajectoryFallsBackToBodyParsing(t *testing.T) {
 
 	_, err := recorder.AddRecord(routerreplay.RoutingRecord{
 		ID:           "traj-fallback",
-		RequestID:    sessionID,
+		RequestID:    "request-fallback",
+		SessionID:    sessionID,
 		Timestamp:    time.Unix(1, 0).UTC(),
 		RequestBody:  requestBody,
 		ResponseBody: responseBody,
@@ -178,7 +189,7 @@ func TestHandleRouterReplayTrajectoryFallsBackToBodyParsing(t *testing.T) {
 		ReplayRecorders: map[string]*routerreplay.Recorder{"default": recorder},
 	}
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/trajectory?session_id="+sessionID)
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory?session_id="+sessionID)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate trajectory response")
 	}
@@ -187,20 +198,60 @@ func TestHandleRouterReplayTrajectoryFallsBackToBodyParsing(t *testing.T) {
 	assertIntField(t, body, "record_count", 1)
 
 	messages := mustTrajectoryMessages(t, body)
-	if len(messages) == 0 {
-		t.Fatal("expected messages from body fallback, got none")
+	if len(messages) != 0 {
+		t.Fatalf("stored wire bodies were reparsed into %d trajectory messages", len(messages))
+	}
+}
+
+func TestHandleRouterReplayTrajectoryCollapsesCumulativeToolLoopRecords(t *testing.T) {
+	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
+	recorder.SetCapturePolicy(true, true, 0)
+	sessionID := "sess-tool-loop"
+	records := []routerreplay.RoutingRecord{
+		{
+			ID: "tool-loop-1", RequestID: "request-a", SessionID: sessionID, TurnIndex: 2,
+			Timestamp: time.Unix(1, 0).UTC(),
+			ToolTrace: &routerreplay.ToolTrace{Steps: []routerreplay.ToolTraceStep{
+				{Type: replayToolStepUserInput, Text: "what do you know?"},
+				{Type: replayToolStepAssistantToolCall, ToolName: "web_search", ToolCallID: "call-1", Arguments: `{"q":"vllm-sr"}`},
+			}},
+		},
+		{
+			ID: "tool-loop-2", RequestID: "request-b", SessionID: sessionID, TurnIndex: 2,
+			Timestamp: time.Unix(2, 0).UTC(),
+			ToolTrace: &routerreplay.ToolTrace{Steps: []routerreplay.ToolTraceStep{
+				{Type: replayToolStepUserInput, Text: "what do you know?"},
+				{Type: replayToolStepAssistantToolCall, ToolName: "web_search", ToolCallID: "call-1", Arguments: `{"q":"vllm-sr"}`},
+				{Type: replayToolStepClientToolResult, ToolName: "web_search", ToolCallID: "call-1", Text: "search result"},
+				{Type: replayToolStepAssistantFinalResponse, Text: "Here is the answer."},
+			}},
+		},
+	}
+	for _, record := range records {
+		if _, err := recorder.AddRecord(record); err != nil {
+			t.Fatalf("failed to add replay record: %v", err)
+		}
 	}
 
-	// The last message should be the assistant final response from the response body.
-	last := messages[len(messages)-1]
-	assertStringField(t, last, "role", "assistant")
-	assertStringField(t, last, "content", "final")
+	router := &OpenAIRouter{ReplayRecorders: map[string]*routerreplay.Recorder{"default": recorder}}
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory?session_id="+sessionID)
+	body := decodeJSONBody(t, response.GetImmediateResponse().Body)
+	assertIntField(t, body, "record_count", 2)
+	assertIntField(t, body, "turn_count", 1)
+	messages := mustTrajectoryMessages(t, body)
+	if len(messages) != 4 {
+		t.Fatalf("expected one complete four-message turn, got %#v", messages)
+	}
+	assertStringField(t, messages[0], "content", "what do you know?")
+	assertStringField(t, messages[2], "tool_name", "web_search")
+	assertStringField(t, messages[2], "content", "search result")
+	assertStringField(t, messages[3], "content", "Here is the answer.")
 }
 
 func TestHandleRouterReplayTrajectoryReturnsEmptyMessagesForUnknownSession(t *testing.T) {
 	router, _ := newTrajectoryTestRouter(t)
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/trajectory?session_id=unknown")
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory?session_id=unknown")
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate trajectory response")
 	}
@@ -218,7 +269,7 @@ func TestHandleRouterReplayTrajectoryReturnsEmptyMessagesForUnknownSession(t *te
 func TestHandleRouterReplayTrajectoryMethodNotAllowed(t *testing.T) {
 	router, sessionID := newTrajectoryTestRouter(t)
 
-	response := router.handleRouterReplayAPI("POST", "/v1/router_replay/trajectory?session_id="+sessionID)
+	response := router.handleRouterReplayAPI("POST", "/api/v1/observability/replays/trajectory?session_id="+sessionID)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate error response")
 	}
@@ -230,7 +281,7 @@ func TestHandleRouterReplayTrajectoryMethodNotAllowed(t *testing.T) {
 func TestHandleRouterReplayTrajectoryMissingSessionID(t *testing.T) {
 	router, _ := newTrajectoryTestRouter(t)
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/trajectory")
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/trajectory")
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate error response")
 	}
@@ -291,4 +342,27 @@ func mustTrajectoryFunction(t *testing.T, toolCall map[string]interface{}) map[s
 		t.Fatalf("expected function object, got %#v", toolCall["function"])
 	}
 	return fn
+}
+
+// A subagent's call carries its harness's agent identity; the session's routes
+// name it so the Dashboard can tell the subagents apart, and leave the main
+// conversation's calls without one.
+func TestBuildTrajectoryRoutesNamesTheSubagent(t *testing.T) {
+	withAgent := routerreplay.RoutingRecord{ID: "sub", SessionPolicy: map[string]interface{}{
+		"identity": map[string]interface{}{"agent": map[string]interface{}{"status": "present", "hash": "9f2c1a"}},
+	}}
+	main := routerreplay.RoutingRecord{ID: "main", SessionPolicy: map[string]interface{}{
+		"identity": map[string]interface{}{"agent": map[string]interface{}{"status": "not_required"}},
+	}}
+	// Codex names its root thread with the session's id, so that agent is the main conversation.
+	root := routerreplay.RoutingRecord{ID: "root", SessionPolicy: map[string]interface{}{
+		"identity": map[string]interface{}{
+			"session": map[string]interface{}{"status": "present", "hash": "26cb8e"},
+			"agent":   map[string]interface{}{"status": "present", "hash": "26cb8e"},
+		},
+	}}
+	routes := buildTrajectoryRoutes([]routerreplay.RoutingRecord{main, withAgent, {ID: "unrecorded"}, root})
+	if routes[0].Agent != "" || routes[1].Agent != "9f2c1a" || routes[2].Agent != "" || routes[3].Agent != "" {
+		t.Fatalf("agents = %q, %q, %q, %q", routes[0].Agent, routes[1].Agent, routes[2].Agent, routes[3].Agent)
+	}
 }

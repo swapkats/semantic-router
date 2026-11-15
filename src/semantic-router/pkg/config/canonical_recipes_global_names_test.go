@@ -1,0 +1,360 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// Regression tests for recipe-local routing namespaces and global entrypoint
+// name collisions.
+
+const recipesOnlyConfigYAML = `
+version: v0.5
+recipes:
+  - name: default
+  - name: privacy
+    description: privacy profile
+    signals:
+      keywords:
+        - name: pii_keywords
+          operator: OR
+          keywords: ["ssn"]
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: keyword
+              name: pii_keywords
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+  - model_names: ["vllm-sr/privacy"]
+    recipe: privacy
+providers:
+  defaults:
+    model: model-a
+  models:
+    - name: model-a
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+      description: default tier
+    - name: model-b
+      backend_refs:
+        - endpoint: 127.0.0.1:8001
+          provider: vllm
+      description: privacy tier
+`
+
+func TestRecipesOnlyConfigKeepsDecisionsReachable(t *testing.T) {
+	cfg, err := ParseYAMLBytes([]byte(recipesOnlyConfigYAML))
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	if len(cfg.Decisions) != 0 {
+		t.Fatalf("expected no flat decisions in a recipes-only config, got %d", len(cfg.Decisions))
+	}
+	if !cfg.HasRoutingDecisions() {
+		t.Fatal("HasRoutingDecisions must see decisions living in non-default recipes")
+	}
+	if decision := cfg.GetDecisionByName("privacy_route"); decision != nil {
+		t.Fatal("a bare default-profile lookup must not escape into another recipe")
+	}
+	privacy, _ := cfg.RecipeByName("privacy")
+	if privacy == nil || len(privacy.Profile.Decisions) != 1 || privacy.Profile.Decisions[0].Name != "privacy_route" {
+		t.Fatalf("expected privacy_route to remain reachable through its recipe, got %+v", privacy)
+	}
+}
+
+func TestDomainRulesOfTheSameNameStayRecipeLocal(t *testing.T) {
+	yamlConfig := `
+version: v0.5
+recipes:
+  - name: default
+    signals:
+      domains: [{name: math}]
+    decisions:
+      - name: math_default
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: math
+        modelRefs:
+          - model: model-a
+            use_reasoning: false
+  - name: privacy
+    signals:
+      domains: [{name: math}]
+    decisions:
+      - name: math_privacy
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: math
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+providers:
+  defaults:
+    model: model-a
+  models:
+    - name: model-a
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+      description: default tier
+    - name: model-b
+      backend_refs:
+        - endpoint: 127.0.0.1:8001
+          provider: vllm
+      description: privacy tier
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+`
+	cfg, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err != nil {
+		t.Fatalf("two profiles routing on the same domain must load: %v", err)
+	}
+
+	privacy, ok := cfg.RecipeByName("privacy")
+	if !ok {
+		t.Fatal("privacy recipe was not normalized")
+	}
+	for recipeName, categories := range map[RecipeName][]Category{
+		DefaultRecipeName: cfg.Categories,
+		privacy.Name:      privacy.Profile.Signals.Categories,
+	} {
+		if len(categories) != 1 || categories[0].Name != "math" {
+			t.Fatalf("recipe %q should own one local math category, got %+v", recipeName, categories)
+		}
+	}
+}
+
+func TestSignalDefinitionsWithTheSameNameStayRecipeLocal(t *testing.T) {
+	yamlConfig := recipeTestBaseYAML + `
+  - name: privacy
+    signals:
+      keywords:
+        - name: urgent_keywords
+          operator: OR
+          keywords: ["ssn"]
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: keyword
+              name: urgent_keywords
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+`
+	cfg, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err != nil {
+		t.Fatalf("same local signal name should be valid across recipes: %v", err)
+	}
+	privacy, _ := cfg.RecipeByName("privacy")
+	if got := privacy.Profile.Signals.KeywordRules[0].Keywords; len(got) != 1 || got[0] != "ssn" {
+		t.Fatalf("privacy recipe lost its local signal definition: %+v", got)
+	}
+	if got := cfg.Signals.KeywordRules[0].Keywords; len(got) != 1 || got[0] != "urgent" {
+		t.Fatalf("default recipe signal was overwritten: %+v", got)
+	}
+}
+
+func TestSignalReferencesCannotCrossRecipeBoundaries(t *testing.T) {
+	yamlConfig := recipeTestBaseYAML + `
+  - name: privacy
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: keyword
+              name: urgent_keywords
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+`
+	_, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err == nil || !strings.Contains(err.Error(), "recipes[privacy].decisions[") || !strings.Contains(err.Error(), "not declared in this recipe") {
+		t.Fatalf("expected a recipe-local signal reference error, got %v", err)
+	}
+}
+
+func TestSignalReferencesCannotCrossSignalFamilies(t *testing.T) {
+	yamlConfig := recipeTestBaseYAML + `
+  - name: privacy
+    signals:
+      keywords:
+        - name: shared_name
+          operator: OR
+          keywords: ["ssn"]
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: authz
+              name: shared_name
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+`
+	_, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err == nil || !strings.Contains(err.Error(), "recipes[privacy].decisions[") || !strings.Contains(err.Error(), "not declared in this recipe") {
+		t.Fatalf("expected a signal-family-local reference error, got %v", err)
+	}
+}
+
+func TestDuplicateDecisionNameAcrossRecipesIsIsolated(t *testing.T) {
+	yamlConfig := recipeTestBaseYAML + `
+  - name: privacy
+    signals:
+      keywords:
+        - name: pii_keywords
+          operator: OR
+          keywords: ["ssn"]
+    decisions:
+      - name: default_route
+        rules:
+          operator: AND
+          conditions:
+            - type: keyword
+              name: pii_keywords
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+`
+	cfg, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err != nil {
+		t.Fatalf("the same local decision name should be valid in two recipes: %v", err)
+	}
+	if got := cfg.GetDecisionByName("default_route"); got == nil {
+		t.Fatal("expected the default recipe's decision")
+	}
+	privacy, _ := cfg.RecipeByName("privacy")
+	if privacy == nil || len(privacy.Profile.Decisions) != 1 || privacy.Profile.Decisions[0].Name != "default_route" {
+		t.Fatalf("expected an independent privacy decision, got %+v", privacy)
+	}
+}
+
+func TestEntrypointNameCollisionsRejected(t *testing.T) {
+	cases := []struct {
+		name          string
+		entrypoint    string
+		wantErrSubstr string
+	}{
+		{
+			name:          "configured model",
+			entrypoint:    "model-a",
+			wantErrSubstr: "already a configured model",
+		},
+		{
+			name:          "default entrypoint name",
+			entrypoint:    DefaultEntrypointModel,
+			wantErrSubstr: "is already mapped by another entrypoint",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			yamlConfig := recipeTestBaseYAML + `
+  - name: privacy
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: keyword
+              name: urgent_keywords
+        modelRefs:
+          - model: model-b
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+  - model_names: ["` + testCase.entrypoint + `"]
+    recipe: privacy
+`
+			_, err := ParseYAMLBytes([]byte(yamlConfig))
+			if err == nil {
+				t.Fatalf("expected entrypoint name %q to be rejected", testCase.entrypoint)
+			}
+			if !strings.Contains(err.Error(), testCase.wantErrSubstr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEntrypointNameCollidingWithLoRARejected(t *testing.T) {
+	yamlConfig := `
+version: v0.5
+recipes:
+  - name: default
+  - name: privacy
+    signals:
+      domains: [{name: other}]
+    decisions:
+      - name: privacy_route
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: other
+        modelRefs:
+          - model: base-model
+            use_reasoning: false
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: default
+    default: true
+  - model_names: ["general-expert"]
+    recipe: privacy
+providers:
+  defaults:
+    model: base-model
+  models:
+    - name: base-model
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+      loras:
+        - name: general-expert
+          description: Default LoRA adapter
+`
+	_, err := ParseYAMLBytes([]byte(yamlConfig))
+	if err == nil {
+		t.Fatal("expected an entrypoint name matching a LoRA adapter to be rejected")
+	}
+	if !strings.Contains(err.Error(), "already a configured LoRA adapter") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

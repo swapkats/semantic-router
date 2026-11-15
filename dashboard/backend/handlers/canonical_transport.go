@@ -23,17 +23,20 @@ type globalFragment struct {
 }
 
 type routingFragmentDocument struct {
-	Routing routerconfig.CanonicalRouting `yaml:"routing"`
-	Global  *globalFragment               `yaml:"global,omitempty"`
-}
-
-type setupModeConfig struct {
-	Mode bool `yaml:"mode,omitempty"`
+	Version     string                             `yaml:"version,omitempty"`
+	Providers   routerconfig.CanonicalProviders    `yaml:"providers,omitempty"`
+	Global      *globalFragment                    `yaml:"global,omitempty"`
+	Recipes     []routerconfig.CanonicalRecipe     `yaml:"recipes"`
+	Entrypoints []routerconfig.CanonicalEntrypoint `yaml:"entrypoints,omitempty"`
 }
 
 type setupConfigFile struct {
-	routerconfig.CanonicalConfig `yaml:",inline"`
-	Setup                        *setupModeConfig `yaml:"setup,omitempty"`
+	routerconfig.CanonicalConfigDocument `yaml:",inline"`
+	globalOverrideRaw                    *yaml.Node
+}
+
+func (config *setupConfigFile) canonicalTransport() canonicalConfigTransport {
+	return canonicalConfigTransport{CanonicalConfig: config.CanonicalConfig, globalOverrideRaw: config.globalOverrideRaw}
 }
 
 func decodeYAMLTaggedBody[T any](reader io.Reader) (T, error) {
@@ -42,7 +45,18 @@ func decodeYAMLTaggedBody[T any](reader io.Reader) (T, error) {
 	if err != nil {
 		return value, err
 	}
-	return decodeYAMLTaggedBytes[T](data)
+	return decodeConfigDocument[T](data)
+}
+
+// decodeConfigDocument decodes a whole config as the Router reads it, with
+// its renamed forms in their canonical form.
+func decodeConfigDocument[T any](data []byte) (T, error) {
+	canonical, err := routerconfig.CanonicalConfigBytes(data)
+	if err != nil {
+		var value T
+		return value, err
+	}
+	return decodeYAMLTaggedBytes[T](canonical)
 }
 
 func decodeYAMLTaggedBytes[T any](data []byte) (T, error) {
@@ -51,6 +65,9 @@ func decodeYAMLTaggedBytes[T any](data []byte) (T, error) {
 		return value, nil
 	}
 	if err := yaml.Unmarshal(data, &value); err != nil {
+		return value, err
+	}
+	if err := resolveTransportGlobal(data, &value); err != nil {
 		return value, err
 	}
 	return value, nil
@@ -86,12 +103,12 @@ func rawJSONMessage(value any) (json.RawMessage, error) {
 	return json.RawMessage(payload), nil
 }
 
-func readCanonicalConfigFile(configPath string) (*routerconfig.CanonicalConfig, error) {
-	data, err := os.ReadFile(configPath)
+func readCanonicalConfigFile(configPath string) (*canonicalConfigTransport, error) {
+	data, err := readPersistedDashboardConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := decodeYAMLTaggedBytes[routerconfig.CanonicalConfig](data)
+	cfg, err := decodeConfigDocument[canonicalConfigTransport](data)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +120,7 @@ func readSetupConfigFile(configPath string) (*setupConfigFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := decodeYAMLTaggedBytes[setupConfigFile](data)
+	cfg, err := decodeConfigDocument[setupConfigFile](data)
 	if err != nil {
 		return nil, err
 	}

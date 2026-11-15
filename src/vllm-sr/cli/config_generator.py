@@ -1,48 +1,159 @@
 """Envoy configuration generator for vLLM Semantic Router."""
 
-import ipaddress
+import json
 import os
+import re
 from pathlib import Path
-from urllib.parse import urlparse
 
 from jinja2 import Environment, FileSystemLoader
 
-from cli.consts import DEFAULT_LISTENER_PORT, EXTERNAL_API_MODEL_FORMATS
-from cli.models import UserConfig
+from cli.api_registry import served_path_regex
+from cli.catalog_provider_projection import project_provider_models_for_envoy
+from cli.config_contract import iter_routing_profiles
+from cli.consts import DEFAULT_LISTENER_PORT
+from cli.durations import envoy_duration
+from cli.envoy_backend_pool import (
+    default_backend_ca_file,
+    is_ip_address,
+    project_envoy_backend_group,
+)
+from cli.models import Model, UserConfig
 from cli.utils import get_logger
 
 log = get_logger(__name__)
 
-
-def _uses_shared_anthropic_cluster(model) -> bool:
-    """Use api.anthropic.com only when no custom upstream host is configured."""
-    if not model.backend_refs:
-        return True
-    for backend in model.backend_refs:
-        upstream = (backend.endpoint or backend.base_url or "").lower()
-        if not upstream:
-            continue
-        if "api.anthropic.com" in upstream:
-            continue
-        return False
-    return True
+ENVOY_CONTAINER_LISTENER_ADDRESS_ENV = "VLLM_SR_ENVOY_CONTAINER_LISTENER_ADDRESS"
 
 
-def _is_ip_address(host: str) -> bool:
+def _model_cluster_id(model_name: str) -> str:
+    """Encode a model alias into a stable, injective Envoy resource identity.
+
+    Escape UTF-8 bytes, including the escape marker, so punctuation aliases
+    cannot collapse into the same cluster. The prefix separates model resources
+    from the fixed infrastructure clusters in the template.
     """
-    Check if a host string is an IP address (IPv4 or IPv6).
+    return "model_" + "".join(
+        chr(byte) if chr(byte).isascii() and chr(byte).isalnum() else f"_{byte:02x}"
+        for byte in model_name.encode("utf-8")
+    )
 
-    Args:
-        host: Host string to check
 
-    Returns:
-        bool: True if host is an IP address, False if it's a domain name
+_RELIABILITY_DURATIONS = (
+    "base_ejection_time",
+    "health_check_interval",
+    "health_check_timeout",
+    "connect_timeout",
+    "total_timeout",
+    "idle_timeout",
+    "per_try_timeout",
+    "retry_back_off_base",
+    "retry_back_off_max",
+    "retry_after_max",
+)
+
+
+def _envoy_reliability(model: Model) -> dict:
+    """Project a model's reliability block onto the template's inputs.
+
+    Durations take the seconds form Envoy requires. A field only the native
+    gateway can honor fails the render instead of being dropped silently.
     """
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
+
+    if model.reliability is None:
+        return {}
+    reliability = model.reliability.model_dump()
+    if reliability.get("first_byte_timeout"):
+        raise ValueError(
+            f"providers.models[{model.name!r}].reliability.first_byte_timeout is "
+            "honored only in standalone mode; Envoy has no first-byte timeout. "
+            "Serve with --gateway standalone, or remove it (per_try_timeout bounds "
+            "each try) to serve with --gateway extproc."
+        )
+    for field in _RELIABILITY_DURATIONS:
+        if reliability.get(field):
+            reliability[field] = envoy_duration(reliability[field])
+    return reliability
+
+
+def _check_decision_reliability(user_config: UserConfig) -> None:
+    """Reject a decision reliability field Envoy cannot apply to one request,
+    instead of letting Envoy drop it silently.
+
+    The Router sends the other fields to Envoy's router as per-request
+    headers, which the template's ext_proc filter always allows.
+    """
+
+    scopes = [
+        (f"recipes[{name!r}]", recipe.decisions)
+        for name, recipe in iter_routing_profiles(user_config)
+    ]
+    for scope, decisions in scopes:
+        for decision in decisions:
+            if decision.reliability is None:
+                continue
+            native_only = decision.reliability.native_only_fields()
+            if native_only:
+                fields = ", ".join(f"reliability.{field}" for field in native_only)
+                raise ValueError(
+                    f"{scope}.decisions[{decision.name!r}]: {fields} is honored only "
+                    "in standalone mode; Envoy cannot apply it to a single request. "
+                    "Serve with --gateway standalone, or remove it to serve with "
+                    "--gateway extproc."
+                )
+
+
+_DEFAULT_IDENTITY_HEADERS = (
+    "x-authz-user-id",
+    "x-authz-user-groups",
+    "x-authz-team-id",
+    "x-authz-tenant-id",
+)
+_HEADER_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def _identity_headers(user_config: UserConfig) -> list[str]:
+    """Name the headers that carry a caller's identity.
+
+    They are the x-authz-* set and the names global.services.authz.identity
+    reads the user and groups from. Only an authenticating proxy in front of a
+    listener that trusts them may set them, and no provider receives them.
+    """
+
+    global_config = user_config.global_ if isinstance(user_config.global_, dict) else {}
+    services = global_config.get("services")
+    authz = services.get("authz") if isinstance(services, dict) else None
+    identity = authz.get("identity") if isinstance(authz, dict) else None
+    names = list(_DEFAULT_IDENTITY_HEADERS)
+    for field in ("user_id_header", "user_groups_header"):
+        value = identity.get(field) if isinstance(identity, dict) else None
+        if value is None or not str(value).strip():
+            continue
+        name = str(value).strip().lower()
+        if not _HEADER_NAME_PATTERN.match(name):
+            raise ValueError(
+                f"global.services.authz.identity.{field} {value!r} is not a "
+                "header name the Envoy listener can remove"
+            )
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _trusts_identity_headers(listener) -> bool:
+    """Report whether a listener keeps the identity headers clients send."""
+
+    identity = getattr(listener, "identity", None)
+    if identity is None:
         return False
+    if identity.trusted_peers:
+        raise ValueError(
+            f"listener '{listener.name}': identity.trusted_peers is checked in "
+            "standalone mode, and the --gateway extproc Envoy listener does not "
+            "check the peer address; serve with --gateway standalone, or keep "
+            "identity.trust_headers alone behind a proxy that removes the "
+            "identity headers clients send"
+        )
+    return bool(identity.trust_headers)
 
 
 def _route_request_headers(endpoint: dict) -> list[dict[str, str]]:
@@ -53,11 +164,42 @@ def _route_request_headers(endpoint: dict) -> list[dict[str, str]]:
     return [{"key": key, "value": value} for key, value in sorted(headers.items())]
 
 
+DEFAULT_DELEGATED_CREDENTIAL_HEADER = "x-vsr-delegated-credential"
+
+
+def _delegated_credential_headers(user_config: UserConfig) -> list[str]:
+    """Name the delegated credential headers Envoy strips ahead of ext_proc.
+
+    The credential is an authenticator output, never a client input. The
+    default name is always stripped; a configured
+    global.services.authz.delegated_credential.header is stripped too.
+    """
+    configured = None
+    services = (user_config.global_ or {}).get("services")
+    authz = services.get("authz") if isinstance(services, dict) else None
+    credential = authz.get("delegated_credential") if isinstance(authz, dict) else None
+    if isinstance(credential, dict):
+        configured = credential.get("header")
+    names = [DEFAULT_DELEGATED_CREDENTIAL_HEADER]
+    if isinstance(configured, str) and configured.strip():
+        header = configured.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", header):
+            raise ValueError(
+                "global.services.authz.delegated_credential.header must be a "
+                f"plain header name, got {configured!r}"
+            )
+        if header not in names:
+            names.append(header)
+    return names
+
+
 def generate_envoy_config_from_user_config(
     user_config: UserConfig,
     output_file: str,
     template_file: str | None = None,
     template_root: str | None = None,
+    *,
+    log_summary: bool = True,
 ) -> Path:
     """
     Generate Envoy configuration from user config.
@@ -67,6 +209,8 @@ def generate_envoy_config_from_user_config(
         output_file: Output file path for Envoy config
         template_file: Path to Envoy template (optional)
         template_root: Template root directory (optional)
+        log_summary: Emit the human-readable generation summary. Machine-readable
+            callers disable this so their output streams remain valid documents.
 
     Returns:
         Path: Path to generated Envoy config
@@ -80,25 +224,65 @@ def generate_envoy_config_from_user_config(
         default_template_root = cli_dir / "templates"
         template_root = os.getenv("TEMPLATE_ROOT", str(default_template_root))
 
-    log.info("Generating Envoy config...")
+    if log_summary:
+        log.info("Generating Envoy config...")
 
     # Extract all listeners
     listeners = []
     if user_config.listeners:
         for listener in user_config.listeners:
+            if getattr(listener, "tls", None) is not None:
+                raise ValueError(
+                    f"listener '{listener.name}': tls is served in standalone "
+                    "mode, and --gateway extproc does not terminate TLS; serve "
+                    "with --gateway standalone or remove tls from the listener"
+                )
+            restricted = [
+                name
+                for name, entry in (listener.apis or {}).items()
+                if name != "systemone" and entry.models is not None
+            ]
+            if restricted:
+                raise ValueError(
+                    f"listener '{listener.name}': apis.{restricted[0]}.models is "
+                    "enforced in standalone mode, and the --gateway extproc Envoy "
+                    "listener does not enforce it; serve with --gateway standalone "
+                    "or remove models from the listener's apis"
+                )
+            if "systemone" in (listener.apis or {}):
+                raise ValueError(
+                    f"listener '{listener.name}': apis.systemone is served in "
+                    "standalone mode, and the --gateway extproc Envoy listener "
+                    "does not serve the System One API; serve with --gateway "
+                    "standalone or remove systemone from the listener's apis"
+                )
+            gate = {}
+            if listener.apis is not None:
+                served = listener.served_apis()
+                gate = {
+                    "served_path_regex": served_path_regex(served),
+                    "unserved_body": json.dumps(
+                        {
+                            "detail": f"listener {json.dumps(listener.name)} does not serve "
+                            f"this path; it serves {', '.join(served)}"
+                        }
+                    ),
+                }
             listeners.append(
                 {
+                    **gate,
                     "name": listener.name,
-                    "address": listener.address,
-                    "port": listener.port,
-                    "timeout": (
-                        listener.timeout if hasattr(listener, "timeout") else "300s"
+                    "address": os.getenv(
+                        ENVOY_CONTAINER_LISTENER_ADDRESS_ENV, listener.address
                     ),
+                    "port": listener.port,
+                    "timeout": envoy_duration(listener.timeout or "300s"),
                     "api_keys": (
                         list(listener.api_keys)
                         if getattr(listener, "api_keys", None)
                         else []
                     ),
+                    "trust_identity_headers": _trusts_identity_headers(listener),
                 }
             )
     else:
@@ -110,119 +294,45 @@ def generate_envoy_config_from_user_config(
                 "port": DEFAULT_LISTENER_PORT,
                 "timeout": "300s",
                 "api_keys": [],
+                "trust_identity_headers": False,
             }
         )
 
     # Extract models and their endpoints
     # Group endpoints by model for cluster creation
     models = []
-    anthropic_models = []  # Anthropic models use a shared cluster
+    default_ca_file = default_backend_ca_file(user_config)
+    for model in project_provider_models_for_envoy(user_config):
+        backend_group = project_envoy_backend_group(model, default_ca_file)
+        endpoints = list(backend_group.endpoints)
+        has_https = backend_group.has_https
+        uses_dns = backend_group.uses_dns
 
-    for model in user_config.providers.models:
-        # Handle external API models (e.g., Anthropic) - they use shared clusters
-        if model.api_format and model.api_format in EXTERNAL_API_MODEL_FORMATS:
-            if model.api_format == "anthropic" and _uses_shared_anthropic_cluster(
-                model
-            ):
-                anthropic_models.append({"name": model.name})
-                log.info(
-                    f"  Anthropic model: {model.name} (will use shared anthropic_api_cluster)"
-                )
-                continue
-            if model.api_format == "anthropic":
-                log.info(f"  Anthropic model: {model.name} (dedicated cluster)")
-
-        endpoints = []
-        has_https = False
-        uses_dns = False
-
-        backend_refs = model.backend_refs
-        for index, backend in enumerate(backend_refs):
-            # Parse endpoint: can be "host", "host:port", or "host/path" or "host:port/path"
-            endpoint_str = backend.endpoint or backend.base_url or ""
-            if not endpoint_str:
-                continue
-            path = ""
-
-            if "://" in endpoint_str:
-                parsed = urlparse(endpoint_str)
-                host = parsed.hostname or parsed.netloc
-                path = parsed.path.rstrip("/")
-                protocol = parsed.scheme or backend.protocol
-                port = parsed.port or (443 if protocol == "https" else 80)
-            else:
-                protocol = backend.protocol
-
-                # Extract path if present (e.g., "host/path" or "host:port/path")
-                if "/" in endpoint_str:
-                    # Split by first "/" to separate host[:port] from path
-                    parts = endpoint_str.split("/", 1)
-                    endpoint_str = parts[0]  # host or host:port
-                    path = "/" + parts[1]  # /path
-
-                # Parse host and port
-                if ":" in endpoint_str:
-                    host, port = endpoint_str.split(":", 1)
-                    port = int(port)
-                else:
-                    host = endpoint_str
-                    # Default port based on protocol
-                    port = 443 if protocol == "https" else 80
-
-            # Check if this is HTTPS (for transport_socket)
-            is_https = protocol == "https"
-            if is_https:
-                has_https = True
-
-            # Check if host is a domain name (for cluster type)
-            # Simple heuristic: if it contains letters or dots in non-IP pattern, it's a domain
-            is_domain = not _is_ip_address(host)
-            if is_domain:
-                uses_dns = True
-
-            extra_headers = dict(backend.extra_headers or {})
-            api_key = backend.resolve_api_key()
-            if api_key and backend.auth_header:
-                auth_prefix = (backend.auth_prefix or "").strip()
-                extra_headers[str(backend.auth_header)] = (
-                    f"{auth_prefix} {api_key}".strip() if auth_prefix else str(api_key)
-                )
-
-            endpoints.append(
-                {
-                    "name": backend.name or f"backend-{index + 1}",
-                    "address": host,
-                    "port": int(port),
-                    "host_authority": (
-                        f"{host}:{port}" if int(port) not in (80, 443) else host
-                    ),
-                    "path": path,
-                    "weight": backend.weight,
-                    "protocol": protocol,
-                    "is_https": is_https,
-                    "is_domain": is_domain,
-                    "extra_headers": extra_headers,
-                }
-            )
-
-        # Sanitize model name for cluster name (replace / with _)
         if not endpoints:
             continue
 
-        cluster_name = model.name.replace("/", "_").replace("-", "_")
+        cluster_name = _model_cluster_id(model.name)
 
         # Determine cluster type based on whether endpoints use domain names
         # Domain names → LOGICAL_DNS, IP addresses → STATIC
-        cluster_type = "LOGICAL_DNS" if uses_dns else "STATIC"
+        cluster_type = (
+            "STRICT_DNS"
+            if uses_dns and len(endpoints) > 1
+            else "LOGICAL_DNS" if uses_dns else "STATIC"
+        )
 
         # Determine path prefix - use the first endpoint's path if all endpoints have the same path
         path_prefix = ""
         route_request_headers = []
         if endpoints:
             first_path = endpoints[0].get("path", "")
-            if first_path and all(ep.get("path", "") == first_path for ep in endpoints):
+            if first_path:
                 path_prefix = first_path
             route_request_headers = _route_request_headers(endpoints[0])
+
+        auto_host_rewrite = (
+            len({endpoint["host_authority"] for endpoint in endpoints}) > 1
+        )
 
         models.append(
             {
@@ -231,19 +341,23 @@ def generate_envoy_config_from_user_config(
                 "endpoints": endpoints,
                 "cluster_type": cluster_type,
                 "has_https": has_https,
+                "tls": backend_group.tls,
                 "path_prefix": path_prefix,
                 "route_request_headers": route_request_headers,
+                "auto_host_rewrite": auto_host_rewrite,
+                "reliability": _envoy_reliability(model),
             }
         )
 
     extproc_host = os.getenv("ENVOY_EXTPROC_ADDRESS", "127.0.0.1")
     router_api_host = os.getenv("ENVOY_ROUTER_API_ADDRESS", "127.0.0.1")
-    extproc_host_is_domain = not _is_ip_address(extproc_host)
-    router_api_host_is_domain = not _is_ip_address(router_api_host)
+    extproc_host_is_domain = not is_ip_address(extproc_host)
+    router_api_host_is_domain = not is_ip_address(router_api_host)
 
     # Prepare template data
     template_data = {
         "listeners": listeners,
+        "identity_headers": _identity_headers(user_config),
         "extproc_host": extproc_host,
         "extproc_port": 50051,
         "extproc_cluster_type": "LOGICAL_DNS" if extproc_host_is_domain else "STATIC",
@@ -255,25 +369,25 @@ def generate_envoy_config_from_user_config(
         ),
         "router_api_host_is_domain": router_api_host_is_domain,
         "models": models,
-        "anthropic_models": anthropic_models,  # Anthropic models for shared cluster
+        "delegated_credential_headers": _delegated_credential_headers(user_config),
         "use_original_dst": False,  # Use static clusters for now
     }
+    _check_decision_reliability(user_config)
 
-    log.info("  Listeners:")
-    for listener in listeners:
-        log.info(f"    - {listener['name']}: {listener['address']}:{listener['port']}")
-    log.info(f"  Found {len(models)} vLLM model(s):")
-    for model in models:
-        log.info(f"    - {model['name']} (cluster: {model['cluster_name']})")
-        for ep in model["endpoints"]:
+    if log_summary:
+        log.info("  Listeners:")
+        for listener in listeners:
             log.info(
-                f"        - {ep['name']}: {ep['address']}:{ep['port']} (weight: {ep['weight']})"
+                f"    - {listener['name']}: {listener['address']}:{listener['port']}"
             )
-    if anthropic_models:
-        log.info(f"  Found {len(anthropic_models)} Anthropic model(s):")
-        for model in anthropic_models:
-            log.info(f"    - {model['name']} (cluster: anthropic_api_cluster)")
-
+        log.info(f"  Found {len(models)} vLLM model(s):")
+        for model in models:
+            log.info(f"    - {model['name']} (cluster: {model['cluster_name']})")
+            for ep in model["endpoints"]:
+                log.info(
+                    f"        - {ep['name']}: {ep['address']}:{ep['port']} "
+                    f"(weight: {ep['weight']})"
+                )
     # Check if template exists
     template_path = Path(template_root) / template_file
     if not template_path.exists():
@@ -297,9 +411,10 @@ def generate_envoy_config_from_user_config(
 
     # Write output
     try:
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(rendered)
-        log.info(f"Generated Envoy config: {output_path}")
+        if log_summary:
+            log.info(f"Generated Envoy config: {output_path}")
     except Exception as e:
         log.error(f"Failed to write Envoy config: {e}")
         raise

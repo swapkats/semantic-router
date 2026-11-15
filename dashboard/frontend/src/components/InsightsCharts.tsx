@@ -15,15 +15,27 @@ import {
 import type {
   InsightsAggregateResponse,
   InsightsAggregateSummary,
+  InsightsAggregateCurrencySummary,
   InsightsAggregateTokenEntry,
 } from '../pages/insightsPageTypes'
 import styles from './InsightsCharts.module.css'
+import InsightsProviderCacheSummary from './InsightsProviderCacheSummary'
+import { formatInsightsCost as formatCurrency } from '../utils/insightsCost'
 
 interface InsightsChartsProps {
   aggregate: InsightsAggregateResponse
 }
 
-const COLORS = ['#76b900', '#8fd400', '#6ba300', '#5a8f00', '#718096', '#5a6c7d', '#606c7a', '#556b7d']
+const CHART_COLORS = [
+  '#e31b23',
+  '#f4f4f5',
+  '#c9cbd0',
+  '#a1a1aa',
+  '#858990',
+  '#6f7379',
+  '#55585e',
+  '#393b40',
+]
 
 interface PieLabelProps {
   cx: number
@@ -44,7 +56,7 @@ const renderCustomLabel = ({ cx, cy, midAngle, outerRadius, percent, name }: Pie
     <text
       x={x}
       y={y}
-      fill="white"
+      fill="#e4e4e7"
       textAnchor={x > cx ? 'start' : 'end'}
       dominantBaseline="central"
       style={{ fontSize: '11px', fontWeight: 500 }}
@@ -55,33 +67,7 @@ const renderCustomLabel = ({ cx, cy, midAngle, outerRadius, percent, name }: Pie
 }
 
 const generateBarColors = (count: number): string[] => {
-  const colors: string[] = []
-  for (let i = 0; i < count; i += 1) {
-    const ratio = i / Math.max(count - 1, 1)
-    const r = Math.round(118 + (156 - 118) * ratio)
-    const g = Math.round(185 + (163 - 185) * ratio)
-    const b = Math.round(0 + (175 - 0) * ratio)
-    colors.push(`rgb(${r}, ${g}, ${b})`)
-  }
-  return colors
-}
-
-const formatCurrency = (value: number, currency?: string) => {
-  if (!currency) {
-    return 'N/A'
-  }
-
-  try {
-    const minimumFractionDigits = Math.abs(value) >= 0.01 ? 2 : 4
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency,
-      minimumFractionDigits,
-      maximumFractionDigits: 4,
-    }).format(value)
-  } catch {
-    return `${value.toFixed(4)} ${currency}`
-  }
+  return Array.from({ length: count }, (_, index) => CHART_COLORS[index % CHART_COLORS.length])
 }
 
 const formatTokenCount = (value: number) =>
@@ -112,7 +98,13 @@ function TokenBreakdownChart({ title, data }: TokenBreakdownChartProps) {
   return (
     <div className={styles.chartSection}>
       <h3 className={styles.chartTitle}>
-        <svg className={styles.chartIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <svg
+          className={styles.chartIcon}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
           <path d="M4 19h16" />
           <path d="M7 16V8" />
           <path d="M12 16V5" />
@@ -132,7 +124,10 @@ function TokenBreakdownChart({ title, data }: TokenBreakdownChartProps) {
             tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }}
             tickFormatter={formatAxisLabel}
           />
-          <YAxis tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }} tickFormatter={formatCompactTokenCount} />
+          <YAxis
+            tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }}
+            tickFormatter={formatCompactTokenCount}
+          />
           <Tooltip
             cursor={false}
             formatter={(value: number | string) => [formatTokenCount(Number(value)), 'Tokens']}
@@ -141,29 +136,29 @@ function TokenBreakdownChart({ title, data }: TokenBreakdownChartProps) {
               background: 'var(--color-bg-secondary)',
               border: '1px solid var(--color-border)',
               borderRadius: '4px',
-              color: 'var(--color-text-primary)',
+              color: 'var(--color-text)',
             }}
-            itemStyle={{ color: 'var(--color-text-primary)' }}
+            itemStyle={{ color: 'var(--color-text)' }}
           />
           <Legend verticalAlign="top" height={30} />
-          <Bar dataKey="input_tokens" name="Input Tokens" fill="#76b900" radius={[6, 6, 0, 0]} />
-          <Bar dataKey="output_tokens" name="Output Tokens" fill="#00d4ff" radius={[6, 6, 0, 0]} />
-          <Bar dataKey="total_tokens" name="Total Tokens" fill="#f59e0b" radius={[6, 6, 0, 0]} />
+          <Bar dataKey="input_tokens" name="Input Tokens" fill="#8f949c" radius={[6, 6, 0, 0]} />
+          <Bar dataKey="output_tokens" name="Output Tokens" fill="#a6abb3" radius={[6, 6, 0, 0]} />
+          <Bar dataKey="total_tokens" name="Total Tokens" fill="#e31b23" radius={[6, 6, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>
   )
 }
 
-const summaryCards = (summary: InsightsAggregateSummary) => [
+const summaryCards = (summary: InsightsAggregateSummary | InsightsAggregateCurrencySummary) => [
   {
-    label: 'Total Saved',
+    label: 'Estimated Savings',
     value: formatCurrency(summary.total_saved, summary.currency),
     accentClassName: styles.summaryValuePositive,
     cardClassName: '',
   },
   {
-    label: 'Saved %',
+    label: 'Estimated Saved %',
     value:
       summary.cost_record_count > 0 && summary.baseline_spend > 0
         ? formatPercent(summary.total_saved / summary.baseline_spend)
@@ -172,13 +167,13 @@ const summaryCards = (summary: InsightsAggregateSummary) => [
     cardClassName: styles.summaryCardHighlight,
   },
   {
-    label: 'Baseline Spend',
+    label: 'Estimated Baseline',
     value: formatCurrency(summary.baseline_spend, summary.currency),
     accentClassName: '',
     cardClassName: '',
   },
   {
-    label: 'Actual Spend',
+    label: 'Estimated Model Cost',
     value: formatCurrency(summary.actual_spend, summary.currency),
     accentClassName: styles.summaryValueNeutral,
     cardClassName: '',
@@ -187,15 +182,16 @@ const summaryCards = (summary: InsightsAggregateSummary) => [
 
 export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
   const summary = aggregate.summary
+  const costGroups = summary.by_currency?.length ? summary.by_currency : [summary]
   const modelData = aggregate.model_selection
   const decisionData = aggregate.decision_distribution
   const signalData = aggregate.signal_distribution
   const tokenVolume = aggregate.token_volume
   const tokenBreakdown = aggregate.token_breakdown
   const tokenValues = [
-    { name: 'Input Tokens', value: tokenVolume.input_tokens, fill: '#76b900' },
-    { name: 'Output Tokens', value: tokenVolume.output_tokens, fill: '#00d4ff' },
-    { name: 'Total Tokens', value: tokenVolume.total_tokens, fill: '#f59e0b' },
+    { name: 'Input Tokens', value: tokenVolume.input_tokens, fill: '#8f949c' },
+    { name: 'Output Tokens', value: tokenVolume.output_tokens, fill: '#a6abb3' },
+    { name: 'Total Tokens', value: tokenVolume.total_tokens, fill: '#e31b23' },
   ]
   const barColors = generateBarColors(modelData.length)
 
@@ -205,28 +201,67 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
 
   return (
     <section className={styles.container}>
-      <div className={styles.summaryGrid}>
-        {summaryCards(summary).map((card) => (
-          <article
-            key={card.label}
-            className={`${styles.summaryCard} ${card.cardClassName}`.trim()}
-          >
-            <span className={styles.summaryLabel}>{card.label}</span>
-            <strong className={`${styles.summaryValue} ${card.accentClassName}`.trim()}>{card.value}</strong>
-          </article>
-        ))}
+      <div className={styles.estimateContext}>
+        <p className={styles.summaryHint}>
+          Estimates from recorded tokens and configured rates, not GPU bills or provider invoices.
+        </p>
+        <details className={styles.estimateDetails}>
+          <summary>How estimates work</summary>
+          <p>
+            New records use the highest estimate in the recipe’s complete model pool across all
+            decisions, in the same currency, as baseline using the same recorded tokens. Direct
+            requests use the selected model as baseline. Older records retain their captured
+            baseline.
+          </p>
+          <p>
+            Infrastructure charges and invoice adjustments are excluded. Currencies are shown
+            separately; no exchange-rate conversion is applied. Requests that are not completed or
+            lack token usage, model pricing, or baseline data are excluded. Missing data is shown as
+            an explicit reason in each record. Historical requests without captured prices remain
+            “Price not recorded”; current model rates do not backfill them.
+          </p>
+        </details>
       </div>
-
+      {costGroups.map((group) => (
+        <div key={group.currency || 'unavailable'}>
+          {costGroups.length > 1 ? (
+            <h3 className={styles.chartTitle}>{group.currency} estimates</h3>
+          ) : null}
+          <div className={styles.summaryGrid}>
+            {summaryCards(group).map((card) => (
+              <article
+                key={card.label}
+                className={`${styles.summaryCard} ${card.cardClassName}`.trim()}
+              >
+                <span className={styles.summaryLabel}>{card.label}</span>
+                <strong className={`${styles.summaryValue} ${card.accentClassName}`.trim()}>
+                  {card.value}
+                </strong>
+              </article>
+            ))}
+          </div>
+        </div>
+      ))}
       {summary.excluded_record_count > 0 ? (
         <p className={styles.summaryHint}>
-          {summary.excluded_record_count} filtered record{summary.excluded_record_count === 1 ? '' : 's'} excluded from cost totals because usage or pricing data is incomplete.
+          {summary.excluded_record_count} filtered record
+          {summary.excluded_record_count === 1 ? '' : 's'} excluded from estimates. Each row
+          explains what was not recorded. Historical rows without captured prices are not repriced.
         </p>
       ) : null}
+
+      <InsightsProviderCacheSummary summary={aggregate.provider_cache} />
 
       <div className={styles.chartsRow}>
         <div className={styles.chartSection}>
           <h3 className={styles.chartTitle}>
-            <svg className={styles.chartIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg
+              className={styles.chartIcon}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
               <rect x="3" y="3" width="7" height="18" />
               <rect x="14" y="8" width="7" height="13" />
             </svg>
@@ -234,8 +269,18 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
           </h3>
           <ResponsiveContainer width="100%" height={300}>
             <BarChart data={modelData} margin={{ top: 20, right: 0, left: 0, bottom: 60 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" vertical={false} />
-              <XAxis dataKey="name" angle={-45} textAnchor="end" height={80} tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }} />
+              <CartesianGrid
+                strokeDasharray="3 3"
+                stroke="rgba(255,255,255,0.1)"
+                vertical={false}
+              />
+              <XAxis
+                dataKey="name"
+                angle={-45}
+                textAnchor="end"
+                height={80}
+                tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }}
+              />
               <YAxis tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }} />
               <Tooltip
                 cursor={false}
@@ -243,9 +288,9 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                   background: 'var(--color-bg-secondary)',
                   border: '1px solid var(--color-border)',
                   borderRadius: '4px',
-                  color: 'var(--color-text-primary)',
+                  color: 'var(--color-text)',
                 }}
-                itemStyle={{ color: 'var(--color-text-primary)' }}
+                itemStyle={{ color: 'var(--color-text)' }}
               />
               <Bar dataKey="value" name="Count">
                 {modelData.map((_entry, index) => (
@@ -258,7 +303,13 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
 
         <div className={styles.chartSection}>
           <h3 className={styles.chartTitle}>
-            <svg className={styles.chartIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg
+              className={styles.chartIcon}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
               <circle cx="12" cy="12" r="10" />
               <path d="M12 2 L12 12 L20 12" />
             </svg>
@@ -276,7 +327,10 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                 dataKey="value"
               >
                 {decisionData.map((_entry, index) => (
-                  <Cell key={`decision-${index}`} fill={COLORS[index % COLORS.length]} />
+                  <Cell
+                    key={`decision-${index}`}
+                    fill={CHART_COLORS[index % CHART_COLORS.length]}
+                  />
                 ))}
               </Pie>
               <Tooltip
@@ -284,9 +338,9 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                   background: 'var(--color-bg-secondary)',
                   border: '1px solid var(--color-border)',
                   borderRadius: '4px',
-                  color: 'var(--color-text-primary)',
+                  color: 'var(--color-text)',
                 }}
-                itemStyle={{ color: 'var(--color-text-primary)' }}
+                itemStyle={{ color: 'var(--color-text)' }}
               />
             </PieChart>
           </ResponsiveContainer>
@@ -294,7 +348,13 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
 
         <div className={styles.chartSection}>
           <h3 className={styles.chartTitle}>
-            <svg className={styles.chartIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg
+              className={styles.chartIcon}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
               <circle cx="12" cy="12" r="10" />
               <path d="M12 2 L12 12 L20 12" />
             </svg>
@@ -312,7 +372,7 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                 dataKey="value"
               >
                 {signalData.map((_entry, index) => (
-                  <Cell key={`signal-${index}`} fill={COLORS[index % COLORS.length]} />
+                  <Cell key={`signal-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
                 ))}
               </Pie>
               <Tooltip
@@ -320,9 +380,9 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                   background: 'var(--color-bg-secondary)',
                   border: '1px solid var(--color-border)',
                   borderRadius: '4px',
-                  color: 'var(--color-text-primary)',
+                  color: 'var(--color-text)',
                 }}
-                itemStyle={{ color: 'var(--color-text-primary)' }}
+                itemStyle={{ color: 'var(--color-text)' }}
               />
             </PieChart>
           </ResponsiveContainer>
@@ -331,7 +391,13 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
 
       <div className={styles.chartSection}>
         <h3 className={styles.chartTitle}>
-          <svg className={styles.chartIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg
+            className={styles.chartIcon}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
             <path d="M4 19h16" />
             <path d="M7 16V8" />
             <path d="M12 16V5" />
@@ -354,9 +420,9 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
                 background: 'var(--color-bg-secondary)',
                 border: '1px solid var(--color-border)',
                 borderRadius: '4px',
-                color: 'var(--color-text-primary)',
+                color: 'var(--color-text)',
               }}
-              itemStyle={{ color: 'var(--color-text-primary)' }}
+              itemStyle={{ color: 'var(--color-text)' }}
             />
             <Bar dataKey="value" name="Tokens" radius={[8, 8, 0, 0]}>
               {tokenValues.map((entry) => (
@@ -367,14 +433,19 @@ export default function InsightsCharts({ aggregate }: InsightsChartsProps) {
         </ResponsiveContainer>
         {tokenVolume.excluded_record_count > 0 ? (
           <p className={styles.summaryHint}>
-            {tokenVolume.excluded_record_count} filtered record{tokenVolume.excluded_record_count === 1 ? '' : 's'} excluded from token totals because usage data is incomplete.
+            {tokenVolume.excluded_record_count} filtered record
+            {tokenVolume.excluded_record_count === 1 ? '' : 's'} excluded from token totals because
+            usage data is incomplete.
           </p>
         ) : null}
       </div>
 
       <div className={styles.tokenBreakdownRow}>
         <TokenBreakdownChart title="Tokens by Decision" data={tokenBreakdown.by_decision} />
-        <TokenBreakdownChart title="Tokens by Selected Model" data={tokenBreakdown.by_selected_model} />
+        <TokenBreakdownChart
+          title="Tokens by Selected Model"
+          data={tokenBreakdown.by_selected_model}
+        />
       </div>
     </section>
   )

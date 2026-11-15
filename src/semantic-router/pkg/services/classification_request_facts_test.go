@@ -1,0 +1,147 @@
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
+
+func TestClassificationServiceEvaluatesRequestEnvelopeFacts(t *testing.T) {
+	equalsCanary := "canary"
+	cfg := &config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				MetadataRules: []config.MetadataRule{{
+					Name: "canary",
+					Key:  "cohort",
+					Predicate: config.MetadataPredicate{
+						Equals: &equalsCanary,
+					},
+				}},
+				InputModalityRules: []config.InputModalityRule{{Name: "has-image", Modality: config.InputModalityImage}},
+			},
+			Decisions: []config.Decision{
+				requestFactDecision("metadata-route", config.SignalTypeMetadata, "canary", 30),
+				requestFactDecision("image-route", config.SignalTypeInputModality, "has-image", 20),
+			},
+		},
+	}
+	classifier, err := classification.NewClassifier(cfg)
+	require.NoError(t, err)
+	service := NewClassificationService(classifier, cfg)
+
+	metadataResponse, err := service.ClassifyIntentForEval(context.Background(), IntentRequest{
+		Metadata: map[string]string{"cohort": "canary"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, metadataResponse.DecisionResult)
+	require.Equal(t, "metadata-route", metadataResponse.DecisionResult.DecisionName)
+
+	imageResponse, err := service.ClassifyIntentForEval(context.Background(), IntentRequest{
+		Messages: []IntentMessage{{
+			Role: "user",
+			Content: mustMessageContent(t, []map[string]interface{}{{
+				"type":      "image_url",
+				"image_url": map[string]string{"url": "https://example.invalid/image.png"},
+			}}),
+		}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, imageResponse.DecisionResult)
+	require.Equal(t, "image-route", imageResponse.DecisionResult.DecisionName)
+	require.Equal(t, float64(1), imageResponse.SignalValues["input_modality:has-image"])
+}
+
+func TestClassificationServiceContextSignalUsesFullRequestTokenFloor(t *testing.T) {
+	cfg := &config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				ContextRules: []config.ContextRule{
+					{
+						Name:      "short-request-context",
+						MinTokens: config.TokenCount("0"),
+						MaxTokens: config.TokenCount("10K"),
+					},
+					{
+						Name:      "large-request-context",
+						MinTokens: config.TokenCount("10K"),
+						MaxTokens: config.TokenCount("128K"),
+					},
+				},
+			},
+			Decisions: []config.Decision{
+				requestFactDecision(
+					"large-context-route",
+					config.SignalTypeContext,
+					"large-request-context",
+					10,
+				),
+			},
+		},
+	}
+	classifier, err := classification.NewClassifier(cfg)
+	require.NoError(t, err)
+	service := NewClassificationService(classifier, cfg)
+
+	response, err := service.ClassifyIntentForEval(context.Background(), IntentRequest{
+		Messages: []IntentMessage{
+			{Role: "user", Content: mustMessageContent(t, strings.Repeat("p", 8_000))},
+			{
+				Role:       "tool",
+				ToolCallID: "call-1",
+				Content: mustMessageContent(
+					t,
+					strings.Repeat(`{"row":9007199254740993123456789}`, 100),
+				),
+			},
+			{
+				Role: "user",
+				Content: mustMessageContent(t, []map[string]any{
+					{"type": "text", "text": "ok"},
+					{
+						"type": "image_url",
+						"image_url": map[string]string{
+							"url": "data:image/png;base64,PRIVATE",
+						},
+					},
+				}),
+			},
+		},
+		Tools: []json.RawMessage{mustMessageContent(t, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": strings.Repeat("schema", 500),
+				"parameters":  map[string]any{"type": "object"},
+			},
+		})},
+		MaxCompletionTokens: json.RawMessage(`4096`),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, response.DecisionResult)
+	require.Equal(t, "large-context-route", response.DecisionResult.DecisionName)
+	require.NotNil(t, response.DecisionResult.MatchedSignals)
+	require.Contains(t, response.DecisionResult.MatchedSignals.Context, "large-request-context")
+}
+
+func requestFactDecision(
+	name string,
+	signalType string,
+	signalName string,
+	priority int,
+) config.Decision {
+	return config.Decision{
+		Name:     name,
+		Priority: priority,
+		Rules: config.RuleNode{
+			Type: signalType,
+			Name: signalName,
+		},
+	}
+}

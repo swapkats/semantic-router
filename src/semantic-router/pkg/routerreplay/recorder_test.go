@@ -1,7 +1,10 @@
 package routerreplay
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +24,7 @@ func TestRecorderUpdateUsageCostClonesStoredValues(t *testing.T) {
 
 	promptTokens := 120
 	cachedPromptTokens := 40
+	cacheWriteTokens := 20
 	completionTokens := 45
 	totalTokens := 165
 	actualCost := 0.0012
@@ -31,6 +35,7 @@ func TestRecorderUpdateUsageCostClonesStoredValues(t *testing.T) {
 	usage := UsageCost{
 		PromptTokens:       &promptTokens,
 		CachedPromptTokens: &cachedPromptTokens,
+		CacheWriteTokens:   &cacheWriteTokens,
 		CompletionTokens:   &completionTokens,
 		TotalTokens:        &totalTokens,
 		ActualCost:         &actualCost,
@@ -46,6 +51,7 @@ func TestRecorderUpdateUsageCostClonesStoredValues(t *testing.T) {
 
 	promptTokens = 999
 	cachedPromptTokens = 999
+	cacheWriteTokens = 999
 	completionTokens = 999
 	totalTokens = 1998
 	actualCost = 9.9
@@ -61,6 +67,7 @@ func TestRecorderUpdateUsageCostClonesStoredValues(t *testing.T) {
 
 	assertIntPtr(t, record.PromptTokens, 120, "prompt tokens")
 	assertIntPtr(t, record.CachedPromptTokens, 40, "cached prompt tokens")
+	assertIntPtr(t, record.CacheWriteTokens, 20, "cache write tokens")
 	assertIntPtr(t, record.CompletionTokens, 45, "completion tokens")
 	assertIntPtr(t, record.TotalTokens, 165, "total tokens")
 	assertFloatPtr(t, record.ActualCost, 0.0012, "actual cost")
@@ -72,6 +79,7 @@ func TestRecorderUpdateUsageCostClonesStoredValues(t *testing.T) {
 
 func TestRecorderUpdateToolTraceClonesStoredValues(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
+	recorder.SetCapturePolicy(true, true, 0)
 	recordID, err := recorder.AddRecord(RoutingRecord{
 		ID:        "replay-tool-trace-1",
 		Decision:  "decision-a",
@@ -114,6 +122,55 @@ func TestRecorderUpdateToolTraceClonesStoredValues(t *testing.T) {
 	}
 	if got := record.ToolTrace.Steps[0].Text; got != "Find the weather." {
 		t.Fatalf("unexpected cloned step text: %q", got)
+	}
+}
+
+func TestRecorderUpdateHallucinationStatusClonesStoredValues(t *testing.T) {
+	recorder := NewRecorder(store.NewMemoryStore(10, 0))
+	recorder.SetCapturePolicy(true, true, 0)
+	recordID, err := recorder.AddRecord(RoutingRecord{
+		ID:        "replay-hallucination-1",
+		Decision:  "decision-a",
+		RequestID: "req-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to add record: %v", err)
+	}
+
+	spans := []string{"span-a"}
+	spanDetails := []HallucinationSpan{
+		{
+			Text:                    "span-a",
+			Start:                   0,
+			End:                     6,
+			HallucinationConfidence: 0.9,
+			Severity:                4,
+			Explanation:             "contradicts context",
+		},
+	}
+
+	if err := recorder.UpdateHallucinationStatus(recordID, true, 0.87, spans, spanDetails); err != nil {
+		t.Fatalf("failed to update hallucination status: %v", err)
+	}
+
+	spans[0] = "mutated"
+	spanDetails[0].Text = "mutated"
+	spanDetails[0].Severity = 0
+
+	record, found := recorder.GetRecord(recordID)
+	if !found {
+		t.Fatal("expected to retrieve updated replay record")
+	}
+
+	if !record.HallucinationDetected {
+		t.Fatal("expected hallucination detected to be true")
+	}
+	if len(record.HallucinationSpanDetails) != 1 {
+		t.Fatalf("expected 1 stored span detail, got %d", len(record.HallucinationSpanDetails))
+	}
+	got := record.HallucinationSpanDetails[0]
+	if got.Text != "span-a" || got.Severity != 4 || got.Explanation != "contradicts context" {
+		t.Fatalf("unexpected cloned span detail: %#v", got)
 	}
 }
 
@@ -166,94 +223,6 @@ func TestLogFieldsIncludesOptionalReplayMetadata(t *testing.T) {
 	assertSignalLogFields(t, fields)
 }
 
-func richReplayRoutingRecord(
-	timestamp time.Time,
-	promptTokens *int,
-	cachedPromptTokens *int,
-	completionTokens *int,
-	totalTokens *int,
-	actualCost *float64,
-	baselineCost *float64,
-	costSavings *float64,
-	currency *string,
-	baselineModel *string,
-) RoutingRecord {
-	return RoutingRecord{
-		ID:                "replay-1",
-		Decision:          "decision-a",
-		DecisionTier:      2,
-		DecisionPriority:  100,
-		Category:          "math",
-		OriginalModel:     "model-a",
-		SelectedModel:     "model-b",
-		ReasoningMode:     "cot",
-		ConfidenceScore:   0.91,
-		SelectionMethod:   "router_dc",
-		SessionPolicy:     map[string]interface{}{"decision_reason": "stay_has_best_adjusted_score"},
-		RequestID:         "req-1",
-		SessionID:         "sess-log-test",
-		TurnIndex:         5,
-		Timestamp:         timestamp,
-		FromCache:         true,
-		Streaming:         true,
-		ResponseStatus:    200,
-		Projections:       []string{"balance_reasoning"},
-		ProjectionScores:  map[string]float64{"reasoning_pressure": 0.73},
-		SignalConfidences: map[string]float64{"projection:balance_reasoning": 0.73},
-		SignalValues:      map[string]float64{"reask:likely_dissatisfied": 2},
-		ToolTrace: &ToolTrace{
-			Flow:      "User Query -> LLM Tool Call -> Client Tool Result -> LLM Final Response",
-			Stage:     "LLM Final Response",
-			ToolNames: []string{"get_weather"},
-			Steps: []ToolTraceStep{
-				{Type: "user_input", Text: "Find the weather."},
-				{Type: "assistant_tool_call", ToolName: "get_weather"},
-				{Type: "client_tool_result", ToolName: "get_weather"},
-				{Type: "assistant_final_response", Text: "It is sunny."},
-			},
-		},
-		Signals: Signal{
-			Keyword:    []string{"math_keywords"},
-			Reask:      []string{"likely_dissatisfied"},
-			Complexity: []string{"complex"},
-			Modality:   []string{"AR"},
-			Authz:      []string{"premium_tier"},
-			Jailbreak:  []string{"prompt_attack"},
-			PII:        []string{"email"},
-			KB:         []string{"policy_kb"},
-		},
-		GuardrailsEnabled:           true,
-		JailbreakEnabled:            true,
-		PIIEnabled:                  true,
-		JailbreakDetected:           true,
-		JailbreakType:               "prompt_injection",
-		JailbreakConfidence:         0.9,
-		ResponseJailbreakDetected:   true,
-		ResponseJailbreakType:       "response_attack",
-		ResponseJailbreakConfidence: 0.8,
-		PIIDetected:                 true,
-		PIIEntities:                 []string{"email"},
-		PIIBlocked:                  true,
-		RAGEnabled:                  true,
-		RAGBackend:                  "milvus",
-		RAGContextLength:            2048,
-		RAGSimilarityScore:          0.76,
-		HallucinationEnabled:        true,
-		HallucinationDetected:       true,
-		HallucinationConfidence:     0.66,
-		HallucinationSpans:          []string{"span-a"},
-		PromptTokens:                promptTokens,
-		CachedPromptTokens:          cachedPromptTokens,
-		CompletionTokens:            completionTokens,
-		TotalTokens:                 totalTokens,
-		ActualCost:                  actualCost,
-		BaselineCost:                baselineCost,
-		CostSavings:                 costSavings,
-		Currency:                    currency,
-		BaselineModel:               baselineModel,
-	}
-}
-
 func assertSignalLogFields(t *testing.T, fields map[string]interface{}) {
 	t.Helper()
 	signals, ok := fields["signals"].(map[string]interface{})
@@ -261,13 +230,12 @@ func assertSignalLogFields(t *testing.T, fields map[string]interface{}) {
 		t.Fatalf("expected signals to be a map, got %T", fields["signals"])
 	}
 	assertFieldValue(t, signals, "keyword", []string{"math_keywords"})
-	assertFieldValue(t, signals, "reask", []string{"likely_dissatisfied"})
+	assertFieldValue(t, signals, "turn_relation", []string{"likely_dissatisfied"})
 	assertFieldValue(t, signals, "complexity", []string{"complex"})
 	assertFieldValue(t, signals, "modality", []string{"AR"})
 	assertFieldValue(t, signals, "authz", []string{"premium_tier"})
 	assertFieldValue(t, signals, "jailbreak", []string{"prompt_attack"})
 	assertFieldValue(t, signals, "pii", []string{"email"})
-	assertFieldValue(t, signals, "kb", []string{"policy_kb"})
 }
 
 func assertIntPtr(t *testing.T, value *int, expected int, label string) {
@@ -307,9 +275,11 @@ func assertFieldValue(
 	}
 }
 
-func TestRecorderMaxToolTraceBytesPromptTruncation(t *testing.T) {
+// MaxToolTraceBytes bounds tool definitions and trace steps; the prompt has a
+// limit of its own (MaxPromptBytes, 64 KiB by default).
+func TestRecorderMaxToolTraceBytesLeavesThePromptToItsOwnLimit(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(15)
 
 	id, err := recorder.AddRecord(RoutingRecord{
@@ -326,11 +296,8 @@ func TestRecorderMaxToolTraceBytesPromptTruncation(t *testing.T) {
 		t.Fatal("record not found")
 	}
 
-	if len(rec.Prompt) != 15 {
-		t.Errorf("expected Prompt len=15, got %d", len(rec.Prompt))
-	}
-	if !rec.PromptTruncated {
-		t.Error("expected PromptTruncated=true")
+	if rec.Prompt != "This prompt exceeds fifteen bytes" || rec.PromptTruncated {
+		t.Errorf("expected the whole prompt, got %q (truncated %v)", rec.Prompt, rec.PromptTruncated)
 	}
 	// ToolDefinitions is shorter than 15 bytes only if json is short enough;
 	// here `[{"type":"function"}]` is 22 bytes so it should be truncated too.
@@ -341,7 +308,7 @@ func TestRecorderMaxToolTraceBytesPromptTruncation(t *testing.T) {
 
 func TestRecorderMaxToolTraceBytesStepTruncation(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(8)
 
 	trace := &ToolTrace{
@@ -379,7 +346,7 @@ func TestRecorderMaxToolTraceBytesStepTruncation(t *testing.T) {
 
 func TestRecorderMaxToolTraceBytesPreservesRawFields(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(5)
 
 	fullArgs := `{"city":"San Francisco"}`
@@ -427,7 +394,7 @@ func TestRecorderMaxToolTraceBytesPreservesRawFields(t *testing.T) {
 
 func TestRecorderMaxToolTraceBytesFlagsToolDefinitionsTruncation(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(10)
 
 	longToolDefs := `[{"type":"function","function":{"name":"really_long_tool_name","description":"truncate me"}}]`
@@ -454,7 +421,7 @@ func TestRecorderMaxToolTraceBytesFlagsToolDefinitionsTruncation(t *testing.T) {
 
 func TestRecorderUpdateToolTraceAppliesMaxToolTraceBytes(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(6)
 
 	id, err := recorder.AddRecord(RoutingRecord{
@@ -609,7 +576,7 @@ func TestRecorderUpdateToolTraceAppliesMaxToolTraceSteps(t *testing.T) {
 
 func TestRecorderSetMaxToolTraceBytesZeroNoTruncation(t *testing.T) {
 	recorder := NewRecorder(store.NewMemoryStore(10, 0))
-	recorder.SetCapturePolicy(false, false, 4096)
+	recorder.SetCapturePolicy(true, true, 4096)
 	recorder.SetMaxToolTraceBytes(0) // no limit
 
 	longPrompt := "This is a very long prompt that would be truncated if the limit were active."
@@ -631,5 +598,129 @@ func TestRecorderSetMaxToolTraceBytesZeroNoTruncation(t *testing.T) {
 	}
 	if rec.PromptTruncated {
 		t.Error("expected PromptTruncated=false")
+	}
+}
+
+func TestRecorderPolicyConcurrentAccess(t *testing.T) {
+	recorder := NewRecorder(store.NewMemoryStore(1000, 0))
+	var waitGroup sync.WaitGroup
+	for worker := range 8 {
+		waitGroup.Add(1)
+		go func(worker int) {
+			defer waitGroup.Done()
+			for iteration := range 100 {
+				recorder.SetCapturePolicy(true, true, 128+iteration)
+				recorder.SetMaxToolTraceBytes(iteration)
+				recorder.SetMaxToolTraceSteps(iteration)
+				id := fmt.Sprintf("%d-%d", worker, iteration)
+				_, _ = recorder.AddRecord(RoutingRecord{
+					ID:           id,
+					RequestBody:  strings.Repeat("q", 256),
+					ResponseBody: strings.Repeat("a", 256),
+				})
+				_ = recorder.AttachRequest(id, []byte("request"))
+				_ = recorder.AttachResponse(id, []byte("response"))
+			}
+		}(worker)
+	}
+	waitGroup.Wait()
+}
+
+func TestLogFieldsOmitsUnavailableConfidence(t *testing.T) {
+	fields := LogFields(RoutingRecord{ConfidenceScore: 1, JailbreakEnabled: true, JailbreakDetected: true, JailbreakConfidence: 1, JailbreakType: "classification_error", SignalErrorMatches: map[string]bool{"jailbreak:guard": true}}, "test")
+	if _, exists := fields["confidence_score"]; exists {
+		t.Fatal("unscored decision logged model confidence")
+	}
+	if _, exists := fields["jailbreak_confidence"]; exists {
+		t.Fatal("policy error logged model confidence")
+	}
+	if fields["confidence_score_available"] != false || fields["jailbreak_score_available"] != false || fields["signal_error_matches"] == nil {
+		t.Fatal("score availability or policy origin missing")
+	}
+}
+
+func richReplayRoutingRecord(
+	timestamp time.Time,
+	promptTokens *int,
+	cachedPromptTokens *int,
+	completionTokens *int,
+	totalTokens *int,
+	actualCost *float64,
+	baselineCost *float64,
+	costSavings *float64,
+	currency *string,
+	baselineModel *string,
+) RoutingRecord {
+	return RoutingRecord{
+		ID:                       "replay-1",
+		Decision:                 "decision-a",
+		DecisionTier:             2,
+		DecisionPriority:         100,
+		Category:                 "math",
+		OriginalModel:            "model-a",
+		SelectedModel:            "model-b",
+		ReasoningMode:            "cot",
+		ConfidenceScore:          0.91,
+		ConfidenceScoreAvailable: true,
+		SelectionMethod:          "router_dc",
+		SessionPolicy:            map[string]interface{}{"decision_reason": "stay_has_best_adjusted_score"},
+		RequestID:                "req-1",
+		SessionID:                "sess-log-test",
+		TurnIndex:                5,
+		Timestamp:                timestamp,
+		FromCache:                true,
+		Streaming:                true,
+		ResponseStatus:           200,
+		Projections:              []string{"balance_reasoning"},
+		ProjectionScores:         map[string]float64{"reasoning_pressure": 0.73},
+		SignalConfidences:        map[string]float64{"projection:balance_reasoning": 0.73},
+		SignalValues:             map[string]float64{"turn_relation:likely_dissatisfied": 0.9},
+		ToolTrace: &ToolTrace{
+			Flow:      "User Query -> LLM Tool Call -> Client Tool Result -> LLM Final Response",
+			Stage:     "LLM Final Response",
+			ToolNames: []string{"get_weather"},
+			Steps: []ToolTraceStep{
+				{Type: "user_input", Text: "Find the weather."},
+				{Type: "assistant_tool_call", ToolName: "get_weather"},
+				{Type: "client_tool_result", ToolName: "get_weather"},
+				{Type: "assistant_final_response", Text: "It is sunny."},
+			},
+		},
+		Signals: Signal{
+			Keyword:      []string{"math_keywords"},
+			TurnRelation: []string{"likely_dissatisfied"},
+			Complexity:   []string{"complex"},
+			Modality:     []string{"AR"},
+			Authz:        []string{"premium_tier"},
+			Jailbreak:    []string{"prompt_attack"},
+			PII:          []string{"email"},
+		},
+		GuardrailsEnabled:       true,
+		JailbreakEnabled:        true,
+		PIIEnabled:              true,
+		JailbreakDetected:       true,
+		JailbreakType:           "prompt_injection",
+		JailbreakConfidence:     0.9,
+		JailbreakScoreAvailable: true,
+		PIIDetected:             true,
+		PIIEntities:             []string{"email"},
+		PIIBlocked:              true,
+		RAGEnabled:              true,
+		RAGBackend:              "milvus",
+		RAGContextLength:        2048,
+		RAGSimilarityScore:      0.76,
+		HallucinationEnabled:    true,
+		HallucinationDetected:   true,
+		HallucinationConfidence: 0.66,
+		HallucinationSpans:      []string{"span-a"},
+		PromptTokens:            promptTokens,
+		CachedPromptTokens:      cachedPromptTokens,
+		CompletionTokens:        completionTokens,
+		TotalTokens:             totalTokens,
+		ActualCost:              actualCost,
+		BaselineCost:            baselineCost,
+		CostSavings:             costSavings,
+		Currency:                currency,
+		BaselineModel:           baselineModel,
 	}
 }

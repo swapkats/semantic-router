@@ -1,8 +1,10 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package cache
 
 import (
+	"context"
+	"crypto/md5"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -19,9 +21,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
-	candle_binding "github.com/vllm-project/semantic-router/candle-binding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/internal/testutil/storagetest"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
@@ -30,12 +33,6 @@ func TestCache(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Cache Suite")
 }
-
-var _ = BeforeSuite(func() {
-	// Initialize BERT model once for all cache tests (Linux only)
-	err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true)
-	Expect(err).NotTo(HaveOccurred())
-})
 
 var _ = Describe("Cache Package", func() {
 	var tempDir string
@@ -55,12 +52,13 @@ var _ = Describe("Cache Package", func() {
 			Context("with memory backend", func() {
 				It("should create in-memory cache backend successfully", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         InMemoryCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						MaxEntries:          1000,
 						TTLSeconds:          3600,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -71,12 +69,13 @@ var _ = Describe("Cache Package", func() {
 
 				It("should create disabled cache when enabled is false", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         InMemoryCacheType,
 						Enabled:             false,
 						SimilarityThreshold: 0.8,
 						MaxEntries:          1000,
 						TTLSeconds:          3600,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -87,12 +86,13 @@ var _ = Describe("Cache Package", func() {
 
 				It("should default to memory backend when backend_type is empty", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         "", // Empty should default to memory
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						MaxEntries:          500,
 						TTLSeconds:          1800,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -105,6 +105,7 @@ var _ = Describe("Cache Package", func() {
 			Context("with hybrid backend option plumbing", func() {
 				It("should preserve embedding model when deriving hybrid cache options", func() {
 					cacheConfig := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         HybridCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
@@ -112,23 +113,21 @@ var _ = Describe("Cache Package", func() {
 						MaxMemoryEntries:    500,
 						HNSWM:               16,
 						HNSWEfConstruction:  200,
-						EmbeddingModel:      "mmbert",
+						EmbeddingDeployment: "vela-embedding",
 					}
 
 					options := hybridCacheOptionsFromConfig(cacheConfig)
-					Expect(options.EmbeddingModel).To(Equal("mmbert"))
+					Expect(options.EmbeddingDeployment).To(Equal("vela-embedding"))
 					Expect(options.MaxMemoryEntries).To(Equal(500))
 				})
 			})
 
-			Context("(Deprecated) with file base Milvus backend", func() {
+			Context("(Deprecated) with file base Milvus backend", Label("storage", "storage:milvus"), func() {
 				var milvusConfigPath string
 
 				BeforeEach(func() {
 					// Skip Milvus tests if environment variable is set
-					if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-						Skip("Milvus tests skipped due to SKIP_MILVUS_TESTS=true")
-					}
+					storagetest.Require(GinkgoT(), "milvus")
 
 					// Create a test Milvus configuration file
 					milvusConfigPath = filepath.Join(tempDir, "milvus.yaml")
@@ -160,7 +159,6 @@ search:
 
 development:
   auto_create_collection: true
-  verbose_errors: true
 `
 					err := os.WriteFile(milvusConfigPath, []byte(milvusConfig), 0o644)
 					Expect(err).NotTo(HaveOccurred())
@@ -171,12 +169,13 @@ development:
 					Expect(err).NotTo(HaveOccurred())
 
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 512},
 						BackendType:         MilvusCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.85,
 						TTLSeconds:          7200,
 						Milvus:              milvusConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -186,7 +185,7 @@ development:
 						if strings.Contains(err.Error(), "failed to create Milvus client") ||
 							strings.Contains(err.Error(), "connection") ||
 							strings.Contains(err.Error(), "dial") {
-							Skip("Milvus server not available: " + err.Error())
+							storagetest.Unavailable(GinkgoT(), "milvus", err)
 						}
 						// For other errors, fail the test
 						Expect(err).NotTo(HaveOccurred())
@@ -202,12 +201,13 @@ development:
 					Expect(err).NotTo(HaveOccurred())
 
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         MilvusCacheType,
 						Enabled:             false,
 						SimilarityThreshold: 0.8,
 						TTLSeconds:          3600,
 						Milvus:              milvusConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -217,13 +217,11 @@ development:
 				})
 			})
 
-			Context("with inline Milvus configuration", func() {
+			Context("with inline Milvus configuration", Label("storage", "storage:milvus"), func() {
 				var milvusConfig *config.MilvusConfig
 				BeforeEach(func() {
 					// Skip Milvus tests if environment variable is set
-					if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-						Skip("Milvus tests skipped due to SKIP_MILVUS_TESTS=true")
-					}
+					storagetest.Require(GinkgoT(), "milvus")
 
 					yamlConfig := `
 connection:
@@ -250,7 +248,6 @@ search:
   consistency_level: "Session"
 development:
   auto_create_collection: true
-  verbose_errors: true
 `
 					err := yaml.Unmarshal([]byte(yamlConfig), &milvusConfig)
 					Expect(err).NotTo(HaveOccurred())
@@ -258,12 +255,13 @@ development:
 
 				It("should create Milvus cache backend successfully with valid config", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 512},
 						BackendType:         MilvusCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.85,
 						TTLSeconds:          7200,
 						Milvus:              milvusConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -273,7 +271,7 @@ development:
 						if strings.Contains(err.Error(), "failed to create Milvus client") ||
 							strings.Contains(err.Error(), "connection") ||
 							strings.Contains(err.Error(), "dial") {
-							Skip("Milvus server not available: " + err.Error())
+							storagetest.Unavailable(GinkgoT(), "milvus", err)
 						}
 						// For other errors, fail the test
 						Expect(err).NotTo(HaveOccurred())
@@ -285,13 +283,11 @@ development:
 				})
 			})
 
-			Context("(Deprecated) with Redis backend", func() {
+			Context("(Deprecated) with Redis backend", Label("storage", "storage:redis"), func() {
 				var redisConfigPath string
 
 				BeforeEach(func() {
-					if os.Getenv("SKIP_REDIS_TESTS") == "true" {
-						Skip("Redis tests skipped due to SKIP_REDIS_TESTS=true")
-					}
+					storagetest.Require(GinkgoT(), "redis")
 
 					redisConfigPath = filepath.Join(tempDir, "redis.yaml")
 					redisConfig := `
@@ -316,14 +312,9 @@ index:
 search:
   topk: 1
 
-logging:
-  enable_query_log: false
-  enable_metrics: false
-
 development:
   drop_index_on_startup: true
   auto_create_index: true
-  verbose_errors: true
 `
 					err := os.WriteFile(redisConfigPath, []byte(redisConfig), 0o644)
 					Expect(err).NotTo(HaveOccurred())
@@ -334,12 +325,13 @@ development:
 					Expect(err).NotTo(HaveOccurred())
 
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         RedisCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						TTLSeconds:          3600,
 						Redis:               redisConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -348,7 +340,7 @@ development:
 						if strings.Contains(err.Error(), "failed to connect to Redis") ||
 							strings.Contains(err.Error(), "connection refused") ||
 							strings.Contains(err.Error(), "failed to initialize index") {
-							Skip("Redis server not available: " + err.Error())
+							storagetest.Unavailable(GinkgoT(), "redis", err)
 						}
 						Expect(err).NotTo(HaveOccurred())
 					} else {
@@ -363,12 +355,13 @@ development:
 					Expect(err).NotTo(HaveOccurred())
 
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         RedisCacheType,
 						Enabled:             false,
 						SimilarityThreshold: 0.8,
 						TTLSeconds:          3600,
 						Redis:               redisConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -379,13 +372,11 @@ development:
 				})
 			})
 
-			Context("with inline Redis configuration", func() {
+			Context("with inline Redis configuration", Label("storage", "storage:redis"), func() {
 				var redisConfig *config.RedisConfig
 
 				BeforeEach(func() {
-					if os.Getenv("SKIP_REDIS_TESTS") == "true" {
-						Skip("Redis tests skipped due to SKIP_REDIS_TESTS=true")
-					}
+					storagetest.Require(GinkgoT(), "redis")
 
 					yamlConfig := `
 connection:
@@ -414,12 +405,9 @@ search:
   topk: 1
 logging:
   level: "info"
-  enable_query_log: false
-  enable_metrics: true
 development:
   drop_index_on_startup: true
   auto_create_index: true
-  verbose_errors: true
 `
 					err := yaml.Unmarshal([]byte(yamlConfig), &redisConfig)
 					Expect(err).NotTo(HaveOccurred())
@@ -427,12 +415,13 @@ development:
 
 				It("should create Redis cache backend successfully with valid config", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         RedisCacheType,
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						TTLSeconds:          3600,
 						Redis:               redisConfig,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -441,7 +430,7 @@ development:
 						if strings.Contains(err.Error(), "failed to connect to Redis") ||
 							strings.Contains(err.Error(), "connection refused") ||
 							strings.Contains(err.Error(), "failed to initialize index") {
-							Skip("Redis server not available: " + err.Error())
+							storagetest.Unavailable(GinkgoT(), "redis", err)
 						}
 						Expect(err).NotTo(HaveOccurred())
 					} else {
@@ -473,6 +462,7 @@ connection:
 					go func() {
 						defer GinkgoRecover()
 						_, cacheErr = NewMilvusCache(MilvusCacheOptions{
+							EmbeddingProvider:   storagetest.Vectors{Size: 384},
 							Enabled:             true,
 							SimilarityThreshold: 0.85,
 							TTLSeconds:          60,
@@ -538,11 +528,12 @@ development:
 			Context("with unsupported backend type", func() {
 				It("should return error for unsupported backend type", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         "unsupported_type", // Unsupported
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						TTLSeconds:          3600,
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -555,12 +546,13 @@ development:
 			Context("with invalid config but valid backend type", func() {
 				It("should return error due to validation when config has invalid values", func() {
 					config := CacheConfig{
+						EmbeddingProvider:   storagetest.Vectors{Size: 384},
 						BackendType:         InMemoryCacheType, // valid backend type
 						Enabled:             true,
 						SimilarityThreshold: -0.8, // invalid
 						MaxEntries:          10,
 						TTLSeconds:          -1, // invalid
-						EmbeddingModel:      "bert",
+						EmbeddingDeployment: "qwen3-embedding",
 					}
 
 					backend, err := NewCacheBackend(config)
@@ -575,12 +567,13 @@ development:
 		Describe("ValidateCacheConfig", func() {
 			It("should validate enabled memory backend configuration", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          1000,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 					EvictionPolicy:      "lru",
 				}
 
@@ -590,6 +583,7 @@ development:
 
 			It("should validate disabled cache configuration", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             false,
 					SimilarityThreshold: 2.0, // Invalid, but should be ignored for disabled cache
@@ -602,12 +596,13 @@ development:
 
 			It("should return error for invalid similarity threshold", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 1.5, // Invalid: > 1.0
 					MaxEntries:          1000,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -617,12 +612,13 @@ development:
 
 			It("should return error for negative similarity threshold", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: -0.1, // Invalid: < 0.0
 					MaxEntries:          1000,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -632,12 +628,13 @@ development:
 
 			It("should return error for negative TTL", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          1000,
 					TTLSeconds:          -1, // Invalid: negative TTL
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -647,12 +644,13 @@ development:
 
 			It("should return error for negative max entries in memory backend", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          -1, // Invalid: negative max entries
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -662,12 +660,13 @@ development:
 
 			It("should return error for unsupported eviction_policy value in memory backend", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          1000,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 					EvictionPolicy:      "random", // unsupported
 				}
 
@@ -678,11 +677,12 @@ development:
 
 			It("should return error for Milvus backend without inline config", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         MilvusCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -692,11 +692,12 @@ development:
 
 			It("should return error for Redis backend without inline config", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         RedisCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -706,11 +707,12 @@ development:
 
 			It("should return error for hybrid backend without inline Milvus config", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         HybridCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					TTLSeconds:          3600,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -720,6 +722,7 @@ development:
 
 			It("should validate edge case values", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 0.0, // Valid: minimum threshold
@@ -733,12 +736,13 @@ development:
 
 			It("should validate maximum threshold value", func() {
 				config := CacheConfig{
+					EmbeddingProvider:   storagetest.Vectors{Size: 384},
 					BackendType:         InMemoryCacheType,
 					Enabled:             true,
 					SimilarityThreshold: 1.0, // Valid: maximum threshold
 					MaxEntries:          10000,
 					TTLSeconds:          86400,
-					EmbeddingModel:      "bert",
+					EmbeddingDeployment: "qwen3-embedding",
 				}
 
 				err := ValidateCacheConfig(config)
@@ -765,7 +769,12 @@ development:
 			It("should return information about available backends", func() {
 				backends := GetAvailableCacheBackends()
 
-				Expect(backends).To(HaveLen(4)) // Memory, Milvus, Redis, and Valkey
+				Expect(backends).To(HaveLen(6))
+				for _, backend := range backends {
+					Expect(backend.Capabilities.Backend).To(Equal(backend.Type))
+					Expect(backend.Capabilities.Exact).To(BeTrue())
+					Expect(backend.Capabilities.Semantic).To(BeTrue())
+				}
 
 				// Check memory backend info
 				memoryBackend := backends[0]
@@ -795,15 +804,16 @@ development:
 	})
 
 	Describe("InMemoryCache", func() {
-		var inMemoryCache CacheBackend
+		var inMemoryCache LegacyCacheBackend
 
 		BeforeEach(func() {
 			options := InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             true,
 				SimilarityThreshold: 0.8,
 				MaxEntries:          100,
 				TTLSeconds:          300,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			}
 			inMemoryCache = NewInMemoryCache(options)
 		})
@@ -812,7 +822,6 @@ development:
 			if inMemoryCache != nil {
 				inMemoryCache.Close()
 			}
-			// BERT model is initialized once per process, no need to reset
 		})
 
 		It("should implement CacheBackend interface", func() {
@@ -826,11 +835,12 @@ development:
 
 			// Create disabled cache
 			disabledOptions := InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             false,
 				SimilarityThreshold: 0.8,
 				MaxEntries:          100,
 				TTLSeconds:          300,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			}
 			disabledCache := NewInMemoryCache(disabledOptions)
 			defer disabledCache.Close()
@@ -848,7 +858,7 @@ development:
 		})
 
 		It("should handle AddEntry operation with embeddings", func() {
-			err := inMemoryCache.AddEntry("test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
+			err := inMemoryCache.AddEntry(context.Background(), "test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			stats := inMemoryCache.GetStats()
@@ -857,7 +867,7 @@ development:
 
 		It("should handle FindSimilar operation with embeddings", func() {
 			// First add an entry
-			err := inMemoryCache.AddEntry("test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
+			err := inMemoryCache.AddEntry(context.Background(), "test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Search for similar query
@@ -866,12 +876,12 @@ development:
 			Expect(found).To(BeTrue()) // Should find exact match
 			Expect(response).To(Equal([]byte("response")))
 
-			// Search for different model - should match due to cross-model cache sharing
-			// (model filtering removed to improve cache hit rates)
+			// A different model selects a different cache partition, even when the
+			// query and its embedding are identical.
 			response, found, err = inMemoryCache.FindSimilar("different-model", "test query")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(found).To(BeTrue())
-			Expect(response).To(Equal([]byte("response")))
+			Expect(found).To(BeFalse())
+			Expect(response).To(BeNil())
 		})
 
 		It("should handle AddPendingRequest and UpdateWithResponse", func() {
@@ -895,11 +905,12 @@ development:
 
 			Expect(inMemoryCache.Close()).NotTo(HaveOccurred())
 			inMemoryCache = NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             true,
 				SimilarityThreshold: 0.8,
 				MaxEntries:          100,
 				TTLSeconds:          1,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			})
 
 			err := inMemoryCache.AddPendingRequest("expired-request-id", "test-model", "stale query", []byte("request"), -1)
@@ -919,16 +930,17 @@ development:
 		It("should respect similarity threshold", func() {
 			// Add entry with a very high similarity threshold
 			highThresholdOptions := InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             true,
 				SimilarityThreshold: 0.99, // Very high threshold
 				MaxEntries:          100,
 				TTLSeconds:          300,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			}
 			highThresholdCache := NewInMemoryCache(highThresholdOptions)
 			defer highThresholdCache.Close()
 
-			err := highThresholdCache.AddEntry("test-request-id", "test-model", "machine learning", []byte("request"), []byte("ml response"), -1)
+			err := highThresholdCache.AddEntry(context.Background(), "test-request-id", "test-model", "machine learning", []byte("request"), []byte("ml response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Exact match should work
@@ -946,7 +958,7 @@ development:
 
 		It("should track hit and miss statistics", func() {
 			// Add an entry with a specific query
-			err := inMemoryCache.AddEntry("test-request-id", "test-model", "What is machine learning?", []byte("request"), []byte("ML is a subset of AI"), -1)
+			err := inMemoryCache.AddEntry(context.Background(), "test-request-id", "test-model", "What is machine learning?", []byte("request"), []byte("ML is a subset of AI"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Search for the exact cached query (should be a hit)
@@ -970,15 +982,16 @@ development:
 
 		It("should skip expired entries during similarity search", func() {
 			ttlCache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             true,
 				SimilarityThreshold: 0.1,
 				MaxEntries:          10,
 				TTLSeconds:          1,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			})
 			defer ttlCache.Close()
 
-			err := ttlCache.AddEntry("ttl-request-id", "ttl-model", "time-sensitive query", []byte("request"), []byte("response"), -1)
+			err := ttlCache.AddEntry(context.Background(), "ttl-request-id", "ttl-model", "time-sensitive query", []byte("request"), []byte("response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			time.Sleep(1100 * time.Millisecond)
@@ -1010,11 +1023,12 @@ development:
 
 		It("should handle disabled cache operations gracefully", func() {
 			disabledOptions := InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             false,
 				SimilarityThreshold: 0.8,
 				MaxEntries:          100,
 				TTLSeconds:          300,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			}
 			disabledCache := NewInMemoryCache(disabledOptions)
 			defer disabledCache.Close()
@@ -1027,7 +1041,7 @@ development:
 			err = disabledCache.UpdateWithResponse("test-request-id", []byte("response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
-			err = disabledCache.AddEntry("test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
+			err = disabledCache.AddEntry(context.Background(), "test-request-id", "test-model", "test query", []byte("request"), []byte("response"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			response, found, err := disabledCache.FindSimilar("model", "query")
@@ -1044,6 +1058,7 @@ development:
 
 		It("should keep existing HNSW nodes searchable after eviction", func() {
 			cacheWithHNSW := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				Enabled:             true,
 				SimilarityThreshold: 0.1,
 				MaxEntries:          2,
@@ -1053,14 +1068,14 @@ development:
 				HNSWM:               4,
 				HNSWEfConstruction:  8,
 				HNSWEfSearch:        8,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 			})
 			defer cacheWithHNSW.Close()
 
-			err := cacheWithHNSW.AddEntry("req-1", "test-model", "first query text", []byte("request-1"), []byte("response-1"), -1)
+			err := cacheWithHNSW.AddEntry(context.Background(), "req-1", "test-model", "first query text", []byte("request-1"), []byte("response-1"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
-			err = cacheWithHNSW.AddEntry("req-2", "test-model", "second query text", []byte("request-2"), []byte("response-2"), -1)
+			err = cacheWithHNSW.AddEntry(context.Background(), "req-2", "test-model", "second query text", []byte("request-2"), []byte("response-2"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Sanity check: the second entry should be retrievable before any eviction occurs.
@@ -1070,7 +1085,7 @@ development:
 			Expect(resp).To(Equal([]byte("response-2")))
 
 			// Adding a third entry triggers eviction (max entries = 2).
-			err = cacheWithHNSW.AddEntry("req-3", "test-model", "third query text", []byte("request-3"), []byte("response-3"), -1)
+			err = cacheWithHNSW.AddEntry(context.Background(), "req-3", "test-model", "third query text", []byte("request-3"), []byte("response-3"), -1)
 			Expect(err).NotTo(HaveOccurred())
 
 			// Entry 2 should still be searchable even after eviction reshuffles the slice.
@@ -1091,12 +1106,13 @@ development:
 	Describe("Cache Configuration Types", func() {
 		It("should support all required configuration fields", func() {
 			config := CacheConfig{
+				EmbeddingProvider:   storagetest.Vectors{Size: 384},
 				BackendType:         MilvusCacheType,
 				Enabled:             true,
 				SimilarityThreshold: 0.9,
 				MaxEntries:          2000,
 				TTLSeconds:          7200,
-				EmbeddingModel:      "bert",
+				EmbeddingDeployment: "qwen3-embedding",
 				Milvus:              &config.MilvusConfig{},
 			}
 
@@ -1284,12 +1300,7 @@ func generateQuery(length ContentLength, index int) string {
 
 // BenchmarkComprehensive runs comprehensive benchmarks across multiple dimensions
 func BenchmarkComprehensive(b *testing.B) {
-	// Initialize BERT model
 	useCPU := os.Getenv("USE_CPU") != "false" // Default to CPU
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
 
 	// Determine hardware type
 	hardware := "cpu"
@@ -1333,6 +1344,7 @@ func BenchmarkComprehensive(b *testing.B) {
 			// Benchmark Linear Search
 			b.Run(fmt.Sprintf("%s/Linear/%s/%dEntries", hardware, contentLen.String(), cacheSize), func(b *testing.B) {
 				cache := NewInMemoryCache(InMemoryCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					MaxEntries:          cacheSize * 2,
 					SimilarityThreshold: 0.85,
@@ -1343,7 +1355,7 @@ func BenchmarkComprehensive(b *testing.B) {
 				// Populate cache
 				for i, query := range testQueries {
 					reqID := fmt.Sprintf("req%d", i)
-					_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+					_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 				}
 
 				searchQuery := generateQuery(contentLen, cacheSize/2)
@@ -1371,6 +1383,7 @@ func BenchmarkComprehensive(b *testing.B) {
 			for _, hnswCfg := range hnswConfigs {
 				b.Run(fmt.Sprintf("%s/HNSW_%s/%s/%dEntries", hardware, hnswCfg.name, contentLen.String(), cacheSize), func(b *testing.B) {
 					cache := NewInMemoryCache(InMemoryCacheOptions{
+						EmbeddingProvider:   cacheTestEmbeddingProvider(),
 						Enabled:             true,
 						MaxEntries:          cacheSize * 2,
 						SimilarityThreshold: 0.85,
@@ -1383,7 +1396,7 @@ func BenchmarkComprehensive(b *testing.B) {
 					// Populate cache
 					for i, query := range testQueries {
 						reqID := fmt.Sprintf("req%d", i)
-						_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+						_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 					}
 
 					searchQuery := generateQuery(contentLen, cacheSize/2)
@@ -1414,10 +1427,6 @@ func BenchmarkComprehensive(b *testing.B) {
 
 // BenchmarkIndexConstruction benchmarks HNSW index build time
 func BenchmarkIndexConstruction(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	cacheSizes := []int{100, 500, 1000, 5000}
 	contentLengths := []ContentLength{ShortContent, MediumContent, LongContent}
 
@@ -1433,6 +1442,7 @@ func BenchmarkIndexConstruction(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					b.StopTimer()
 					cache := NewInMemoryCache(InMemoryCacheOptions{
+						EmbeddingProvider:   cacheTestEmbeddingProvider(),
 						Enabled:             true,
 						MaxEntries:          cacheSize * 2,
 						SimilarityThreshold: 0.85,
@@ -1446,7 +1456,7 @@ func BenchmarkIndexConstruction(b *testing.B) {
 					// Build index by adding entries
 					for j, query := range testQueries {
 						reqID := fmt.Sprintf("req%d", j)
-						_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+						_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 					}
 				}
 			})
@@ -1712,6 +1722,7 @@ func TestExpirationHeapOperations(t *testing.T) {
 // TestInMemoryCacheEviction tests cache eviction with O(1) policies
 func TestInMemoryCacheEviction(t *testing.T) {
 	cache := NewInMemoryCache(InMemoryCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		MaxEntries:          3,
 		TTLSeconds:          3600,
@@ -1758,7 +1769,8 @@ func TestInMemoryCacheEviction(t *testing.T) {
 // TestHybridCacheDisabled tests that disabled hybrid cache returns immediately
 func TestHybridCacheDisabled(t *testing.T) {
 	cache, err := NewHybridCache(HybridCacheOptions{
-		Enabled: false,
+		EmbeddingProvider: storagetest.Vectors{Size: 384},
+		Enabled:           false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create disabled cache: %v", err)
@@ -1770,7 +1782,7 @@ func TestHybridCacheDisabled(t *testing.T) {
 	}
 
 	// All operations should be no-ops
-	err = cache.AddEntry("req1", "model1", "test query", []byte("request"), []byte("response"), -1)
+	err = cache.AddEntry(context.Background(), "req1", "model1", "test query", []byte("request"), []byte("response"), -1)
 	if err != nil {
 		t.Errorf("AddEntry should not error on disabled cache: %v", err)
 	}
@@ -1786,15 +1798,16 @@ func TestHybridCacheDisabled(t *testing.T) {
 
 func TestMilvusCacheOptionsFromHybridOptionsPreservesEmbeddingModel(t *testing.T) {
 	options := milvusCacheOptionsFromHybridOptions(HybridCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
-		EmbeddingModel:      "mmbert",
+		EmbeddingDeployment: "vela-embedding",
 		Milvus:              &config.MilvusConfig{},
 	})
 
-	if options.EmbeddingModel != "mmbert" {
-		t.Fatalf("expected embedding model mmbert, got %q", options.EmbeddingModel)
+	if options.EmbeddingDeployment != "vela-embedding" {
+		t.Fatalf("expected embedding deployment vela-embedding, got %q", options.EmbeddingDeployment)
 	}
 	if options.Config == nil {
 		t.Fatal("expected inline Milvus config to be preserved")
@@ -1802,49 +1815,62 @@ func TestMilvusCacheOptionsFromHybridOptionsPreservesEmbeddingModel(t *testing.T
 }
 
 func TestSemanticCacheEmbeddingDimensionUsesConfiguredValue(t *testing.T) {
-	if got := semanticCacheEmbeddingDimension(512, "mmbert"); got != 512 {
+	if got := semanticCacheEmbeddingDimension(512, nil); got != 512 {
 		t.Fatalf("expected configured dimension 512, got %d", got)
 	}
 }
 
-func TestSemanticCacheEmbeddingDimensionDefaultsByModel(t *testing.T) {
-	tests := map[string]int{
-		"":           384,
-		"bert":       384,
-		"qwen3":      1024,
-		"gemma":      768,
-		"mmbert":     768,
-		"multimodal": 384,
-	}
-	for model, want := range tests {
-		if got := semanticCacheEmbeddingDimension(0, model); got != want {
-			t.Fatalf("model %q: expected dimension %d, got %d", model, want, got)
+func TestSemanticCacheEmbeddingDimensionUsesPreparedProvider(t *testing.T) {
+	for _, want := range []int{256, 384, 768, 1024} {
+		provider := storagetest.Vectors{Size: want}
+		if got := semanticCacheEmbeddingDimension(0, provider); got != want {
+			t.Fatalf("provider dimension: got %d, want %d", got, want)
 		}
+	}
+	if got := semanticCacheEmbeddingDimension(0, nil); got != 0 {
+		t.Fatalf("missing provider guessed dimension %d", got)
 	}
 }
 
-func TestHybridCacheGenerateEmbeddingUsesMilvusEmbeddingModel(t *testing.T) {
+func waitForHybridCacheHit(t *testing.T, cache *HybridCache, model, query string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		response, found, err := cache.FindSimilar(model, query)
+		if err != nil {
+			t.Fatalf("FindSimilar failed while waiting for Milvus indexing: %v", err)
+		}
+		if found {
+			return response
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cache entry did not become visible before deadline")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestHybridCacheGenerateEmbeddingRequiresPreparedProvider(t *testing.T) {
 	cache := &HybridCache{
 		milvusCache: &MilvusCache{
-			embeddingModel: "unsupported",
+			embeddingDeployment: "unprepared",
 		},
 	}
 
-	_, err := cache.generateEmbedding("test")
+	_, err := cache.generateEmbedding(context.Background(), "test")
 	if err == nil {
-		t.Fatal("expected unsupported embedding model error")
+		t.Fatal("expected unprepared embedding provider error")
 	}
-	if !strings.Contains(err.Error(), "unsupported embedding model: unsupported") {
+	if !strings.Contains(err.Error(), "cache embedding provider was not prepared") {
 		t.Fatalf("expected unsupported model error, got %v", err)
 	}
 }
 
 // TestHybridCacheBasicOperations tests basic cache operations
+// StorageIntegration: milvus
 func TestHybridCacheBasicOperations(t *testing.T) {
 	// Skip if Milvus tests are disabled
-	if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-		t.Skip("Skipping Milvus-dependent test (SKIP_MILVUS_TESTS=true)")
-	}
+	storagetest.Require(t, "milvus")
 
 	t.Log("Starting TestHybridCacheBasicOperations - this may take 30-60 seconds...")
 
@@ -1856,6 +1882,11 @@ func TestHybridCacheBasicOperations(t *testing.T) {
 	defer cleanup()
 
 	cache, err := NewHybridCache(HybridCacheOptions{
+		// Declare the related query/record pair for this storage fixture.
+		// The unrelated pasta query remains independent and must miss.
+		EmbeddingProvider: storagetest.Vectors{Size: 384, Aliases: map[string]string{
+			"What's the meaning of life?": "What is the meaning of life?",
+		}},
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
@@ -1877,7 +1908,7 @@ func TestHybridCacheBasicOperations(t *testing.T) {
 	testQuery := "What is the meaning of life?"
 	testResponse := []byte(`{"response": "42"}`)
 
-	err = cache.AddEntry("req1", "gpt-4", testQuery, []byte("{}"), testResponse, -1)
+	err = cache.AddEntry(context.Background(), "req1", "gpt-4", testQuery, []byte("{}"), testResponse, -1)
 	if err != nil {
 		t.Fatalf("Failed to add entry: %v", err)
 	}
@@ -1889,22 +1920,13 @@ func TestHybridCacheBasicOperations(t *testing.T) {
 	}
 
 	// Test FindSimilar with exact same query (should hit)
-	// Wait for Milvus to index the entry
-	time.Sleep(2 * time.Second)
-
-	response, found, err := cache.FindSimilar("gpt-4", testQuery)
-	if err != nil {
-		t.Fatalf("FindSimilar failed: %v", err)
-	}
-	if !found {
-		t.Error("Expected to find cached entry")
-	}
+	response := waitForHybridCacheHit(t, cache, "gpt-4", testQuery)
 	if string(response) != string(testResponse) {
 		t.Errorf("Response mismatch: got %s, want %s", string(response), string(testResponse))
 	}
 
 	// Test FindSimilar with similar query (should hit)
-	_, found, err = cache.FindSimilar("gpt-4", "What's the meaning of life?")
+	_, found, err := cache.FindSimilar("gpt-4", "What's the meaning of life?")
 	if err != nil {
 		t.Fatalf("FindSimilar failed: %v", err)
 	}
@@ -1931,69 +1953,25 @@ func TestHybridCacheBasicOperations(t *testing.T) {
 	}
 }
 
-// TestHybridCachePendingRequest tests pending request flow
-func TestHybridCachePendingRequest(t *testing.T) {
-	// Skip if Milvus tests are disabled
-	if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-		t.Skip("Skipping Milvus-dependent test (SKIP_MILVUS_TESTS=true)")
+// TestPendingRequestPrimaryKey verifies the stable pending-entry identity contract.
+func TestPendingRequestPrimaryKey(t *testing.T) {
+	key := pendingRequestPrimaryKey("req1")
+	if len(key) != md5.Size*2 {
+		t.Fatalf("pending primary key length = %d, want %d", len(key), md5.Size*2)
 	}
-
-	t.Log("Starting TestHybridCachePendingRequest - this may take 30-60 seconds...")
-
-	milvusConfig, cleanup, err := createTestMilvusConfig("test_hybrid_pending", 64, true)
-	if err != nil {
-		t.Fatalf("Failed to create test config: %v", err)
+	if key != pendingRequestPrimaryKey("req1") {
+		t.Fatal("pending primary key must be deterministic")
 	}
-	defer cleanup()
-
-	cache, err := NewHybridCache(HybridCacheOptions{
-		Enabled:             true,
-		SimilarityThreshold: 0.8,
-		TTLSeconds:          300,
-		MaxMemoryEntries:    100,
-		MilvusConfigPath:    milvusConfig,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create hybrid cache: %v", err)
-	}
-	defer cache.Close()
-
-	// Add pending request
-	testQuery := "Explain quantum computing"
-	err = cache.AddPendingRequest("req1", "gpt-4", testQuery, []byte("{}"), -1)
-	if err != nil {
-		t.Fatalf("Failed to add pending request: %v", err)
-	}
-
-	// Update with response
-	testResponse := []byte(`{"answer": "Quantum computing uses qubits..."}`)
-	err = cache.UpdateWithResponse("req1", testResponse, -1)
-	if err != nil {
-		t.Fatalf("Failed to update with response: %v", err)
-	}
-
-	// Wait for indexing
-	time.Sleep(100 * time.Millisecond)
-
-	// Try to find it
-	response, found, err := cache.FindSimilar("gpt-4", testQuery)
-	if err != nil {
-		t.Fatalf("FindSimilar failed: %v", err)
-	}
-	if !found {
-		t.Error("Expected to find cached entry after update")
-	}
-	if string(response) != string(testResponse) {
-		t.Errorf("Response mismatch: got %s, want %s", string(response), string(testResponse))
+	if key == pendingRequestPrimaryKey("req2") {
+		t.Fatal("different request IDs must not share a pending primary key")
 	}
 }
 
 // TestHybridCacheEviction tests memory eviction behavior
+// StorageIntegration: milvus
 func TestHybridCacheEviction(t *testing.T) {
 	// Skip if Milvus tests are disabled
-	if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-		t.Skip("Skipping Milvus-dependent test (SKIP_MILVUS_TESTS=true)")
-	}
+	storagetest.Require(t, "milvus")
 
 	t.Log("Starting TestHybridCacheEviction - this may take 30-60 seconds...")
 
@@ -2005,6 +1983,7 @@ func TestHybridCacheEviction(t *testing.T) {
 
 	// Create cache with very small memory limit
 	cache, err := NewHybridCache(HybridCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
@@ -2020,7 +1999,7 @@ func TestHybridCacheEviction(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		query := fmt.Sprintf("Query number %d", i)
 		response := []byte(fmt.Sprintf(`{"answer": "Response %d"}`, i))
-		err = cache.AddEntry(fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
+		err = cache.AddEntry(context.Background(), fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
 		if err != nil {
 			t.Fatalf("Failed to add entry %d: %v", i, err)
 		}
@@ -2054,11 +2033,10 @@ func TestHybridCacheEviction(t *testing.T) {
 }
 
 // TestHybridCacheLocalCacheHit tests local cache hot path
+// StorageIntegration: milvus
 func TestHybridCacheLocalCacheHit(t *testing.T) {
 	// Skip if Milvus tests are disabled
-	if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-		t.Skip("Skipping Milvus-dependent test (SKIP_MILVUS_TESTS=true)")
-	}
+	storagetest.Require(t, "milvus")
 
 	t.Log("Starting TestHybridCacheLocalCacheHit - this may take 30-60 seconds...")
 
@@ -2069,6 +2047,7 @@ func TestHybridCacheLocalCacheHit(t *testing.T) {
 	defer cleanup()
 
 	cache, err := NewHybridCache(HybridCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
@@ -2083,7 +2062,7 @@ func TestHybridCacheLocalCacheHit(t *testing.T) {
 	// Add an entry
 	testQuery := "What is machine learning?"
 	testResponse := []byte(`{"answer": "ML is..."}`)
-	err = cache.AddEntry("req1", "gpt-4", testQuery, []byte("{}"), testResponse, -1)
+	err = cache.AddEntry(context.Background(), "req1", "gpt-4", testQuery, []byte("{}"), testResponse, -1)
 	if err != nil {
 		t.Fatalf("Failed to add entry: %v", err)
 	}
@@ -2238,6 +2217,7 @@ milvus:
 	defer os.Remove(milvusConfig)
 
 	cache, err := NewHybridCache(HybridCacheOptions{
+		EmbeddingProvider:   cacheTestEmbeddingProvider(),
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
@@ -2253,7 +2233,7 @@ milvus:
 	for i := 0; i < b.N; i++ {
 		query := fmt.Sprintf("Benchmark query number %d", i)
 		response := []byte(fmt.Sprintf(`{"answer": "Response %d"}`, i))
-		err := cache.AddEntry(fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
+		err := cache.AddEntry(context.Background(), fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
 		if err != nil {
 			b.Fatalf("AddEntry failed: %v", err)
 		}
@@ -2282,6 +2262,7 @@ milvus:
 	defer os.Remove(milvusConfig)
 
 	cache, err := NewHybridCache(HybridCacheOptions{
+		EmbeddingProvider:   cacheTestEmbeddingProvider(),
 		Enabled:             true,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          300,
@@ -2297,7 +2278,7 @@ milvus:
 	for i := 0; i < 100; i++ {
 		query := fmt.Sprintf("Benchmark query number %d", i)
 		response := []byte(fmt.Sprintf(`{"answer": "Response %d"}`, i))
-		err := cache.AddEntry(fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
+		err := cache.AddEntry(context.Background(), fmt.Sprintf("req%d", i), "gpt-4", query, []byte("{}"), response, -1)
 		if err != nil {
 			b.Fatalf("AddEntry failed: %v", err)
 		}
@@ -2385,10 +2366,6 @@ func (dcc *DatabaseCallCounter) Get() int64 {
 	return atomic.LoadInt64(&dcc.calls)
 }
 
-func (dcc *DatabaseCallCounter) Reset() {
-	atomic.StoreInt64(&dcc.calls, 0)
-}
-
 // createTestMilvusConfig creates a temporary Milvus config file for testing
 // Returns the path to the config file and cleanup function
 func createTestMilvusConfig(collectionName string, efConstruction int, dropOnStartup bool) (string, func(), error) {
@@ -2440,25 +2417,18 @@ func getMilvusConfigPath() string {
 	}
 
 	// Try relative from project root (when run via make)
-	configPath := "deploy/examples/runtime/semantic-cache/milvus.yaml"
+	configPath := "config/runtime/semantic-cache/milvus.yaml"
 	if _, err := os.Stat(configPath); err == nil {
 		return configPath
 	}
 
 	// Fallback to relative from test directory
-	return "../../../../../deploy/examples/runtime/semantic-cache/milvus.yaml"
+	return "../../../../../config/runtime/semantic-cache/milvus.yaml"
 }
 
 // BenchmarkHybridVsMilvus is the comprehensive benchmark comparing hybrid cache vs pure Milvus
 // This validates the claims from the hybrid HNSW storage architecture paper
 func BenchmarkHybridVsMilvus(b *testing.B) {
-	// Initialize BERT model
-	useCPU := os.Getenv("USE_CPU") != "false"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Fatalf("Failed to initialize BERT model: %v", err)
-	}
-
 	// Test configurations - realistic production scales
 	cacheSizes := []int{
 		10000,  // Medium: 10K entries
@@ -2547,6 +2517,7 @@ func BenchmarkHybridVsMilvus(b *testing.B) {
 				b.Logf("\n=== Testing Pure Milvus Cache ===")
 
 				milvusCache, err := NewMilvusCache(MilvusCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					SimilarityThreshold: 0.80,
 					TTLSeconds:          3600,
@@ -2704,6 +2675,7 @@ func BenchmarkHybridVsMilvus(b *testing.B) {
 				b.Logf("\n=== Testing Hybrid Cache ===")
 
 				hybridCache, err := NewHybridCache(HybridCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					SimilarityThreshold: 0.80,
 					TTLSeconds:          3600,
@@ -2879,38 +2851,16 @@ func BenchmarkHybridVsMilvus(b *testing.B) {
 
 // BenchmarkComponentLatency measures individual component latencies
 func BenchmarkComponentLatency(b *testing.B) {
-	// Initialize BERT model
-	useCPU := os.Getenv("USE_CPU") != "false"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Fatalf("Failed to initialize BERT model: %v", err)
-	}
-
 	cacheSize := 10000
 	testQueries := make([]string, cacheSize)
 	for i := 0; i < cacheSize; i++ {
 		testQueries[i] = generateQuery(MediumContent, i)
 	}
 
-	b.Run("EmbeddingGeneration", func(b *testing.B) {
-		query := testQueries[0]
-		b.ResetTimer()
-		start := time.Now()
-		for i := 0; i < b.N; i++ {
-			_, err := candle_binding.GetEmbedding(query, 0)
-			if err != nil {
-				b.Fatal(err)
-			}
-		}
-		elapsed := time.Since(start)
-		avgMs := float64(elapsed.Nanoseconds()) / float64(b.N) / 1e6
-		b.Logf("Embedding generation: %.2f ms/op", avgMs)
-		b.ReportMetric(avgMs, "ms/op")
-	})
-
 	b.Run("HNSWSearch", func(b *testing.B) {
 		// Build HNSW index
 		cache := NewInMemoryCache(InMemoryCacheOptions{
+			EmbeddingProvider:   cacheTestEmbeddingProvider(),
 			Enabled:             true,
 			SimilarityThreshold: 0.80,
 			MaxEntries:          cacheSize,
@@ -2921,7 +2871,7 @@ func BenchmarkComponentLatency(b *testing.B) {
 
 		b.Logf("Building HNSW index with %d entries...", cacheSize)
 		for i := 0; i < cacheSize; i++ {
-			_ = cache.AddEntry(fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
+			_ = cache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
 		}
 		b.Logf("HNSW index built")
 
@@ -2941,6 +2891,7 @@ func BenchmarkComponentLatency(b *testing.B) {
 
 	b.Run("MilvusVectorSearch", func(b *testing.B) {
 		milvusCache, err := NewMilvusCache(MilvusCacheOptions{
+			EmbeddingProvider:   cacheTestEmbeddingProvider(),
 			Enabled:             true,
 			SimilarityThreshold: 0.80,
 			TTLSeconds:          3600,
@@ -2955,7 +2906,7 @@ func BenchmarkComponentLatency(b *testing.B) {
 
 		b.Logf("Populating Milvus with %d entries...", cacheSize)
 		for i := 0; i < cacheSize; i++ {
-			_ = milvusCache.AddEntry(fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
+			_ = milvusCache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
 		}
 		time.Sleep(2 * time.Second)
 		b.Logf("Milvus populated")
@@ -2981,13 +2932,6 @@ func BenchmarkComponentLatency(b *testing.B) {
 
 // BenchmarkThroughputUnderLoad tests throughput with concurrent requests
 func BenchmarkThroughputUnderLoad(b *testing.B) {
-	// Initialize BERT model
-	useCPU := os.Getenv("USE_CPU") != "false"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Fatalf("Failed to initialize BERT model: %v", err)
-	}
-
 	cacheSize := 10000
 	concurrencyLevels := []int{1, 10, 50, 100}
 
@@ -2999,6 +2943,7 @@ func BenchmarkThroughputUnderLoad(b *testing.B) {
 	for _, concurrency := range concurrencyLevels {
 		b.Run(fmt.Sprintf("Milvus_Concurrency_%d", concurrency), func(b *testing.B) {
 			milvusCache, err := NewMilvusCache(MilvusCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				SimilarityThreshold: 0.80,
 				TTLSeconds:          3600,
@@ -3013,7 +2958,7 @@ func BenchmarkThroughputUnderLoad(b *testing.B) {
 
 			// Populate
 			for i := 0; i < cacheSize; i++ {
-				_ = milvusCache.AddEntry(fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
+				_ = milvusCache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
 			}
 			time.Sleep(2 * time.Second)
 
@@ -3038,6 +2983,7 @@ func BenchmarkThroughputUnderLoad(b *testing.B) {
 
 		b.Run(fmt.Sprintf("Hybrid_Concurrency_%d", concurrency), func(b *testing.B) {
 			hybridCache, err := NewHybridCache(HybridCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				SimilarityThreshold: 0.80,
 				TTLSeconds:          3600,
@@ -3055,7 +3001,7 @@ func BenchmarkThroughputUnderLoad(b *testing.B) {
 
 			// Populate
 			for i := 0; i < cacheSize; i++ {
-				_ = hybridCache.AddEntry(fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
+				_ = hybridCache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model", testQueries[i], []byte("req"), []byte("resp"), -1)
 			}
 			time.Sleep(2 * time.Second)
 
@@ -3128,11 +3074,10 @@ func writeBenchmarkResultToCSV(file *os.File, result TestBenchmarkResult) {
 }
 
 // TestHybridVsMilvusSmoke is a quick smoke test to verify both caches work
+// StorageIntegration: milvus
 func TestHybridVsMilvusSmoke(t *testing.T) {
 	// Skip if Milvus tests are disabled
-	if os.Getenv("SKIP_MILVUS_TESTS") == "true" {
-		t.Skip("Skipping Milvus-dependent test (SKIP_MILVUS_TESTS=true)")
-	}
+	storagetest.Require(t, "milvus")
 
 	t.Log("Starting TestHybridVsMilvusSmoke - this may take 2-3 minutes...")
 
@@ -3143,16 +3088,10 @@ func TestHybridVsMilvusSmoke(t *testing.T) {
 	}
 	defer cleanup()
 
-	// Initialize BERT model
-	useCPU := os.Getenv("USE_CPU") != "false"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		t.Fatalf("Failed to initialize BERT model: %v", err)
-	}
-
 	// Test Milvus cache
 	t.Run("Milvus", func(t *testing.T) {
 		cache, err := NewMilvusCache(MilvusCacheOptions{
+			EmbeddingProvider:   storagetest.Vectors{Size: 384},
 			Enabled:             true,
 			SimilarityThreshold: 0.85,
 			TTLSeconds:          3600,
@@ -3166,7 +3105,7 @@ func TestHybridVsMilvusSmoke(t *testing.T) {
 		time.Sleep(1 * time.Second)
 
 		// Add entry
-		err = cache.AddEntry("req-1", "model", "What is machine learning?", []byte("req"), []byte("ML is..."), -1)
+		err = cache.AddEntry(context.Background(), "req-1", "model", "What is machine learning?", []byte("req"), []byte("ML is..."), -1)
 		if err != nil {
 			t.Fatalf("Failed to add entry: %v", err)
 		}
@@ -3191,6 +3130,7 @@ func TestHybridVsMilvusSmoke(t *testing.T) {
 	// Test Hybrid cache
 	t.Run("Hybrid", func(t *testing.T) {
 		cache, err := NewHybridCache(HybridCacheOptions{
+			EmbeddingProvider:   storagetest.Vectors{Size: 384},
 			Enabled:             true,
 			SimilarityThreshold: 0.85,
 			TTLSeconds:          3600,
@@ -3207,7 +3147,7 @@ func TestHybridVsMilvusSmoke(t *testing.T) {
 		time.Sleep(1 * time.Second)
 
 		// Add entry
-		err = cache.AddEntry("req-1", "model", "What is deep learning?", []byte("req"), []byte("DL is..."), -1)
+		err = cache.AddEntry(context.Background(), "req-1", "model", "What is deep learning?", []byte("req"), []byte("DL is..."), -1)
 		if err != nil {
 			t.Fatalf("Failed to add entry: %v", err)
 		}
@@ -3232,11 +3172,8 @@ func TestHybridVsMilvusSmoke(t *testing.T) {
 
 // TestInMemoryCacheIntegration tests the in-memory cache integration
 func TestInMemoryCacheIntegration(t *testing.T) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		t.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	cache := NewInMemoryCache(InMemoryCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		MaxEntries:          2,
 		SimilarityThreshold: 0.9,
@@ -3246,14 +3183,14 @@ func TestInMemoryCacheIntegration(t *testing.T) {
 
 	t.Run("InMemoryCacheIntegration", func(t *testing.T) {
 		// Step 1: Add first entry
-		err := cache.AddEntry("req1", "test-model", "Hello world",
+		err := cache.AddEntry(context.Background(), "req1", "test-model", "Hello world",
 			[]byte("request1"), []byte("response1"), -1)
 		if err != nil {
 			t.Fatalf("Failed to add first entry: %v", err)
 		}
 
 		// Step 2: Add second entry (cache at capacity)
-		err = cache.AddEntry("req2", "test-model", "Good morning",
+		err = cache.AddEntry(context.Background(), "req2", "test-model", "Good morning",
 			[]byte("request2"), []byte("response2"), -1)
 		if err != nil {
 			t.Fatalf("Failed to add second entry: %v", err)
@@ -3294,7 +3231,7 @@ func TestInMemoryCacheIntegration(t *testing.T) {
 		}
 
 		// Step 5: Add third entry - should trigger LFU eviction
-		err = cache.AddEntry("req3", "test-model", "Bye",
+		err = cache.AddEntry(context.Background(), "req3", "test-model", "Bye",
 			[]byte("request3"), []byte("response3"), -1)
 		if err != nil {
 			t.Fatalf("Failed to add third entry: %v", err)
@@ -3321,14 +3258,11 @@ func TestInMemoryCacheIntegration(t *testing.T) {
 
 // TestInMemoryCachePendingRequestWorkflow tests the in-memory cache pending request workflow
 func TestInMemoryCachePendingRequestWorkflow(t *testing.T) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		t.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	cache := NewInMemoryCache(InMemoryCacheOptions{
-		Enabled:        true,
-		MaxEntries:     2,
-		EvictionPolicy: "lru",
+		EmbeddingProvider: storagetest.Vectors{Size: 384},
+		Enabled:           true,
+		MaxEntries:        2,
+		EvictionPolicy:    "lru",
 	})
 
 	t.Run("PendingRequestFlow", func(t *testing.T) {
@@ -3384,7 +3318,8 @@ func TestEvictionPolicySelection(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("Policy_%s", tc.policy), func(t *testing.T) {
 			cache := NewInMemoryCache(InMemoryCacheOptions{
-				EvictionPolicy: EvictionPolicyType(tc.policy),
+				EmbeddingProvider: storagetest.Vectors{Size: 384},
+				EvictionPolicy:    EvictionPolicyType(tc.policy),
 			})
 
 			policyType := fmt.Sprintf("%T", cache.evictionPolicy)
@@ -3397,12 +3332,9 @@ func TestEvictionPolicySelection(t *testing.T) {
 
 // TestInMemoryCacheHNSW tests the HNSW index functionality
 func TestInMemoryCacheHNSW(t *testing.T) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		t.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	// Test with HNSW enabled
 	cacheHNSW := NewInMemoryCache(InMemoryCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		MaxEntries:          100,
 		SimilarityThreshold: 0.85,
@@ -3414,6 +3346,7 @@ func TestInMemoryCacheHNSW(t *testing.T) {
 
 	// Test without HNSW (linear search)
 	cacheLinear := NewInMemoryCache(InMemoryCacheOptions{
+		EmbeddingProvider:   storagetest.Vectors{Size: 384},
 		Enabled:             true,
 		MaxEntries:          100,
 		SimilarityThreshold: 0.85,
@@ -3437,12 +3370,12 @@ func TestInMemoryCacheHNSW(t *testing.T) {
 		// Add entries to both caches
 		for i, q := range testQueries {
 			reqID := fmt.Sprintf("req%d", i)
-			err := cacheHNSW.AddEntry(reqID, q.model, q.query, []byte(q.query), []byte(q.response), -1)
+			err := cacheHNSW.AddEntry(context.Background(), reqID, q.model, q.query, []byte(q.query), []byte(q.response), -1)
 			if err != nil {
 				t.Fatalf("Failed to add entry to HNSW cache: %v", err)
 			}
 
-			err = cacheLinear.AddEntry(reqID, q.model, q.query, []byte(q.query), []byte(q.response), -1)
+			err = cacheLinear.AddEntry(context.Background(), reqID, q.model, q.query, []byte(q.query), []byte(q.response), -1)
 			if err != nil {
 				t.Fatalf("Failed to add entry to linear cache: %v", err)
 			}
@@ -3490,6 +3423,7 @@ func TestInMemoryCacheHNSW(t *testing.T) {
 	t.Run("HNSW_Rebuild_After_Cleanup", func(t *testing.T) {
 		// Create cache with short TTL
 		cacheTTL := NewInMemoryCache(InMemoryCacheOptions{
+			EmbeddingProvider:   storagetest.Vectors{Size: 384},
 			Enabled:             true,
 			MaxEntries:          100,
 			SimilarityThreshold: 0.85,
@@ -3500,7 +3434,7 @@ func TestInMemoryCacheHNSW(t *testing.T) {
 		})
 
 		// Add an entry
-		err := cacheTTL.AddEntry("req1", "test-model", "test query", []byte("request"), []byte("response"), -1)
+		err := cacheTTL.AddEntry(context.Background(), "req1", "test-model", "test query", []byte("request"), []byte("response"), -1)
 		if err != nil {
 			t.Fatalf("Failed to add entry: %v", err)
 		}
@@ -3520,14 +3454,44 @@ func TestInMemoryCacheHNSW(t *testing.T) {
 	})
 }
 
+func TestResponseCacheServiceReclaimsExpiredSemanticEntriesWithoutDefaultTTL(t *testing.T) {
+	backend := NewInMemoryCache(InMemoryCacheOptions{
+		Enabled:           true,
+		TTLSeconds:        0,
+		EmbeddingProvider: cacheTestEmbeddingProvider(),
+	})
+	t.Cleanup(func() { require.NoError(t, backend.Close()) })
+	service := NewResponseCacheService(NewLegacyBackendAdapter(backend, InMemoryCacheType), DefaultResponseCacheServiceOptions())
+	for _, id := range []string{"expired", "new"} {
+		require.NoError(t, service.StoreSemantic(context.Background(), CacheWrite{
+			Identity: CacheIdentity{
+				Partition:     CachePartition{RequestModel: "model"},
+				SemanticQuery: id,
+			},
+			RequestID:    id,
+			ResponseBody: []byte(id),
+			TTL:          TTL(time.Minute),
+		}))
+		if id == "expired" {
+			require.Len(t, backend.entries, 1)
+			expiresAt := time.Now().Add(-time.Second)
+			backend.mu.Lock()
+			backend.entries[0].ExpiresAt = expiresAt
+			backend.expirationHeap.UpdateExpiration(id, expiresAt)
+			backend.mu.Unlock()
+		}
+	}
+	require.Len(t, backend.entries, 1)
+	require.Equal(t, "new", backend.entries[0].RequestID)
+	require.Equal(t, map[string]int{"new": 0}, backend.entryMap)
+	require.Equal(t, 1, backend.expirationHeap.Size())
+	require.NotContains(t, backend.expirationHeap.nodeMap, "expired")
+}
+
 // ===== Benchmark Tests =====
 
 // BenchmarkInMemoryCacheSearch benchmarks search performance with and without HNSW
 func BenchmarkInMemoryCacheSearch(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	// Test different cache sizes
 	cacheSizes := []int{100, 500, 1000, 5000}
 
@@ -3546,6 +3510,7 @@ func BenchmarkInMemoryCacheSearch(b *testing.B) {
 		// Benchmark Linear Search
 		b.Run(fmt.Sprintf("LinearSearch_%d_entries", size), func(b *testing.B) {
 			cache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				MaxEntries:          size * 2,
 				SimilarityThreshold: 0.85,
@@ -3556,7 +3521,7 @@ func BenchmarkInMemoryCacheSearch(b *testing.B) {
 			// Populate cache
 			for i, entry := range entries {
 				reqID := fmt.Sprintf("req%d", i)
-				_ = cache.AddEntry(reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
+				_ = cache.AddEntry(context.Background(), reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
 			}
 
 			// Benchmark search
@@ -3570,6 +3535,7 @@ func BenchmarkInMemoryCacheSearch(b *testing.B) {
 		// Benchmark HNSW Search
 		b.Run(fmt.Sprintf("HNSWSearch_%d_entries", size), func(b *testing.B) {
 			cache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				MaxEntries:          size * 2,
 				SimilarityThreshold: 0.85,
@@ -3582,7 +3548,7 @@ func BenchmarkInMemoryCacheSearch(b *testing.B) {
 			// Populate cache
 			for i, entry := range entries {
 				reqID := fmt.Sprintf("req%d", i)
-				_ = cache.AddEntry(reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
+				_ = cache.AddEntry(context.Background(), reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
 			}
 
 			// Benchmark search
@@ -3597,10 +3563,6 @@ func BenchmarkInMemoryCacheSearch(b *testing.B) {
 
 // BenchmarkHNSWIndexConstruction benchmarks HNSW index construction time
 func BenchmarkHNSWIndexConstruction(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	entryCounts := []int{100, 500, 1000, 5000}
 
 	for _, count := range entryCounts {
@@ -3615,6 +3577,7 @@ func BenchmarkHNSWIndexConstruction(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				cache := NewInMemoryCache(InMemoryCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					MaxEntries:          count * 2,
 					SimilarityThreshold: 0.85,
@@ -3628,7 +3591,7 @@ func BenchmarkHNSWIndexConstruction(b *testing.B) {
 				// Add entries and build index
 				for j := 0; j < count; j++ {
 					reqID := fmt.Sprintf("req%d", j)
-					_ = cache.AddEntry(reqID, "test-model", testQueries[j], []byte(testQueries[j]), []byte("response"), -1)
+					_ = cache.AddEntry(context.Background(), reqID, "test-model", testQueries[j], []byte(testQueries[j]), []byte("response"), -1)
 				}
 			}
 		})
@@ -3637,10 +3600,6 @@ func BenchmarkHNSWIndexConstruction(b *testing.B) {
 
 // BenchmarkHNSWParameters benchmarks different HNSW parameter configurations
 func BenchmarkHNSWParameters(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	cacheSize := 1000
 	testConfigs := []struct {
 		name           string
@@ -3666,6 +3625,7 @@ func BenchmarkHNSWParameters(b *testing.B) {
 	for _, config := range testConfigs {
 		b.Run(config.name, func(b *testing.B) {
 			cache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				MaxEntries:          cacheSize * 2,
 				SimilarityThreshold: 0.85,
@@ -3678,7 +3638,7 @@ func BenchmarkHNSWParameters(b *testing.B) {
 			// Populate cache
 			for i, entry := range entries {
 				reqID := fmt.Sprintf("req%d", i)
-				_ = cache.AddEntry(reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
+				_ = cache.AddEntry(context.Background(), reqID, "test-model", entry.query, []byte(entry.query), []byte(entry.response), -1)
 			}
 
 			// Benchmark search
@@ -3693,12 +3653,9 @@ func BenchmarkHNSWParameters(b *testing.B) {
 
 // BenchmarkCacheOperations benchmarks complete cache workflow
 func BenchmarkCacheOperations(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	b.Run("LinearSearch_AddAndFind", func(b *testing.B) {
 		cache := NewInMemoryCache(InMemoryCacheOptions{
+			EmbeddingProvider:   cacheTestEmbeddingProvider(),
 			Enabled:             true,
 			MaxEntries:          10000,
 			SimilarityThreshold: 0.85,
@@ -3712,7 +3669,7 @@ func BenchmarkCacheOperations(b *testing.B) {
 			reqID := fmt.Sprintf("req%d", i)
 
 			// Add entry
-			_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+			_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 
 			// Find similar
 			_, _, _ = cache.FindSimilar("test-model", query)
@@ -3721,6 +3678,7 @@ func BenchmarkCacheOperations(b *testing.B) {
 
 	b.Run("HNSWSearch_AddAndFind", func(b *testing.B) {
 		cache := NewInMemoryCache(InMemoryCacheOptions{
+			EmbeddingProvider:   cacheTestEmbeddingProvider(),
 			Enabled:             true,
 			MaxEntries:          10000,
 			SimilarityThreshold: 0.85,
@@ -3736,7 +3694,7 @@ func BenchmarkCacheOperations(b *testing.B) {
 			reqID := fmt.Sprintf("req%d", i)
 
 			// Add entry
-			_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+			_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 
 			// Find similar
 			_, _, _ = cache.FindSimilar("test-model", query)
@@ -3746,16 +3704,13 @@ func BenchmarkCacheOperations(b *testing.B) {
 
 // BenchmarkHNSWRebuild benchmarks index rebuild performance
 func BenchmarkHNSWRebuild(b *testing.B) {
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	sizes := []int{100, 500, 1000}
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("Rebuild_%d_entries", size), func(b *testing.B) {
 			// Create and populate cache
 			cache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				MaxEntries:          size * 2,
 				SimilarityThreshold: 0.85,
@@ -3769,7 +3724,7 @@ func BenchmarkHNSWRebuild(b *testing.B) {
 			for i := 0; i < size; i++ {
 				query := fmt.Sprintf("Query %d about machine learning", i)
 				reqID := fmt.Sprintf("req%d", i)
-				_ = cache.AddEntry(reqID, "test-model", query, []byte(query), []byte("response"), -1)
+				_ = cache.AddEntry(context.Background(), reqID, "test-model", query, []byte(query), []byte("response"), -1)
 			}
 
 			b.ResetTimer()
@@ -4047,12 +4002,7 @@ func TestHNSWSearchLayerAndInsertionRegressions(t *testing.T) {
 
 // BenchmarkLargeScale tests HNSW vs Linear at scales where HNSW shows advantages (10K-100K entries)
 func BenchmarkLargeScale(b *testing.B) {
-	// Initialize BERT model (GPU by default)
 	useCPU := os.Getenv("USE_CPU") == "true"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
 
 	// Large scale cache sizes where HNSW shines
 	cacheSizes := []int{10000, 50000, 100000}
@@ -4122,7 +4072,7 @@ func BenchmarkLargeScale(b *testing.B) {
 			}
 
 			for i := 0; i < cacheSize; i++ {
-				emb, err := candle_binding.GetEmbedding(testQueries[i], 0)
+				emb, err := cacheTestEmbeddingProvider().Embed(context.Background(), testQueries[i])
 				if err != nil {
 					b.Fatalf("Failed to generate embedding: %v", err)
 				}
@@ -4150,6 +4100,7 @@ func BenchmarkLargeScale(b *testing.B) {
 			b.Run("Linear", func(b *testing.B) {
 				b.Logf("=== Testing Linear Search with %d entries ===", cacheSize)
 				cache := NewInMemoryCache(InMemoryCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          cacheSize,
@@ -4164,7 +4115,7 @@ func BenchmarkLargeScale(b *testing.B) {
 				}
 
 				for i := 0; i < cacheSize; i++ {
-					err := cache.AddEntry(
+					err := cache.AddEntry(context.Background(),
 						fmt.Sprintf("req-%d", i),
 						"test-model",
 						testQueries[i],
@@ -4216,6 +4167,7 @@ func BenchmarkLargeScale(b *testing.B) {
 					b.Logf("=== Testing %s with %d entries (M=%d, ef=%d) ===",
 						config.name, cacheSize, config.m, config.ef)
 					cache := NewInMemoryCache(InMemoryCacheOptions{
+						EmbeddingProvider:   cacheTestEmbeddingProvider(),
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						MaxEntries:          cacheSize,
@@ -4234,7 +4186,7 @@ func BenchmarkLargeScale(b *testing.B) {
 					}
 
 					for i := 0; i < cacheSize; i++ {
-						err := cache.AddEntry(
+						err := cache.AddEntry(context.Background(),
 							fmt.Sprintf("req-%d", i),
 							"test-model",
 							testQueries[i],
@@ -4304,12 +4256,6 @@ func BenchmarkLargeScale(b *testing.B) {
 
 // BenchmarkScalability tests how performance scales with cache size
 func BenchmarkScalability(b *testing.B) {
-	useCPU := os.Getenv("USE_CPU") == "true"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	// Test cache sizes from small to very large
 	cacheSizes := []int{1000, 5000, 10000, 25000, 50000, 100000}
 
@@ -4349,6 +4295,7 @@ func BenchmarkScalability(b *testing.B) {
 			if testLinear {
 				b.Run("Linear", func(b *testing.B) {
 					cache := NewInMemoryCache(InMemoryCacheOptions{
+						EmbeddingProvider:   cacheTestEmbeddingProvider(),
 						Enabled:             true,
 						SimilarityThreshold: 0.8,
 						MaxEntries:          cacheSize,
@@ -4356,7 +4303,7 @@ func BenchmarkScalability(b *testing.B) {
 					})
 
 					for i := 0; i < cacheSize; i++ {
-						if err := cache.AddEntry(fmt.Sprintf("req-%d", i), "model",
+						if err := cache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model",
 							testQueries[i], []byte("req"), []byte("resp"), -1); err != nil {
 							b.Fatalf("AddEntry failed: %v", err)
 						}
@@ -4390,6 +4337,7 @@ func BenchmarkScalability(b *testing.B) {
 
 			b.Run("HNSW", func(b *testing.B) {
 				cache := NewInMemoryCache(InMemoryCacheOptions{
+					EmbeddingProvider:   cacheTestEmbeddingProvider(),
 					Enabled:             true,
 					SimilarityThreshold: 0.8,
 					MaxEntries:          cacheSize,
@@ -4400,7 +4348,7 @@ func BenchmarkScalability(b *testing.B) {
 
 				buildStart := time.Now()
 				for i := 0; i < cacheSize; i++ {
-					if err := cache.AddEntry(fmt.Sprintf("req-%d", i), "model",
+					if err := cache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model",
 						testQueries[i], []byte("req"), []byte("resp"), -1); err != nil {
 						b.Fatalf("AddEntry failed: %v", err)
 					}
@@ -4440,12 +4388,6 @@ func BenchmarkScalability(b *testing.B) {
 
 // BenchmarkHNSWParameterSweep tests different HNSW parameters at large scale
 func BenchmarkHNSWParameterSweep(b *testing.B) {
-	useCPU := os.Getenv("USE_CPU") == "true"
-	modelName := "sentence-transformers/all-MiniLM-L6-v2"
-	if err := candle_binding.InitModel(modelName, useCPU); err != nil {
-		b.Skipf("Failed to initialize BERT model: %v", err)
-	}
-
 	cacheSize := 50000 // 50K entries - good size to show differences
 
 	// Parameter combinations to test
@@ -4507,6 +4449,7 @@ func BenchmarkHNSWParameterSweep(b *testing.B) {
 	for _, config := range configs {
 		b.Run(config.name, func(b *testing.B) {
 			cache := NewInMemoryCache(InMemoryCacheOptions{
+				EmbeddingProvider:   cacheTestEmbeddingProvider(),
 				Enabled:             true,
 				SimilarityThreshold: 0.8,
 				MaxEntries:          cacheSize,
@@ -4520,7 +4463,7 @@ func BenchmarkHNSWParameterSweep(b *testing.B) {
 			b.Logf("Building HNSW index: M=%d, efConstruction=200, efSearch=%d", config.m, config.efSearch)
 			buildStart := time.Now()
 			for i := 0; i < cacheSize; i++ {
-				if err := cache.AddEntry(fmt.Sprintf("req-%d", i), "model",
+				if err := cache.AddEntry(context.Background(), fmt.Sprintf("req-%d", i), "model",
 					testQueries[i], []byte("req"), []byte("resp"), -1); err != nil {
 					b.Fatalf("AddEntry failed: %v", err)
 				}
@@ -4569,141 +4512,6 @@ func BenchmarkHNSWParameterSweep(b *testing.B) {
 			b.ReportMetric(totalMemMB, "memory_mb")
 		})
 	}
-}
-
-// Benchmark SIMD vs scalar dotProduct implementations
-func BenchmarkDotProduct(b *testing.B) {
-	// Test with different vector sizes
-	sizes := []int{64, 128, 256, 384, 512, 768, 1024}
-
-	for _, size := range sizes {
-		// Generate random vectors
-		a := make([]float32, size)
-		vec_b := make([]float32, size)
-		for i := 0; i < size; i++ {
-			a[i] = rand.Float32()
-			vec_b[i] = rand.Float32()
-		}
-
-		b.Run(fmt.Sprintf("SIMD/%d", size), func(b *testing.B) {
-			b.ReportAllocs()
-			var sum float32
-			for i := 0; i < b.N; i++ {
-				sum += dotProductSIMD(a, vec_b)
-			}
-			_ = sum
-		})
-
-		b.Run(fmt.Sprintf("Scalar/%d", size), func(b *testing.B) {
-			b.ReportAllocs()
-			var sum float32
-			for i := 0; i < b.N; i++ {
-				sum += dotProductScalar(a, vec_b)
-			}
-			_ = sum
-		})
-	}
-}
-
-// Test correctness of SIMD implementation
-func TestDotProductSIMD(t *testing.T) {
-	testCases := []struct {
-		name string
-		a    []float32
-		b    []float32
-		want float32
-	}{
-		{
-			name: "empty",
-			a:    []float32{},
-			b:    []float32{},
-			want: 0,
-		},
-		{
-			name: "single element",
-			a:    []float32{2.0},
-			b:    []float32{3.0},
-			want: 6.0,
-		},
-		{
-			name: "short vector",
-			a:    []float32{1, 2, 3},
-			b:    []float32{4, 5, 6},
-			want: 32.0, // 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
-		},
-		{
-			name: "8 elements (AVX2 boundary)",
-			a:    []float32{1, 2, 3, 4, 5, 6, 7, 8},
-			b:    []float32{1, 1, 1, 1, 1, 1, 1, 1},
-			want: 36.0, // 1+2+3+4+5+6+7+8 = 36
-		},
-		{
-			name: "16 elements (AVX-512 boundary)",
-			a:    []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-			b:    []float32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-			want: 136.0, // 1+2+...+16 = 136
-		},
-		{
-			name: "non-aligned size (17 elements)",
-			a:    []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
-			b:    []float32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-			want: 153.0, // 1+2+...+17 = 153
-		},
-		{
-			name: "384 dimensions (typical embedding size)",
-			a:    make384Vector(),
-			b:    ones(384),
-			want: sum384(),
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := dotProductSIMD(tc.a, tc.b)
-			if abs(got-tc.want) > 0.0001 {
-				t.Errorf("dotProductSIMD() = %v, want %v", got, tc.want)
-			}
-
-			// Also verify scalar produces same result
-			scalar := dotProductScalar(tc.a, tc.b)
-			if abs(scalar-tc.want) > 0.0001 {
-				t.Errorf("dotProductScalar() = %v, want %v", scalar, tc.want)
-			}
-
-			// SIMD and scalar should match
-			if abs(got-scalar) > 0.0001 {
-				t.Errorf("SIMD (%v) != Scalar (%v)", got, scalar)
-			}
-		})
-	}
-}
-
-func make384Vector() []float32 {
-	v := make([]float32, 384)
-	for i := range v {
-		v[i] = float32(i + 1)
-	}
-	return v
-}
-
-func ones(n int) []float32 {
-	v := make([]float32, n)
-	for i := range v {
-		v[i] = 1.0
-	}
-	return v
-}
-
-func sum384() float32 {
-	// Sum of 1+2+3+...+384 = 384 * 385 / 2 = 73920
-	return 73920.0
-}
-
-func abs(x float32) float32 {
-	if x < 0 {
-		return -x
-	}
-	return x
 }
 
 // TestHNSWSelectLevelBatchRandomness verifies selectLevel() produces
@@ -4884,7 +4692,11 @@ func bruteForceKNN(query []float32, candidates [][]float32, k int) []int {
 	}
 	scores := make([]scored, len(candidates))
 	for i, emb := range candidates {
-		scores[i] = scored{idx: i, sim: dotProductScalar(query, emb)}
+		var sim float32
+		for j := range query {
+			sim += query[j] * emb[j]
+		}
+		scores[i] = scored{idx: i, sim: sim}
 	}
 	// Partial sort: only need top k
 	for i := 0; i < k && i < len(scores); i++ {

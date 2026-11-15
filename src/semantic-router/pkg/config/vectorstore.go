@@ -16,7 +16,11 @@ limitations under the License.
 
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
 
 // VectorStoreConfig holds configuration for the vector store feature.
 type VectorStoreConfig struct {
@@ -34,17 +38,27 @@ type VectorStoreConfig struct {
 	// Default: 50
 	MaxFileSizeMB int `json:"max_file_size_mb,omitempty" yaml:"max_file_size_mb,omitempty"`
 
-	// EmbeddingModel specifies the model for document embeddings.
-	// Options: "bert" (default), "qwen3", "gemma", "mmbert", "multimodal"
-	EmbeddingModel string `json:"embedding_model,omitempty" yaml:"embedding_model,omitempty"`
-
-	// EmbeddingDimension is the dimensionality of the embedding vectors.
-	// Default: 768
-	EmbeddingDimension int `json:"embedding_dimension,omitempty" yaml:"embedding_dimension,omitempty"`
+	// Embedding names the deployment that embeds documents and queries, and
+	// the width of their vectors (default: the model's full output).
+	Embedding *EmbeddingBinding `json:"embedding,omitempty" yaml:"embedding,omitempty"`
 
 	// IngestionWorkers is the number of concurrent ingestion pipeline workers.
 	// Default: 2
 	IngestionWorkers int `json:"ingestion_workers,omitempty" yaml:"ingestion_workers,omitempty"`
+
+	// IngestionDrainTimeoutSeconds bounds how long shutdown waits for in-flight
+	// ingestion jobs to drain before cancelling them. This is a shutdown grace
+	// window, not a per-file ingest budget: on shutdown the pipeline stops
+	// accepting new jobs, waits up to this long for currently-running jobs to
+	// finish, then cancels the rest so a wedged embedder or backend cannot block
+	// process shutdown indefinitely.
+	//
+	// Size it to comfortably exceed the typical single-job latency (file size ×
+	// chunk count × per-chunk embed + backend insert), while staying *below* the
+	// deployment's shutdown grace period (e.g. Kubernetes
+	// terminationGracePeriodSeconds, default 30s) so the drain actually runs
+	// before the platform force-kills the process. Default: 25.
+	IngestionDrainTimeoutSeconds int `json:"ingestion_drain_timeout_seconds,omitempty" yaml:"ingestion_drain_timeout_seconds,omitempty"`
 
 	// SupportedFormats lists the allowed file extensions for upload.
 	// Default: [".txt", ".md", ".json", ".csv", ".html"]
@@ -59,7 +73,7 @@ type VectorStoreConfig struct {
 	// LlamaStack holds Llama Stack backend configuration.
 	// When backend_type is "llama_stack", vSR delegates vector storage and
 	// embedding to a locally-running Llama Stack instance via its REST API.
-	// Llama Stack handles embedding internally, so vSR's CandleEmbedder is
+	// Llama Stack handles embedding internally, so vSR's prepared embedder is
 	// not used for insert/search — only Llama Stack's configured model is used.
 	LlamaStack *LlamaStackVectorStoreConfig `json:"llama_stack,omitempty" yaml:"llama_stack,omitempty"`
 
@@ -121,7 +135,8 @@ type LlamaStackVectorStoreConfig struct {
 
 	// SearchType controls the search strategy used by Llama Stack.
 	// Options: "vector" (default, semantic only) or "hybrid" (vector + keyword
-	// with Reciprocal Rank Fusion). Hybrid requires the Milvus vector_io provider.
+	// with Reciprocal Rank Fusion). Hybrid requires a vector_io provider with
+	// keyword search, such as sqlite-vec or Milvus.
 	SearchType string `json:"search_type,omitempty" yaml:"search_type,omitempty"`
 }
 
@@ -188,7 +203,37 @@ func (c *VectorStoreConfig) Validate() error {
 	if err := validateVectorStoreMetadataStore(c); err != nil {
 		return err
 	}
+	if err := validateVectorStoreSupportedFormats(c.SupportedFormats); err != nil {
+		return err
+	}
 	return validateVectorStoreBackendConfig(c)
+}
+
+// VectorStoreFormatExtension normalizes a supported_formats entry to a
+// lowercase file extension with a leading dot.
+func VectorStoreFormatExtension(format string) string {
+	ext := strings.ToLower(strings.TrimSpace(format))
+	if ext != "" && !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+	return ext
+}
+
+// VectorStoreTextFormats lists the supported_formats extensions that
+// vectorstore.ExtractText can read.
+var VectorStoreTextFormats = []string{".txt", ".md", ".json", ".csv", ".html", ".htm"}
+
+func validateVectorStoreSupportedFormats(formats []string) error {
+	for _, format := range formats {
+		if !slices.Contains(VectorStoreTextFormats, VectorStoreFormatExtension(format)) {
+			return fmt.Errorf(
+				"vector_store.supported_formats must contain only '%s', got '%s'",
+				strings.Join(VectorStoreTextFormats, "', '"),
+				format,
+			)
+		}
+	}
+	return nil
 }
 
 func validateVectorStoreBackendType(backendType string) error {
@@ -281,26 +326,16 @@ func validateVectorStoreMetadataStore(c *VectorStoreConfig) error {
 // ApplyDefaults fills in default values for unset fields.
 func (c *VectorStoreConfig) ApplyDefaults() {
 	if c.FileStorageDir == "" {
-		c.FileStorageDir = "/var/lib/vsr/data"
+		c.FileStorageDir = DefaultVectorStoreFileStorageDir
 	}
 	if c.MaxFileSizeMB <= 0 {
 		c.MaxFileSizeMB = 50
 	}
-	if c.EmbeddingModel == "" {
-		c.EmbeddingModel = "bert"
-	}
-	if c.EmbeddingDimension <= 0 {
-		// Default dimension depends on model:
-		// - bert/multimodal = 384
-		// - qwen3/gemma/mmbert = 768
-		if c.EmbeddingModel == "bert" || c.EmbeddingModel == "multimodal" {
-			c.EmbeddingDimension = 384
-		} else {
-			c.EmbeddingDimension = 768
-		}
-	}
 	if c.IngestionWorkers <= 0 {
 		c.IngestionWorkers = 2
+	}
+	if c.IngestionDrainTimeoutSeconds <= 0 {
+		c.IngestionDrainTimeoutSeconds = 25
 	}
 	if len(c.SupportedFormats) == 0 {
 		c.SupportedFormats = []string{".txt", ".md", ".json", ".csv", ".html"}

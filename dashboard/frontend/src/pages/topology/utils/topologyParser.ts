@@ -16,6 +16,7 @@ import type {
   SignalConfig,
   SignalType,
 } from '../types'
+import { SIGNAL_TYPES } from '../constants'
 import { extractSignals } from './topologySignalParser'
 
 /**
@@ -26,63 +27,28 @@ export function parseConfigToTopology(config: ConfigData): ParsedTopology {
   const signals = extractSignals(config)
   const decisions = extractDecisions(config)
   const models = extractModels(config)
-  const strategy = config.global?.router?.strategy || 'priority'
-  const defaultModel = config.providers?.defaults?.default_model
+  const strategy = config.routing?.strategy || config.global?.router?.strategy || 'priority'
+  const defaultModel = config.providers?.defaults?.model
 
   return { globalPlugins, signals, decisions, models, strategy, defaultModel }
 }
 
 /**
- * Extract global plugins (Jailbreak, PII, Cache)
+ * Extract global plugins (Cache)
  */
 function extractGlobalPlugins(config: ConfigData): GlobalPluginConfig[] {
   const plugins: GlobalPluginConfig[] = []
-  const promptGuard = config.global?.model_catalog?.modules?.prompt_guard || config.prompt_guard
-  const piiModel =
-    config.global?.model_catalog?.modules?.classifier?.pii || config.classifier?.pii_model
-  const semanticCache = config.global?.stores?.semantic_cache || config.semantic_cache
-  const promptGuardModel = promptGuard?.model_id || promptGuard?.model_ref
-  const piiModelRef = piiModel?.model_id || piiModel?.model_ref
+  const responseCache = config.global?.stores?.response_cache
 
-  // 1. Prompt Guard (Jailbreak Detection)
-  if (promptGuard) {
+  // Semantic Cache (Global)
+  if (responseCache) {
     plugins.push({
-      type: 'prompt_guard',
-      enabled: promptGuard.enabled ?? !!promptGuardModel,
-      modelId: promptGuardModel || 'vLLM-SR-Jailbreak',
-      threshold: promptGuard.threshold,
+      type: 'response_cache',
+      enabled: responseCache.enabled ?? false,
       config: {
-        use_modernbert: promptGuard.use_modernbert,
-        use_vllm: promptGuard.use_vllm,
-      },
-    })
-  }
-
-  // 2. PII Detection
-  // Note: Global PII only loads the model. Actual detection requires decision-level pii plugin.
-  if (piiModel) {
-    plugins.push({
-      type: 'pii_detection',
-      enabled: piiModel.enabled ?? !!piiModelRef,
-      modelId: piiModelRef || 'vLLM-SR-PII',
-      threshold: piiModel.threshold,
-      config: {
-        // Mark as "model loaded" not "active detection"
-        mode: 'model_loaded',
-        description: 'Model loaded. Enable per-decision via pii plugin.',
-      },
-    })
-  }
-
-  // 3. Semantic Cache (Global)
-  if (semanticCache) {
-    plugins.push({
-      type: 'semantic_cache',
-      enabled: semanticCache.enabled ?? false,
-      config: {
-        backend_type: semanticCache.backend_type,
-        similarity_threshold: semanticCache.similarity_threshold,
-        ttl_seconds: semanticCache.ttl_seconds,
+        backend_type: responseCache.backend_type,
+        similarity_threshold: responseCache.similarity_threshold,
+        ttl_seconds: responseCache.ttl_seconds,
       },
     })
   }
@@ -97,7 +63,6 @@ function extractDecisions(config: ConfigData): DecisionConfig[] {
   const decisions: DecisionConfig[] = []
   const routingDecisions = config.routing?.decisions ?? config.decisions
 
-  // Python CLI format: decisions array
   if (routingDecisions && routingDecisions.length > 0) {
     routingDecisions.forEach((decision) => {
       const rules = parseRuleCombination(decision.rules)
@@ -114,9 +79,10 @@ function extractDecisions(config: ConfigData): DecisionConfig[] {
         return {
           model: ref.model,
           use_reasoning: ref.use_reasoning,
+          reasoning_mode: ref.reasoning_mode,
           reasoning_effort: ref.reasoning_effort,
           lora_name: ref.lora_name,
-          reasoning_family: modelConfig?.reasoning_family,
+          reasoning_family: modelConfig?.reasoning?.family,
         }
       })
 
@@ -128,39 +94,6 @@ function extractDecisions(config: ConfigData): DecisionConfig[] {
         modelRefs,
         algorithm,
         plugins,
-      })
-    })
-  }
-  // Legacy format: categories array
-  else if (config.categories && config.categories.length > 0) {
-    config.categories.forEach((cat, index) => {
-      const modelScores = normalizeModelScores(cat.model_scores)
-      const modelRefs: ModelRefConfig[] = modelScores.map((ms) => {
-        const modelConfig = config.model_config?.[ms.model]
-        return {
-          model: ms.model,
-          use_reasoning: ms.use_reasoning,
-          reasoning_family: modelConfig?.reasoning_family,
-        }
-      })
-
-      // Create implicit domain rule for category
-      const rules: RuleCombination = {
-        operator: 'OR',
-        conditions: [
-          {
-            type: 'domain',
-            name: cat.name,
-          },
-        ],
-      }
-
-      decisions.push({
-        name: cat.name,
-        description: cat.description,
-        priority: index + 1,
-        rules,
-        modelRefs,
       })
     })
   }
@@ -178,22 +111,16 @@ function extractDecisionAlgorithm(
 
   return {
     type: algorithm.type as AlgorithmConfig['type'],
-    confidence: algorithm.confidence,
-    concurrent: algorithm.concurrent,
-    latency_aware: algorithm.latency_aware,
-    ratings: algorithm.ratings,
-    remom: algorithm.remom,
-    fusion: algorithm.fusion,
-    workflows: algorithm.workflows,
-    router_dc: algorithm.router_dc,
-    automix: algorithm.automix,
-    autoMix: algorithm.autoMix ?? algorithm.automix,
-    hybrid: algorithm.hybrid,
-    knn: algorithm.knn,
-    kmeans: algorithm.kmeans,
-    svm: algorithm.svm,
-    mlp: algorithm.mlp,
+    minimum_candidates: algorithm.minimum_candidates,
+    budget: algorithm.budget,
+    on_error: algorithm.on_error,
     multi_factor: algorithm.multi_factor,
+    systemone: algorithm.systemone,
+    escalate: algorithm.escalate,
+    fusion: algorithm.fusion,
+    remom: algorithm.remom,
+    ratings: algorithm.ratings,
+    workflows: algorithm.workflows,
   }
 }
 
@@ -226,6 +153,12 @@ function parseRuleNode(node: RawRuleNode): RuleNode | null {
 }
 
 function parseRuleCombination(rules?: RawRuleCombination): RuleCombination {
+  // A single condition can be the whole rule tree: `rules: {type, name}`.
+  const rootCondition = rules && !rules.operator && !rules.conditions ? parseRuleNode(rules) : null
+  if (rootCondition) {
+    return { operator: 'AND', conditions: [rootCondition] }
+  }
+
   const conditions = (rules?.conditions || [])
     .map((condition: RawRuleNode) => parseRuleNode(condition))
     .filter((condition: RuleNode | null): condition is RuleNode => condition !== null)
@@ -246,84 +179,20 @@ function extractModels(config: ConfigData): ModelConfig[] {
   config.providers?.models?.forEach((model) => {
     models.push({
       name: model.name,
-      reasoning_family: model.reasoning_family,
+      reasoning_family: model.reasoning?.family,
     })
   })
 
-  for (const card of config.routing?.modelCards || []) {
-    if (!models.find((model) => model.name === card.name)) {
-      models.push({
-        name: card.name,
-        reasoning_family: undefined,
-      })
-    }
-  }
-
-  // From model_config (Legacy)
-  if (config.model_config) {
-    Object.entries(config.model_config).forEach(([name, cfg]) => {
-      if (!models.find((m) => m.name === name)) {
-        models.push({
-          name,
-          reasoning_family: cfg.reasoning_family,
-        })
-      }
-    })
-  }
-
   return models
-}
-
-/**
- * Normalize model_scores from object to array (Legacy format uses object)
- */
-interface NormalizedModelScore {
-  model: string
-  score: number
-  use_reasoning?: boolean
-}
-
-function normalizeModelScores(
-  modelScores:
-    | Array<{ model: string; score: number; use_reasoning?: boolean }>
-    | Record<string, number>
-    | undefined,
-): NormalizedModelScore[] {
-  if (!modelScores) return []
-  if (Array.isArray(modelScores)) return modelScores
-  // Object format (Legacy) - convert to array
-  return Object.entries(modelScores).map(([model, score]) => ({
-    model,
-    score: typeof score === 'number' ? score : 0,
-    use_reasoning: false,
-  }))
 }
 
 /**
  * Group signals by type
  */
 export function groupSignalsByType(signals: SignalConfig[]): Record<SignalType, SignalConfig[]> {
-  const groups: Record<SignalType, SignalConfig[]> = {
-    keyword: [],
-    embedding: [],
-    domain: [],
-    fact_check: [],
-    user_feedback: [],
-    reask: [],
-    preference: [],
-    language: [],
-    context: [],
-    structure: [],
-    complexity: [],
-    modality: [],
-    authz: [],
-    jailbreak: [],
-    pii: [],
-    kb: [],
-    conversation: [],
-    event: [],
-    projection: [],
-  }
+  const groups = Object.fromEntries(
+    SIGNAL_TYPES.map((signalType) => [signalType, [] as SignalConfig[]]),
+  ) as Record<SignalType, SignalConfig[]>
 
   signals.forEach((signal) => {
     if (groups[signal.type]) {
@@ -332,11 +201,4 @@ export function groupSignalsByType(signals: SignalConfig[]): Record<SignalType, 
   })
 
   return groups
-}
-
-/**
- * Check if config is Python CLI format
- */
-export function isPythonCLIFormat(config: ConfigData): boolean {
-  return !!(config.decisions && config.decisions.length > 0)
 }

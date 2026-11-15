@@ -1,598 +1,316 @@
 package extproc
 
 import (
-	"encoding/json"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay/store"
 )
 
-func TestBuildReplayRoutingRecordIncludesRequestToolTrace(t *testing.T) {
+func TestBuildReplayRoutingRecordSanitizesNeutralRequestToolTrace(t *testing.T) {
+	toolResultPIICanary := "customer@example.com"
+	isError := false
 	ctx := &RequestContext{
-		RequestID: "req-tool-1",
-		OriginalRequestBody: []byte(`{
-			"model": "auto",
-			"messages": [
-				{"role": "system", "content": "You are helpful."},
-				{"role": "user", "content": "Find the weather in San Francisco."},
-				{
-					"role": "assistant",
-					"content": null,
-					"tool_calls": [
-						{
-							"id": "call_weather",
-							"type": "function",
-							"function": {
-								"name": "get_weather",
-								"arguments": "{\"location\":\"San Francisco\"}"
-							}
-						}
-					]
-				},
-				{
-					"role": "tool",
-					"tool_call_id": "call_weather",
-					"content": "{\"temperature\":\"18C\",\"condition\":\"sunny\"}"
-				}
-			]
-		}`),
+		RequestID:    "req-tool-1",
+		SourceFormat: llmprotocol.OpenAIResponsesV1,
+		SemanticRequest: &llmprotocol.Request{
+			Model: "vllm-sr/auto",
+			Messages: []llmprotocol.Message{
+				{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "Find the weather in San Francisco."}}},
+				{Role: llmprotocol.RoleAssistant, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentToolCall, ToolCall: &llmprotocol.ToolCall{
+					ID: "call_weather", Name: "get_weather", Arguments: `{"location":"San Francisco"}`,
+				}}}},
+				{Role: llmprotocol.RoleTool, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentToolResult, ToolResult: &llmprotocol.ToolResult{
+					CallID:  "call_weather",
+					IsError: &isError,
+					Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: toolResultPIICanary}},
+				}}}},
+			},
+			Tools: []llmprotocol.Tool{{Name: "get_weather", InputSchema: []byte(`{"type":"object"}`)}},
+		},
 	}
 
-	record := buildReplayRoutingRecord(ctx, "MoM", "model-a", "default_route")
-	if assert.NotNil(t, record.ToolTrace) {
-		assert.Equal(t, "User Query -> LLM Tool Call -> Client Tool Result", record.ToolTrace.Flow)
-		assert.Equal(t, "Client Tool Result", record.ToolTrace.Stage)
-		assert.Equal(t, []string{"get_weather"}, record.ToolTrace.ToolNames)
-		assert.Len(t, record.ToolTrace.Steps, 3)
-		assert.Equal(t, replayToolStepUserInput, record.ToolTrace.Steps[0].Type)
-		assert.Equal(t, replayToolStepAssistantToolCall, record.ToolTrace.Steps[1].Type)
-		assert.Equal(t, replayToolStepClientToolResult, record.ToolTrace.Steps[2].Type)
+	record := buildReplayRoutingRecord(ctx, "vllm-sr/auto", "model-a", "default_route")
+	require.NotNil(t, record.ToolTrace)
+	require.Equal(t, "User Query -> LLM Tool Call -> Client Tool Result", record.ToolTrace.Flow)
+	require.Equal(t, "Client Tool Result", record.ToolTrace.Stage)
+	require.Equal(t, []string{"get_weather"}, record.ToolTrace.ToolNames)
+	require.Len(t, record.ToolTrace.Steps, 3)
+	require.Equal(t, string(llmprotocol.OpenAIResponsesV1), record.ToolTrace.Steps[0].APIType)
+	require.Equal(t, replayToolStepAssistantToolCall, record.ToolTrace.Steps[1].Type)
+	require.JSONEq(t, `{"location":"San Francisco"}`, record.ToolTrace.Steps[1].RawArguments)
+	require.Equal(t, replayToolStepClientToolResult, record.ToolTrace.Steps[2].Type)
+	require.Equal(t, "succeeded", record.ToolTrace.Steps[2].Status)
+	require.True(t, record.ToolTrace.Steps[2].ContentRedacted)
+	require.Empty(t, record.ToolTrace.Steps[2].Text)
+	require.Empty(t, record.ToolTrace.Steps[2].Output)
+	require.Empty(t, record.ToolTrace.Steps[2].RawOutput)
+	require.NotContains(t, record.RequestBody, toolResultPIICanary)
+	require.Equal(t, "Find the weather in San Francisco.", record.Prompt)
+	require.Contains(t, record.ToolDefinitions, "get_weather")
+}
+
+func TestBuildReplayResponseToolTraceUsesNeutralResponse(t *testing.T) {
+	ctx := &RequestContext{
+		SourceFormat: llmprotocol.AnthropicMessagesV1,
+		SemanticResponse: &llmprotocol.Response{
+			Output: []llmprotocol.OutputItem{{
+				Role: llmprotocol.RoleAssistant,
+				Content: []llmprotocol.Content{
+					{Kind: llmprotocol.ContentToolCall, ToolCall: &llmprotocol.ToolCall{ID: "call_weather", Name: "get_weather", Arguments: `{"city":"SF"}`}},
+					{Kind: llmprotocol.ContentText, Text: "It is sunny."},
+				},
+			}},
+		},
+	}
+
+	trace := buildReplayResponseToolTrace(ctx, []byte("ignored transport body"))
+	require.NotNil(t, trace)
+	require.Equal(t, "LLM Tool Call -> LLM Final Response", trace.Flow)
+	require.Equal(t, []string{"get_weather"}, trace.ToolNames)
+	require.Len(t, trace.Steps, 2)
+	require.Equal(t, replayToolSourceResponse, trace.Steps[0].Source)
+	require.Equal(t, string(llmprotocol.AnthropicMessagesV1), trace.Steps[0].APIType)
+	require.Equal(t, "It is sunny.", trace.Steps[1].Text)
+}
+
+func TestBuildReplayStreamingToolTraceUsesSemanticAccumulator(t *testing.T) {
+	ctx := &RequestContext{
+		SourceFormat:            llmprotocol.OpenAIChatV1,
+		ExpectStreamingResponse: true,
+		SemanticResponse: &llmprotocol.Response{
+			Output: []llmprotocol.OutputItem{{
+				Role: llmprotocol.RoleAssistant,
+				Content: []llmprotocol.Content{
+					{Kind: llmprotocol.ContentToolCall, ToolCall: &llmprotocol.ToolCall{ID: "call_weather", Name: "get_weather", Arguments: `{"city":"SF"}`}},
+					{Kind: llmprotocol.ContentText, Text: "It is sunny."},
+				},
+			}},
+		},
+	}
+
+	trace := buildReplayStreamingToolTrace(ctx)
+	require.NotNil(t, trace)
+	require.Equal(t, "LLM Tool Call -> LLM Final Response", trace.Flow)
+	require.Len(t, trace.Steps, 2)
+	for _, step := range trace.Steps {
+		require.Equal(t, replayToolSourceStream, step.Source)
 	}
 }
 
-func TestAttachRouterReplayResponseMergesToolTrace(t *testing.T) {
+func TestBuildReplayTraceDoesNotPersistReasoningText(t *testing.T) {
+	ctx := &RequestContext{
+		SourceFormat: llmprotocol.OpenAIResponsesV1,
+		SemanticResponse: &llmprotocol.Response{Output: []llmprotocol.OutputItem{{
+			Role: llmprotocol.RoleAssistant,
+			Content: []llmprotocol.Content{{
+				Kind: llmprotocol.ContentReasoning, Text: "private reasoning", Signature: "signed",
+			}},
+		}}},
+	}
+
+	trace := buildReplayStreamingToolTrace(ctx)
+	require.NotNil(t, trace)
+	require.Equal(t, "LLM Reasoning Complete", trace.Flow)
+	require.Len(t, trace.Steps, 1)
+	require.Empty(t, trace.Steps[0].Text)
+	require.NotContains(t, trace.Steps[0].RawOutput, "private reasoning")
+}
+
+func TestAttachRouterReplayResponseMergesNeutralTrace(t *testing.T) {
 	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
 	recorder.SetCapturePolicy(false, true, 4096)
-	requestTrace := newReplayToolTrace([]routerreplay.ToolTraceStep{
-		{Type: replayToolStepUserInput, Source: replayToolSourceRequest, Role: "user", Text: "Find the weather."},
-		{Type: replayToolStepAssistantToolCall, Source: replayToolSourceRequest, Role: "assistant", ToolName: "get_weather", ToolCallID: "call_weather", Arguments: "{\"location\":\"San Francisco\"}"},
-		{Type: replayToolStepClientToolResult, Source: replayToolSourceRequest, Role: "tool", ToolName: "get_weather", ToolCallID: "call_weather", Text: "{\"temperature\":\"18C\"}"},
-	})
 	replayID, err := recorder.AddRecord(routerreplay.RoutingRecord{
 		ID:        "replay-tool-response",
 		RequestID: "req-tool-2",
 		Decision:  "default_route",
-		ToolTrace: requestTrace,
+		ToolTrace: newReplayToolTrace([]routerreplay.ToolTraceStep{
+			{Type: replayToolStepUserInput, Source: replayToolSourceRequest, Role: "user", Text: "Find the weather."},
+			{Type: replayToolStepAssistantToolCall, Source: replayToolSourceRequest, Role: "assistant", ToolName: "get_weather", ToolCallID: "call_weather", Arguments: `{"city":"SF"}`},
+		}),
 	})
-	if err != nil {
-		t.Fatalf("failed to add replay record: %v", err)
-	}
+	require.NoError(t, err)
 
-	router := &OpenAIRouter{ReplayRecorder: recorder}
 	ctx := &RequestContext{
-		RequestID:            "req-tool-2",
-		RouterReplayID:       replayID,
-		RouterReplayRecorder: recorder,
+		RequestID:                "req-tool-2",
+		RouterReplayID:           replayID,
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &config.RouterReplayPluginConfig{Enabled: true, PromptCapture: config.PromptCaptureRaw, CaptureResponseBody: true},
+		SourceFormat:             llmprotocol.OpenAIChatV1,
+		SemanticResponse: &llmprotocol.Response{Output: []llmprotocol.OutputItem{{
+			Role:    llmprotocol.RoleAssistant,
+			Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "It is sunny."}},
+		}}},
 	}
-
-	router.attachRouterReplayResponse(ctx, []byte(`{
-		"id": "chatcmpl-1",
-		"object": "chat.completion",
-		"created": 1234567890,
-		"model": "model-a",
-		"choices": [
-			{
-				"index": 0,
-				"message": {
-					"role": "assistant",
-					"content": "It is 18C and sunny in San Francisco."
-				},
-				"finish_reason": "stop"
-			}
-		]
-	}`), true)
+	(&OpenAIRouter{ReplayRecorder: recorder}).attachRouterReplayResponse(ctx, []byte(`{"safe":"client body"}`), true)
 
 	record, found := recorder.GetRecord(replayID)
-	if !found {
-		t.Fatal("expected replay record to be present")
-	}
-	if assert.NotNil(t, record.ToolTrace) {
-		assert.Equal(t, "User Query -> LLM Tool Call -> Client Tool Result -> LLM Final Response", record.ToolTrace.Flow)
-		assert.Equal(t, "LLM Final Response", record.ToolTrace.Stage)
-		assert.Len(t, record.ToolTrace.Steps, 4)
-		assert.Equal(t, replayToolStepAssistantFinalResponse, record.ToolTrace.Steps[3].Type)
-	}
-	assert.Contains(t, record.ResponseBody, "sunny in San Francisco")
+	require.True(t, found)
+	require.NotNil(t, record.ToolTrace)
+	require.Equal(t, "User Query -> LLM Tool Call -> LLM Final Response", record.ToolTrace.Flow)
+	require.Len(t, record.ToolTrace.Steps, 3)
+	require.Contains(t, record.ResponseBody, "client body")
 }
 
-func TestParseResponseAPIRequestToolTrace(t *testing.T) {
-	trace := parseResponseAPIRequestToolTrace([]byte(`[
-		{
-			"type": "message",
-			"role": "user",
-			"content": [{"type": "input_text", "text": "Find the weather in San Francisco."}]
-		},
-		{
-			"type": "function_call",
-			"call_id": "call_weather",
-			"name": "get_weather",
-			"arguments": "{\"location\":\"San Francisco\"}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_weather",
-			"output": {"temperature": "18C", "condition": "sunny"}
-		}
-	]`))
-
-	if assert.NotNil(t, trace) {
-		assert.Equal(t, "User Query -> LLM Tool Call -> Client Tool Result", trace.Flow)
-		assert.Equal(t, []string{"get_weather"}, trace.ToolNames)
-		assert.Len(t, trace.Steps, 3)
-		assert.Equal(t, replayToolStepClientToolResult, trace.Steps[2].Type)
-		assert.Contains(t, trace.Steps[2].Text, "temperature")
-	}
+func TestMergeReplayToolTracesDeduplicatesBoundaryStep(t *testing.T) {
+	step := routerreplay.ToolTraceStep{Type: replayToolStepAssistantToolCall, ToolName: "lookup", ToolCallID: "call-1"}
+	merged := mergeReplayToolTraces(newReplayToolTrace([]routerreplay.ToolTraceStep{step}), newReplayToolTrace([]routerreplay.ToolTraceStep{step}))
+	require.NotNil(t, merged)
+	require.Len(t, merged.Steps, 1)
 }
 
-func TestParseChatCompletionRequestToolTracePreservesNullToolResult(t *testing.T) {
-	trace := parseChatCompletionRequestToolTrace([]byte(`{
-		"model": "auto",
-		"messages": [
-			{"role": "user", "content": "Call the tool."},
-			{
-				"role": "assistant",
-				"content": null,
-				"tool_calls": [
-					{
-						"id": "call_weather",
-						"type": "function",
-						"function": {
-							"name": "get_weather",
-							"arguments": "{\"location\":\"San Francisco\"}"
-						}
-					}
-				]
-			},
-			{
-				"role": "tool",
-				"tool_call_id": "call_weather",
-				"content": null
-			}
-		]
-	}`))
-
-	if assert.NotNil(t, trace) {
-		assert.Len(t, trace.Steps, 3)
-
-		// Chat Completions tool call step should preserve RawArguments.
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[1].Type)
-		assert.JSONEq(t, "{\"location\":\"San Francisco\"}", trace.Steps[1].RawArguments)
-
-		// Null tool result: Text, RawOutput should both be empty.
-		assert.Equal(t, replayToolStepClientToolResult, trace.Steps[2].Type)
-		assert.Equal(t, "get_weather", trace.Steps[2].ToolName)
-		assert.Equal(t, "call_weather", trace.Steps[2].ToolCallID)
-		assert.Empty(t, trace.Steps[2].Text)
-		assert.Empty(t, trace.Steps[2].RawOutput)
-	}
-}
-
-func TestBuildReplayStreamingToolTrace(t *testing.T) {
-	ctx := &RequestContext{
-		StreamingContent: "It is 18C and sunny in San Francisco.",
-		StreamingToolCalls: map[int]*StreamingToolCallState{
-			0: {
-				ID:        "call_weather",
-				Name:      "get_weather",
-				Arguments: "{\"location\":\"San Francisco\"}",
-			},
-		},
-	}
-
-	trace := buildReplayStreamingToolTrace(ctx)
-	if assert.NotNil(t, trace) {
-		assert.Equal(t, "LLM Tool Call -> LLM Final Response", trace.Flow)
-		assert.Equal(t, "LLM Final Response", trace.Stage)
-		assert.Equal(t, []string{"get_weather"}, trace.ToolNames)
-		assert.Len(t, trace.Steps, 2)
-
-		// Streaming tool call step should preserve RawArguments.
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[0].Type)
-		assert.JSONEq(t, "{\"location\":\"San Francisco\"}", trace.Steps[0].RawArguments)
-	}
-}
-
-func TestParseResponseAPIResponseToolTraceWithComplexContent(t *testing.T) {
-	trace := parseResponseAPIResponseToolTrace([]byte(`{
-		"output": [
-			{
-				"type": "function_call",
-				"call_id": "call_weather",
-				"name": "get_weather",
-				"arguments": "{\"location\":\"San Francisco\"}"
-			},
-			{
-				"type": "message",
-				"role": "assistant",
-				"content": [
-					{"type": "output_text", "text": "The weather is sunny."}
-				]
-			}
-		]
-	}`))
-
-	if assert.NotNil(t, trace) {
-		assert.Equal(t, "LLM Tool Call -> LLM Final Response", trace.Flow)
-		assert.Len(t, trace.Steps, 2)
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[0].Type)
-		assert.Equal(t, "call_weather", trace.Steps[0].ToolCallID)
-		assert.Equal(t, "get_weather", trace.Steps[0].ToolName)
-		assert.JSONEq(t, "{\"location\":\"San Francisco\"}", trace.Steps[0].RawArguments)
-		assert.Equal(t, replayToolStepAssistantFinalResponse, trace.Steps[1].Type)
-		assert.Equal(t, "The weather is sunny.", trace.Steps[1].Text)
-	}
-}
-
-func TestParseResponseAPIRequestToolTraceMultiToolStructuredOutput(t *testing.T) {
-	trace := parseResponseAPIRequestToolTrace([]byte(`[
-		{
-			"type": "message",
-			"role": "user",
-			"content": "Find weather and news."
-		},
-		{
-			"type": "function_call",
-			"call_id": "call_weather",
-			"name": "get_weather",
-			"arguments": "{\"location\":\"San Francisco\"}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_weather",
-			"output": {"temperature": "18C", "condition": "sunny"}
-		},
-		{
-			"type": "function_call",
-			"call_id": "call_news",
-			"name": "get_news",
-			"arguments": "{\"topic\":\"tech\"}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_news",
-			"output": [{"headline": "AI advances", "source": "TechDaily"}]
-		}
-	]`))
-
-	if assert.NotNil(t, trace) {
-		assert.Equal(t, "User Query -> LLM Tool Call -> Client Tool Result -> LLM Tool Call -> Client Tool Result", trace.Flow)
-		assert.Len(t, trace.Steps, 5)
-
-		// First tool call
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[1].Type)
-		assert.Equal(t, "call_weather", trace.Steps[1].ToolCallID)
-		assert.Equal(t, "get_weather", trace.Steps[1].ToolName)
-		assert.JSONEq(t, "{\"location\":\"San Francisco\"}", trace.Steps[1].RawArguments)
-
-		// First structured output
-		assert.Equal(t, replayToolStepClientToolResult, trace.Steps[2].Type)
-		assert.Equal(t, "call_weather", trace.Steps[2].ToolCallID)
-		assert.Equal(t, "get_weather", trace.Steps[2].ToolName)
-		assert.JSONEq(t, `{"temperature":"18C","condition":"sunny"}`, trace.Steps[2].RawOutput)
-		assert.Contains(t, trace.Steps[2].Text, "temperature")
-
-		// Second tool call
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[3].Type)
-		assert.Equal(t, "call_news", trace.Steps[3].ToolCallID)
-		assert.Equal(t, "get_news", trace.Steps[3].ToolName)
-		assert.JSONEq(t, "{\"topic\":\"tech\"}", trace.Steps[3].RawArguments)
-
-		// Second structured output (array)
-		assert.Equal(t, replayToolStepClientToolResult, trace.Steps[4].Type)
-		assert.Equal(t, "call_news", trace.Steps[4].ToolCallID)
-		assert.Equal(t, "get_news", trace.Steps[4].ToolName)
-		assert.JSONEq(t, `[{"headline":"AI advances","source":"TechDaily"}]`, trace.Steps[4].RawOutput)
-	}
-}
-
-func TestResponseAPIToolTraceRoundTrip(t *testing.T) {
-	requestTrace := parseResponseAPIRequestToolTrace([]byte(`[
-		{
-			"type": "message",
-			"role": "user",
-			"content": "What's the weather?"
-		},
-		{
-			"type": "function_call",
-			"call_id": "call_weather_123",
-			"name": "get_weather",
-			"arguments": "{\"city\":\"Berlin\"}"
-		},
-		{
-			"type": "function_call_output",
-			"call_id": "call_weather_123",
-			"output": {"temp": 22, "unit": "C"}
-		}
-	]`))
-
-	responseTrace := parseResponseAPIResponseToolTrace([]byte(`{
-		"output": [
-			{
-				"type": "message",
-				"role": "assistant",
-				"content": "It is 22C in Berlin."
-			}
-		]
-	}`))
-
-	merged := mergeReplayToolTraces(requestTrace, responseTrace)
-	if !assert.NotNil(t, merged) {
-		return
-	}
-	assert.Len(t, merged.Steps, 4)
-
-	// Round-trip through JSON marshal/unmarshal to verify persistence fidelity.
-	serialized, err := json.Marshal(merged)
-	if !assert.NoError(t, err) {
-		return
-	}
-
-	var restored routerreplay.ToolTrace
-	if !assert.NoError(t, json.Unmarshal(serialized, &restored)) {
-		return
-	}
-
-	if !assert.Len(t, restored.Steps, 4) {
-		return
-	}
-
-	// Verify call_id -> ToolCallID survives round-trip.
-	assert.Equal(t, "call_weather_123", restored.Steps[1].ToolCallID)
-	assert.Equal(t, "call_weather_123", restored.Steps[2].ToolCallID)
-
-	// Verify raw arguments preserved as exact string through round-trip.
-	assert.JSONEq(t, "{\"city\":\"Berlin\"}", restored.Steps[1].RawArguments)
-
-	// Verify raw structured output preserved as exact string through round-trip.
-	// This confirms that RawOutput (a string field) is not altered by JSON
-	// marshal/unmarshal — e.g. numeric values like 22 stay as "22" not "22.0".
-	assert.Equal(t, restored.Steps[2].RawOutput, merged.Steps[2].RawOutput)
-	assert.JSONEq(t, `{"temp":22,"unit":"C"}`, restored.Steps[2].RawOutput)
-
-	// Verify text extracted from structured output is present.
-	assert.Contains(t, restored.Steps[2].Text, "temp")
-
-	// Verify flow and stage survive round-trip.
-	assert.Equal(t, merged.Flow, restored.Flow)
-	assert.Equal(t, merged.Stage, restored.Stage)
-	assert.Equal(t, merged.ToolNames, restored.ToolNames)
-}
-
-func TestBuildReplayStreamingToolTracePreservesResponseAPICallID(t *testing.T) {
-	ctx := &RequestContext{
-		ResponseAPICtx: &ResponseAPIContext{
-			IsResponseAPIRequest: true,
-		},
-		StreamingContent: "It is 18C and sunny in San Francisco.",
-		StreamingToolCalls: map[int]*StreamingToolCallState{
-			0: {
-				ID:        "call_weather_123",
-				Name:      "get_weather",
-				Arguments: "{\"location\":\"San Francisco\"}",
-			},
-			1: {
-				ID:        "call_news_456",
-				Name:      "get_news",
-				Arguments: "{\"topic\":\"tech\"}",
-			},
-		},
-	}
-
-	trace := buildReplayStreamingToolTrace(ctx)
-	if assert.NotNil(t, trace) {
-		// Flow deduplicates consecutive identical step labels, so two assistant_tool_calls
-		// collapse into a single "LLM Tool Call" label.
-		assert.Equal(t, "LLM Tool Call -> LLM Final Response", trace.Flow)
-		assert.Equal(t, []string{"get_weather", "get_news"}, trace.ToolNames)
-		assert.Len(t, trace.Steps, 3)
-
-		// First streamed tool call should preserve call_id as ToolCallID.
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[0].Type)
-		assert.Equal(t, "call_weather_123", trace.Steps[0].ToolCallID)
-		assert.Equal(t, "get_weather", trace.Steps[0].ToolName)
-		assert.JSONEq(t, "{\"location\":\"San Francisco\"}", trace.Steps[0].RawArguments)
-
-		// Second streamed tool call should preserve call_id as ToolCallID.
-		assert.Equal(t, replayToolStepAssistantToolCall, trace.Steps[1].Type)
-		assert.Equal(t, "call_news_456", trace.Steps[1].ToolCallID)
-		assert.Equal(t, "get_news", trace.Steps[1].ToolName)
-		assert.JSONEq(t, "{\"topic\":\"tech\"}", trace.Steps[1].RawArguments)
-
-		// Final assistant response.
-		assert.Equal(t, replayToolStepAssistantFinalResponse, trace.Steps[2].Type)
-		assert.Equal(t, "It is 18C and sunny in San Francisco.", trace.Steps[2].Text)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Tests for issue #1780 – structured tool-call fields
-// ---------------------------------------------------------------------------
-
-func TestExtractChatCompletionPromptAndTools(t *testing.T) {
-	body := []byte(`{
-		"model": "auto",
-		"messages": [
-			{"role": "system", "content": "You are helpful."},
-			{"role": "user", "content": "What is the weather in Paris?"}
-		],
-		"tools": [
-			{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {}}}
-		]
-	}`)
-
-	prompt, toolDefs := extractChatCompletionPromptAndTools(body)
-
-	assert.Equal(t, "What is the weather in Paris?", prompt)
-	assert.NotEmpty(t, toolDefs)
-	assert.Contains(t, toolDefs, "get_weather")
-}
-
-func TestExtractChatCompletionPromptAndTools_NoTools(t *testing.T) {
-	body := []byte(`{
-		"model": "auto",
-		"messages": [
-			{"role": "user", "content": "Hello"}
-		]
-	}`)
-
-	prompt, toolDefs := extractChatCompletionPromptAndTools(body)
-
-	assert.Equal(t, "Hello", prompt)
-	assert.Empty(t, toolDefs)
-}
-
-func TestExtractChatCompletionPromptAndTools_Empty(t *testing.T) {
-	prompt, toolDefs := extractChatCompletionPromptAndTools(nil)
-	assert.Empty(t, prompt)
-	assert.Empty(t, toolDefs)
-}
-
-func TestBuildReplayRoutingRecord_PopulatesPromptAndToolDefs(t *testing.T) {
-	ctx := &RequestContext{
-		RequestID: "req-structured-1",
-		OriginalRequestBody: []byte(`{
-			"model": "auto",
-			"messages": [
-				{"role": "system", "content": "Be helpful."},
-				{"role": "user", "content": "Find the weather in Tokyo."}
-			],
-			"tools": [
-				{"type": "function", "function": {"name": "get_weather", "description": "Returns weather", "parameters": {}}}
-			]
-		}`),
-	}
-
-	record := buildReplayRoutingRecord(ctx, "MoM", "model-a", "default")
-
-	assert.Equal(t, "Find the weather in Tokyo.", record.Prompt)
-	assert.False(t, record.PromptTruncated)
-	assert.NotEmpty(t, record.ToolDefinitions)
-	assert.Contains(t, record.ToolDefinitions, "get_weather")
-}
-
-func TestBuildReplayRoutingRecord_NoTools_EmptyToolDefs(t *testing.T) {
-	ctx := &RequestContext{
-		RequestID: "req-structured-2",
-		OriginalRequestBody: []byte(`{
-			"model": "auto",
-			"messages": [{"role": "user", "content": "Hello world"}]
-		}`),
-	}
-
-	record := buildReplayRoutingRecord(ctx, "MoM", "model-a", "default")
-
-	assert.Equal(t, "Hello world", record.Prompt)
-	assert.Empty(t, record.ToolDefinitions)
-}
-
-func TestChatCompletionToolSteps_HaveAPITypeAndOutput(t *testing.T) {
-	ctx := &RequestContext{
-		RequestID: "req-apitype-chat",
-		OriginalRequestBody: []byte(`{
-			"model": "auto",
-			"messages": [
-				{"role": "user", "content": "Get weather."},
-				{
-					"role": "assistant",
-					"content": null,
-					"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}}]
+// Review #3806 (P1): suppressing RequestBody and Prompt was not enough. The
+// tool trace carries user text and tool arguments and results, and every
+// record is written before masking runs, so a masking route persisted
+// alice@example.com in the trace while the body and prompt were empty.
+func TestBuildReplayRoutingRecordSuppressesRequestTraceWhenMasking(t *testing.T) {
+	const raw = "alice@example.com"
+	newCtx := func(looper bool) *RequestContext {
+		return &RequestContext{
+			RequestID:     "req-mask-trace",
+			SourceFormat:  llmprotocol.OpenAIChatV1,
+			LooperRequest: looper,
+			SemanticRequest: &llmprotocol.Request{
+				Model: "auto",
+				Messages: []llmprotocol.Message{
+					{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{
+						{Kind: llmprotocol.ContentText, Text: "email " + raw},
+					}},
+					{Role: llmprotocol.RoleAssistant, Content: []llmprotocol.Content{
+						{Kind: llmprotocol.ContentToolCall, ToolCall: &llmprotocol.ToolCall{
+							ID: "call_1", Name: "send", Arguments: `{"to":"` + raw + `"}`,
+						}},
+					}},
+					{Role: llmprotocol.RoleTool, Content: []llmprotocol.Content{
+						{Kind: llmprotocol.ContentToolResult, ToolResult: &llmprotocol.ToolResult{
+							CallID:  "call_1",
+							Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "sent to " + raw}},
+						}},
+					}},
 				},
-				{"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\":\"22C\"}"}
-			]
-		}`),
-	}
-
-	record := buildReplayRoutingRecord(ctx, "MoM", "model-a", "default")
-
-	if assert.NotNil(t, record.ToolTrace) && assert.Len(t, record.ToolTrace.Steps, 3) {
-		toolCallStep := record.ToolTrace.Steps[1]
-		assert.Equal(t, replayAPITypeChatCompletions, toolCallStep.APIType)
-
-		toolResultStep := record.ToolTrace.Steps[2]
-		assert.Equal(t, replayAPITypeChatCompletions, toolResultStep.APIType)
-		assert.JSONEq(t, `{"temp":"22C"}`, toolResultStep.Output)
-		assert.Equal(t, toolResultStep.RawOutput, toolResultStep.Output)
-	}
-}
-
-func TestMaxToolTraceBytesPromptTruncation(t *testing.T) {
-	storage := store.NewMemoryStore(10, 0)
-	recorder := routerreplay.NewRecorder(storage)
-	recorder.SetCapturePolicy(false, false, 4096)
-	recorder.SetMaxToolTraceBytes(10) // very small limit
-
-	record := routerreplay.RoutingRecord{
-		RequestID:       "req-trunc-1",
-		Prompt:          "This is a prompt longer than ten bytes",
-		ToolDefinitions: `[{"type":"function","function":{"name":"long_tool"}}]`,
-	}
-
-	id, err := recorder.AddRecord(record)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	stored, found := recorder.GetRecord(id)
-	if !found {
-		t.Fatal("record not found")
-	}
-	assert.Len(t, stored.Prompt, 10)
-	assert.True(t, stored.PromptTruncated)
-	assert.Len(t, stored.ToolDefinitions, 10)
-}
-
-func TestMaxToolTraceBytesStepTruncation(t *testing.T) {
-	storage := store.NewMemoryStore(10, 0)
-	recorder := routerreplay.NewRecorder(storage)
-	recorder.SetCapturePolicy(false, false, 4096)
-	recorder.SetMaxToolTraceBytes(5)
-
-	trace := &routerreplay.ToolTrace{
-		Steps: []routerreplay.ToolTraceStep{
-			{
-				Type:      replayToolStepAssistantToolCall,
-				Arguments: `{"city":"New York"}`,
-				Output:    "",
 			},
-			{
-				Type:   replayToolStepClientToolResult,
-				Output: `{"temperature":"22C","condition":"sunny"}`,
+		}
+	}
+
+	// Baseline: without the plugin the trace is recorded as before.
+	plain := buildReplayRoutingRecord(newCtx(false), "auto", "model-a", "route")
+	require.NotNil(t, plain.ToolTrace, "a route without masking must still record its trace")
+
+	maskingDecision := &config.Decision{Plugins: []config.DecisionPlugin{{
+		Type:          config.DecisionPluginMasking,
+		Configuration: config.MustStructuredPayload(map[string]interface{}{"enabled": true, "signal": "personal"}),
+	}}}
+
+	// Both paths write through this one builder: the ordinary request path and
+	// the internal Looper path, which records before the final mask.
+	for _, looper := range []bool{false, true} {
+		ctx := newCtx(looper)
+		ctx.VSRSelectedDecision = maskingDecision
+
+		record := buildReplayRoutingRecord(ctx, "auto", "model-a", "route")
+
+		require.Nil(t, record.ToolTrace, "looper=%v: request tool trace must be suppressed", looper)
+		require.Empty(t, record.RequestBody, "looper=%v: request body must be suppressed", looper)
+		require.Empty(t, record.Prompt, "looper=%v: prompt must be suppressed", looper)
+		// Routing metadata still records; only request content is dropped.
+		require.Equal(t, "route", record.Decision)
+		require.Equal(t, "model-a", record.SelectedModel)
+	}
+}
+
+func toolResultReplayContext(t *testing.T, result string) *RequestContext {
+	t.Helper()
+	return &RequestContext{
+		TraceContext: t.Context(),
+		RequestID:    "req-tool-result",
+		SourceFormat: llmprotocol.OpenAIChatV1,
+		SemanticRequest: &llmprotocol.Request{
+			Model: "vllm-sr/auto",
+			Messages: []llmprotocol.Message{
+				{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "Find the weather in San Francisco."}}},
+				{Role: llmprotocol.RoleAssistant, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentToolCall, ToolCall: &llmprotocol.ToolCall{
+					ID: "call_weather", Name: "get_weather", Arguments: `{"location":"San Francisco"}`,
+				}}}},
+				{Role: llmprotocol.RoleTool, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentToolResult, ToolResult: &llmprotocol.ToolResult{
+					CallID: "call_weather", Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: result}},
+				}}}},
 			},
 		},
 	}
-	record := routerreplay.RoutingRecord{
-		RequestID: "req-trunc-2",
-		ToolTrace: trace,
-	}
+}
 
-	id, err := recorder.AddRecord(record)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestBuildReplayRoutingRecordCapturesToolResultsOnlyWhenOptedIn(t *testing.T) {
+	const result = "Sunny, 21C in San Francisco."
+	no := false
+	for _, test := range []struct {
+		name    string
+		policy  *config.RouterReplayPluginConfig
+		capture bool
+	}{
+		{"default", &config.RouterReplayPluginConfig{Enabled: true, PromptCapture: config.PromptCaptureRaw}, false},
+		{"opted in", &config.RouterReplayPluginConfig{Enabled: true, PromptCapture: config.PromptCaptureRaw, CaptureToolResults: true}, true},
+		{"no prompt capture", &config.RouterReplayPluginConfig{Enabled: true, CaptureToolResults: true}, false},
+		{"verified capture", &config.RouterReplayPluginConfig{Enabled: true, PromptCapture: config.PromptCaptureVerified, CaptureToolResults: true}, false},
+		{"personal data withheld", &config.RouterReplayPluginConfig{Enabled: true, CaptureToolResults: true, CapturePersonalData: &no}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := toolResultReplayContext(t, result)
+			ctx.RouterReplayPluginConfig = test.policy
+			record := buildReplayRoutingRecord(ctx, "vllm-sr/auto", "model-a", "default_route")
+			require.NotNil(t, record.ToolTrace)
+			require.Len(t, record.ToolTrace.Steps, 3)
+			step := record.ToolTrace.Steps[2]
+			require.Equal(t, replayToolStepClientToolResult, step.Type)
+			require.Equal(t, "succeeded", step.Status)
+			require.Empty(t, step.Text)
+			require.Empty(t, step.RawOutput)
+			if test.capture {
+				require.Equal(t, result, step.Output)
+				require.False(t, step.ContentRedacted)
+				require.Contains(t, record.RequestBody, result)
+			} else {
+				require.Empty(t, step.Output)
+				require.True(t, step.ContentRedacted)
+				require.NotContains(t, record.RequestBody, result)
+			}
+			require.Equal(t, "Find the weather in San Francisco.", record.Prompt)
+			require.Equal(t, result, ctx.SemanticRequest.Messages[2].Content[0].ToolResult.Content[0].Text)
+		})
 	}
+}
 
-	stored, found := recorder.GetRecord(id)
-	if !found {
-		t.Fatal("record not found")
-	}
+func TestReplayToolResultCaptureIsBoundedByMaxToolTraceBytes(t *testing.T) {
+	cfg := withGlobalPlugins(t, &config.RouterConfig{RouterReplay: config.RouterReplayConfig{StoreBackend: "memory"}},
+		replayTestPlugin(map[string]interface{}{"enabled": true, "prompt_capture": config.PromptCaptureRaw, "capture_tool_results": true, "max_tool_trace_bytes": 5}))
+	router := replayRuntimeRouter(t, cfg)
+	ctx := toolResultReplayContext(t, "Sunny, 21C in San Francisco.")
+	router.startRouterReplay(ctx, "vllm-sr/auto", "model-a", "")
+	record, ok := router.ReplayRecorder.GetRecord(ctx.RouterReplayID)
+	require.True(t, ok)
+	require.NotNil(t, record.ToolTrace)
+	step := record.ToolTrace.Steps[2]
+	require.Equal(t, "Sunny", step.Output)
+	require.True(t, step.Truncated)
+	require.False(t, step.ContentRedacted)
+}
 
-	if assert.Len(t, stored.ToolTrace.Steps, 2) {
-		assert.Len(t, stored.ToolTrace.Steps[0].Arguments, 5)
-		assert.True(t, stored.ToolTrace.Steps[0].Truncated)
+func TestTrajectoryToolMessageReadsCapturedOutput(t *testing.T) {
+	captured := trajectoryMessageFromStep(routerreplay.ToolTraceStep{
+		Type: replayToolStepClientToolResult, ToolCallID: "call_weather", Output: "Sunny", Truncated: true,
+	}, 1)
+	require.Equal(t, "Sunny", captured.Content)
+	require.True(t, captured.ContentTruncated)
 
-		assert.Len(t, stored.ToolTrace.Steps[1].Output, 5)
-		assert.True(t, stored.ToolTrace.Steps[1].Truncated)
-	}
+	older := trajectoryMessageFromStep(routerreplay.ToolTraceStep{Type: replayToolStepClientToolResult, Text: "Sunny"}, 1)
+	require.Equal(t, "Sunny", older.Content)
+	require.False(t, older.ContentTruncated)
+
+	redacted := trajectoryMessageFromStep(routerreplay.ToolTraceStep{
+		Type: replayToolStepClientToolResult, Status: "succeeded", ContentRedacted: true,
+	}, 1)
+	require.Empty(t, redacted.Content)
 }

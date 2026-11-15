@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 import yaml
@@ -16,18 +17,28 @@ from cli.bootstrap import (
 from cli.commands.runtime_config_mutation import (
     _apply_algorithm_override,
     _normalized_algorithm_override,
-    _platform_requires_gpu_defaults,
-    apply_platform_gpu_defaults,
 )
-from cli.commands.runtime_kb import _sync_runtime_kb_store
+from cli.commands.runtime_management_credentials import (
+    management_credential_env_names,
+)
+from cli.commands.runtime_observability import apply_local_tracing_endpoint
 from cli.commands.runtime_paths import (
     _container_runtime_config_path,
-    _container_source_config_path,
     _write_runtime_config,
+    write_runtime_config_bytes,
 )
 from cli.consts import (
     CONTAINER_RUNTIME_ENV,
     SUPPORTED_CONTAINER_RUNTIMES,
+)
+from cli.container_management_listener import resolve_managed_management_listener
+from cli.gateway_mode import GATEWAY_ENV, GATEWAY_STANDALONE, runs_envoy
+from cli.models import UserConfig
+from cli.recipe_topology_contract import MANAGEMENT_CREDENTIAL_ENV
+from cli.runtime_env_names import (
+    _ENV_NAME,
+    RESERVED_RUNTIME_ENV_NAMES,
+    normalize_runtime_env_names,
 )
 from cli.runtime_stack import resolve_runtime_stack
 from cli.service_defaults import (
@@ -41,6 +52,9 @@ log = get_logger(__name__)
 RUNTIME_CONFIG_PATH_ENV = "VLLM_SR_RUNTIME_CONFIG_PATH"
 SOURCE_CONFIG_PATH_ENV = "VLLM_SR_SOURCE_CONFIG_PATH"
 RUNTIME_ALGORITHM_OVERRIDE_ENV = "VLLM_SR_ALGORITHM_OVERRIDE"
+RECIPE_ENV_ALLOWLIST_ENV = "VLLM_SR_RECIPE_ENV_ALLOWLIST"
+
+API_KEY_ENV_FIELD = "api_key_env"
 
 PASSTHROUGH_ENV_RULES = (
     ("HF_ENDPOINT", False),
@@ -48,17 +62,24 @@ PASSTHROUGH_ENV_RULES = (
     ("HF_HOME", False),
     ("HF_HUB_CACHE", False),
     ("VLLM_SR_DETERMINISTIC_EMBEDDINGS", False),
+    ("VLLM_SRUN_CPU_THREADS", False),
     ("ANTHROPIC_API_KEY", True),
     ("OPENAI_API_KEY", True),
     ("OPENROUTER_API_KEY", True),
-    ("OPENCLAW_BASE_IMAGE", False),
     ("SR_LOG_LEVEL", False),
     ("SR_LOG_ENCODING", False),
     ("SR_LOG_DEVELOPMENT", False),
     ("SR_LOG_ADD_CALLER", False),
+    ("VLLM_SR_ENVOY_LOG_LEVEL", False),
 )
 
+_STATIC_SENSITIVE = frozenset(name for name, masked in PASSTHROUGH_ENV_RULES if masked)
 
+
+# Never auto-forward these from a ${VAR} match: POSIX process/identity vars are present
+# in every host shell, so an incidental match (a templated path, an example URL) would
+# silently leak them into the container. CLI override vars are covered too, so a config
+# that happens to reference one can't inject a host value ahead of the CLI's own default.
 def _finalize_runtime_config_write(
     config_path: Path, config: dict[str, object], changed: bool
 ) -> Path:
@@ -95,15 +116,186 @@ def validate_setup_mode_flags(setup_mode: bool, minimal: bool, readonly: bool) -
         )
 
 
-def append_passthrough_env_vars(env_vars: dict[str, str]) -> None:
-    """Pass selected host environment variables into the container runtime."""
-    for name, masked in PASSTHROUGH_ENV_RULES:
+def config_env_references(config_path: Path | str | None) -> set[str]:
+    """Env names used by trusted source config passthrough: the names the
+    Router reads, less the reserved ones."""
+    return required_config_env_references(config_path) - RESERVED_RUNTIME_ENV_NAMES
+
+
+def required_config_env_references(config_path: Path | str | None) -> set[str]:
+    """Return every environment name Router interpolation will consult.
+
+    This parser mirrors Router's tokenization, which reads only uppercase
+    names, then ``validate_config_recipe_env_bindings`` applies the
+    remote-package reserved-name policy. That two-step design makes fallback
+    and reserved references fail closed instead of disappearing from the
+    preflight inventory.
+    """
+
+    if config_path is None:
+        return set()
+    try:
+        document = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+
+    names: set[str] = set()
+    pending: list[object] = [document]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            named = node.get(API_KEY_ENV_FIELD)
+            if isinstance(named, str) and named.strip():
+                names.add(named.strip())
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, str):
+            names.update(_router_consulted_env_names(node))
+    return names
+
+
+def _router_consulted_env_names(value: str) -> set[str]:
+    names: set[str] = set()
+    index = 0
+    while index < len(value):
+        if value[index] != "$":
+            index += 1
+            continue
+        if index + 1 < len(value) and value[index + 1] == "$":
+            index += 2
+            continue
+        if index + 1 < len(value) and value[index + 1] == "{":
+            close = value.find("}", index + 2)
+            if close < 0:
+                index += 1
+                continue
+            name, separator, _ = value[index + 2 : close].partition("-")
+            if separator:
+                name = name.removesuffix(":")
+            if _ENV_NAME.fullmatch(name):
+                names.add(name)
+            index = close + 1
+            continue
+        end = index + 1
+        while end < len(value) and (
+            value[end].isascii() and (value[end].isalnum() or value[end] == "_")
+        ):
+            end += 1
+        if end > index + 1:
+            if _ENV_NAME.fullmatch(value[index + 1 : end]):
+                names.add(value[index + 1 : end])
+            index = end
+            continue
+        index += 1
+    return names
+
+
+def sensitive_env_names(config_path: Path | str | None = None) -> set[str]:
+    """Names that must reach the container as a secret, never as plain-text manifest."""
+    return (
+        _STATIC_SENSITIVE
+        | config_env_references(config_path)
+        | management_credential_env_names(config_path)
+    )
+
+
+def append_passthrough_env_vars(
+    env_vars: dict[str, str], config_path: Path | str | None = None
+) -> None:
+    """Pass established host variables for an operator-trusted source config."""
+    discovered_names = config_env_references(
+        config_path
+    ) | management_credential_env_names(config_path)
+    mask_rules = dict(PASSTHROUGH_ENV_RULES)
+    for name in sorted(discovered_names):
+        mask_rules[name] = True
+    for name, masked in mask_rules.items():
+        if name in env_vars:
+            continue
         value = os.environ.get(name)
         if value is None:
             continue
         env_vars[name] = value
         logged_value = "***" if masked else value
         log.info(f"Passing environment variable: {name}={logged_value}")
+
+
+def normalize_recipe_env_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Validate, deduplicate, and stabilize explicit Recipe env bindings.
+
+    The management credential is never a Recipe input: the Dashboard always
+    holds it, and a Recipe could otherwise send it anywhere a value goes.
+    """
+
+    try:
+        normalized = normalize_runtime_env_names(names)
+    except ValueError as error:
+        raise ValueError(
+            "Invalid Recipe environment binding name. Use an uppercase, "
+            "non-reserved environment variable name, without NAME=value."
+        ) from error
+    if MANAGEMENT_CREDENTIAL_ENV in normalized:
+        raise ValueError(
+            f"{MANAGEMENT_CREDENTIAL_ENV} is the Dashboard's management "
+            "credential and cannot be bound into a Recipe."
+        )
+    return normalized
+
+
+def configure_recipe_env_bindings(
+    env_vars: dict[str, str], requested_names: Iterable[str]
+) -> tuple[str, ...]:
+    """Bind only operator-authorized host variables for Recipes.
+
+    The names-only allowlist is safe to expose to the Dashboard. Values are
+    never accepted on the command line and never included in log messages.
+    """
+
+    names = list(requested_names)
+    configured_allowlist = os.getenv(RECIPE_ENV_ALLOWLIST_ENV, "").strip()
+    if configured_allowlist:
+        raw_names = configured_allowlist.split(",")
+        if any(not raw.strip() for raw in raw_names):
+            raise ValueError(
+                f"{RECIPE_ENV_ALLOWLIST_ENV} must be a comma-separated list of names"
+            )
+        names.extend(raw_names)
+
+    normalized = normalize_recipe_env_names(names)
+    missing = [name for name in normalized if not os.getenv(name)]
+    if missing:
+        raise ValueError(
+            "Recipe environment binding has no non-empty host value: "
+            + ", ".join(missing)
+        )
+
+    env_vars[RECIPE_ENV_ALLOWLIST_ENV] = ",".join(normalized)
+    for name in normalized:
+        env_vars[name] = os.environ[name]
+        log.info("Binding Recipe environment variable: %s=***", name)
+    return normalized
+
+
+def validate_config_recipe_env_bindings(
+    config_path: Path | str, allowed_names: Iterable[str]
+) -> None:
+    """Require every active config dependency to be explicitly authorized."""
+
+    required = required_config_env_references(config_path)
+    try:
+        normalized_required = set(normalize_recipe_env_names(required))
+    except ValueError as exc:
+        raise ValueError(
+            "Active config contains an invalid Recipe environment binding"
+        ) from exc
+    missing = sorted(normalized_required - set(allowed_names))
+    if missing:
+        flags = " ".join(f"--recipe-env {name}" for name in missing)
+        raise ValueError(
+            "Active config requires explicit Recipe environment bindings: "
+            f"{', '.join(missing)}. Restart serve with {flags}."
+        )
 
 
 def apply_container_runtime_override(runtime: str | None) -> None:
@@ -157,8 +349,14 @@ def apply_runtime_mode_env_vars(
     if setup_mode:
         env_vars[SETUP_MODE_ENV] = "true"
         env_vars[DASHBOARD_SETUP_MODE_ENV] = "true"
+        standby = (
+            "the Router and Envoy"
+            if runs_envoy(env_vars.get(GATEWAY_ENV, GATEWAY_STANDALONE))
+            else "the Router"
+        )
         log.info(
-            "Setup mode: starting dashboard-first bootstrap flow with router/envoy on standby"
+            f"Setup mode: starting the Dashboard first, with {standby} on standby "
+            "until a config is activated"
         )
 
     if platform:
@@ -175,48 +373,119 @@ def apply_runtime_mode_env_vars(
         log.info(f"Router log level: {normalized_log_level}")
 
 
-def resolve_effective_config_path(
-    config_path: Path, algorithm: str | None, setup_mode: bool, platform: str | None
-) -> Path:
-    """Apply CLI algorithm and platform override translation when appropriate."""
-    with config_path.open() as handle:
+def _resolve_effective_config_document(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+    *,
+    materialize_local_runtime: bool = True,
+) -> tuple[dict[str, object], bool]:
+    with config_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
 
-    kb_runtime_required, changed = _sync_runtime_kb_store(config, config_path)
-    if not setup_mode:
+    changed = False
+    if not setup_mode and materialize_local_runtime:
         stack = resolve_runtime_stack()
         changed = inject_local_service_runtime_defaults(config, stack) or changed
         changed = inject_local_store_runtime_defaults(config, stack) or changed
+        changed = apply_local_tracing_endpoint(config, stack) or changed
     normalized_algorithm = _normalized_algorithm_override(algorithm, setup_mode)
-    apply_gpu_defaults = _platform_requires_gpu_defaults(platform)
-    if (
-        not kb_runtime_required
-        and not normalized_algorithm
-        and not apply_gpu_defaults
-        and not changed
-    ):
-        return config_path
-
     if normalized_algorithm:
         changed = _apply_algorithm_override(config, normalized_algorithm) or changed
+    return config, changed
 
-    changed = apply_platform_gpu_defaults(config, platform) or changed
+
+def build_effective_config_bytes(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+) -> bytes:
+    """Build the effective config bytes."""
+
+    config, changed = _resolve_effective_config_document(
+        config_path,
+        algorithm,
+        setup_mode,
+    )
+    if not changed:
+        return config_path.read_bytes()
+    return yaml.dump(config, default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+def build_effective_config_document(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+    *,
+    materialize_local_runtime: bool = True,
+) -> dict[str, object]:
+    """Build an effective config in memory without publishing runtime state."""
+
+    config, _changed = _resolve_effective_config_document(
+        config_path,
+        algorithm,
+        setup_mode,
+        materialize_local_runtime=materialize_local_runtime,
+    )
+    return config
+
+
+def realize_runtime_config(
+    source_path: Path,
+    target_path: Path,
+    *,
+    algorithm: str | None = None,
+    managed_listener: bool = False,
+) -> Path:
+    """Realize one raw config at an explicit runtime-owned path.
+
+    The raw source is never changed. Runtime defaults and the CLI's algorithm
+    override are applied before a strict atomic replace of ``target_path``. A
+    managed listener is validated before publication.
+    """
+
+    if algorithm is None:
+        algorithm = os.getenv(RUNTIME_ALGORITHM_OVERRIDE_ENV, "").strip() or None
+
+    effective = build_effective_config_bytes(
+        source_path,
+        algorithm=algorithm,
+        setup_mode=is_setup_mode_config(source_path),
+    )
+    if managed_listener:
+        prepared = UserConfig.model_validate(yaml.safe_load(effective), extra="allow")
+        resolve_managed_management_listener(prepared, resolve_runtime_stack())
+    return write_runtime_config_bytes(target_path, effective)
+
+
+def resolve_effective_config_path(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+    *,
+    materialize_local_runtime: bool = True,
+) -> Path:
+    """Apply target-appropriate runtime config transformations."""
+
+    config, changed = _resolve_effective_config_document(
+        config_path,
+        algorithm,
+        setup_mode,
+        materialize_local_runtime=materialize_local_runtime,
+    )
     return _finalize_runtime_config_write(
         config_path,
         config,
-        changed or kb_runtime_required,
+        changed,
     )
 
 
-def sync_runtime_config(
-    config_path: Path, algorithm: str | None = None, platform: str | None = None
-) -> Path:
+def sync_runtime_config(config_path: Path, algorithm: str | None = None) -> Path:
     """Regenerate the internal runtime config from the user-facing source config."""
     return resolve_effective_config_path(
         config_path=config_path,
         algorithm=algorithm,
         setup_mode=is_setup_mode_config(config_path),
-        platform=platform,
     )
 
 
@@ -225,15 +494,10 @@ def configure_runtime_override_env_vars(
     source_config_path: Path,
     effective_config_path: Path,
 ) -> None:
-    """Expose the runtime-only config path to the container when overrides exist."""
-    env_vars[SOURCE_CONFIG_PATH_ENV] = _container_source_config_path()
-
-    if source_config_path.resolve() != effective_config_path.resolve() or env_vars.get(
-        RUNTIME_ALGORITHM_OVERRIDE_ENV
-    ):
-        env_vars[RUNTIME_CONFIG_PATH_ENV] = _container_runtime_config_path(
-            source_config_path
-        )
-        return
-
-    env_vars.pop(RUNTIME_CONFIG_PATH_ENV, None)
+    """Expose source and runtime-owned config paths inside local containers."""
+    container_runtime_path = _container_runtime_config_path(source_config_path)
+    # This env is the Router/Dashboard persistence source, not a provenance
+    # hint. Keep mutations on the runtime-owned active file; the original
+    # source is separately mounted read-only for inspection.
+    env_vars[SOURCE_CONFIG_PATH_ENV] = container_runtime_path
+    env_vars[RUNTIME_CONFIG_PATH_ENV] = container_runtime_path

@@ -28,16 +28,18 @@ const postgresInsertQueryTemplate = `
 			original_model, selected_model, reasoning_mode,
 			signals, projections, projection_scores, signal_confidences, signal_values, tool_trace, projection_trace, session_policy, route_diagnostics, learning, outcomes,
 			request_body, response_body, response_status,
+			lifecycle_state, ended_at, duration_ms, terminal_reason,
 			from_cache, streaming, request_body_truncated, response_body_truncated,
 			guardrails_enabled, jailbreak_enabled, pii_enabled,
 			prompt, prompt_truncated, tool_definitions, tool_definitions_truncated,
 			rag_enabled, rag_backend, rag_context_length, rag_similarity_score,
 			hallucination_enabled, hallucination_detected, hallucination_confidence, hallucination_spans,
-			prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens,
+			prompt_tokens, cached_prompt_tokens, cache_write_tokens, completion_tokens, total_tokens,
 			actual_cost, baseline_cost, cost_savings, currency, baseline_model,
 			session_id, turn_index, previous_response_id, conversation_id,
-			cache_similarity, context_token_count
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58)
+			cache_similarity, context_token_count, hallucination_span_details, recipe, safety_evidence, routing_metadata, provider_cache,
+			prompt_original_bytes, prompt_original_sha256
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70)
 	`
 
 const postgresCreateTableQueryTemplate = `
@@ -45,6 +47,9 @@ const postgresCreateTableQueryTemplate = `
 			id VARCHAR(255) PRIMARY KEY,
 			timestamp TIMESTAMP NOT NULL,
 			request_id VARCHAR(255),
+			recipe TEXT,
+ safety_evidence JSONB,
+			routing_metadata JSONB,
 			decision VARCHAR(255),
 			decision_tier INTEGER DEFAULT 0,
 			decision_priority INTEGER DEFAULT 0,
@@ -66,6 +71,10 @@ const postgresCreateTableQueryTemplate = `
 			request_body TEXT,
 			response_body TEXT,
 			response_status INTEGER,
+			lifecycle_state VARCHAR(32) NOT NULL DEFAULT 'unknown',
+			ended_at TIMESTAMP,
+			duration_ms BIGINT DEFAULT 0,
+			terminal_reason TEXT,
 			from_cache BOOLEAN DEFAULT FALSE,
 			streaming BOOLEAN DEFAULT FALSE,
 			request_body_truncated BOOLEAN DEFAULT FALSE,
@@ -87,8 +96,12 @@ const postgresCreateTableQueryTemplate = `
 			hallucination_spans JSONB,
 			prompt_tokens INTEGER,
 			cached_prompt_tokens INTEGER,
+			cache_write_tokens INTEGER,
 			completion_tokens INTEGER,
 			total_tokens INTEGER,
+			provider_cache JSONB,
+			prompt_original_bytes INTEGER DEFAULT 0,
+			prompt_original_sha256 TEXT DEFAULT '',
 			actual_cost DOUBLE PRECISION,
 			baseline_cost DOUBLE PRECISION,
 			cost_savings DOUBLE PRECISION,
@@ -96,6 +109,13 @@ const postgresCreateTableQueryTemplate = `
 			baseline_model VARCHAR(255),
 			created_at TIMESTAMP DEFAULT NOW()
 		);
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS recipe TEXT;
+ ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS safety_evidence JSONB;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS routing_metadata JSONB;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS provider_cache JSONB;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS prompt_original_bytes INTEGER DEFAULT 0;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS prompt_original_sha256 TEXT DEFAULT '';
+		ALTER TABLE {{table}} ALTER COLUMN recipe TYPE TEXT;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS decision_tier INTEGER DEFAULT 0;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS decision_priority INTEGER DEFAULT 0;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS projections JSONB;
@@ -108,12 +128,17 @@ const postgresCreateTableQueryTemplate = `
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS route_diagnostics JSONB;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS learning JSONB;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS outcomes JSONB;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS lifecycle_state VARCHAR(32) NOT NULL DEFAULT 'unknown';
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS duration_ms BIGINT DEFAULT 0;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS terminal_reason TEXT;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS prompt TEXT;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS prompt_truncated BOOLEAN DEFAULT FALSE;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS tool_definitions TEXT;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS tool_definitions_truncated BOOLEAN DEFAULT FALSE;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS cached_prompt_tokens INTEGER;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS cache_write_tokens INTEGER;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS total_tokens INTEGER;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS actual_cost DOUBLE PRECISION;
@@ -127,6 +152,8 @@ const postgresCreateTableQueryTemplate = `
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(255);
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS cache_similarity REAL DEFAULT 0;
 		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS context_token_count INTEGER DEFAULT 0;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS hallucination_span_details JSONB;
+		ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS recipe VARCHAR(255);
 		CREATE INDEX IF NOT EXISTS idx_{{table}}_timestamp ON {{table}} (timestamp DESC);
 		CREATE INDEX IF NOT EXISTS idx_{{table}}_created_at ON {{table}} (created_at);
 		CREATE INDEX IF NOT EXISTS idx_{{table}}_request_id ON {{table}} (request_id);
@@ -143,6 +170,8 @@ type PostgresStore struct {
 	asyncWrites bool
 	asyncChan   chan asyncOp
 	done        chan struct{}
+	writerDone  chan struct{}
+	lifecycle   *storageLifecycle
 }
 
 // NewPostgresStore creates a new PostgreSQL storage backend.
@@ -175,6 +204,7 @@ func newPostgresStoreWithDB(db *sql.DB, tableName string, ttlSeconds int, asyncW
 		ttl:         time.Duration(ttlSeconds) * time.Second,
 		asyncWrites: asyncWrites,
 		done:        make(chan struct{}),
+		lifecycle:   newStorageLifecycle(),
 	}
 }
 
@@ -183,6 +213,7 @@ func startPostgresAsyncWriter(store *PostgresStore) {
 		return
 	}
 	store.asyncChan = make(chan asyncOp, 100)
+	store.writerDone = make(chan struct{})
 	go store.asyncWriter()
 }
 
@@ -199,6 +230,7 @@ func postgresCreateTableQuery(tableName string) string {
 
 // asyncWriter processes async write operations.
 func (p *PostgresStore) asyncWriter() {
+	defer close(p.writerDone)
 	for {
 		select {
 		case op := <-p.asyncChan:
@@ -214,6 +246,11 @@ func (p *PostgresStore) asyncWriter() {
 
 // Add inserts a new record into PostgreSQL.
 func (p *PostgresStore) Add(ctx context.Context, record Record) (string, error) {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	insertRecord, err := newPostgresInsertRecord(record)
 	if err != nil {
 		return "", err
@@ -228,8 +265,10 @@ func (p *PostgresStore) Add(ctx context.Context, record Record) (string, error) 
 	}
 
 	if p.asyncWrites {
-		errChan := make(chan error, 1)
-		p.asyncChan <- asyncOp{fn: fn, err: errChan}
+		if err := runAsyncOp(ctx, p.asyncChan, fn); err != nil {
+			return "", fmt.Errorf("failed to insert record: %w", err)
+		}
+		p.schedulePostgresCleanup()
 		return insertRecord.record.ID, nil
 	}
 
@@ -243,6 +282,15 @@ func (p *PostgresStore) Add(ctx context.Context, record Record) (string, error) 
 
 // Get retrieves a record by ID from PostgreSQL.
 func (p *PostgresStore) Get(ctx context.Context, id string) (Record, bool, error) {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer release()
+	return p.getRecord(ctx, id)
+}
+
+func (p *PostgresStore) getRecord(ctx context.Context, id string) (Record, bool, error) {
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		SELECT %s
@@ -261,6 +309,15 @@ func (p *PostgresStore) Get(ctx context.Context, id string) (Record, bool, error
 
 // List returns all records ordered by timestamp descending.
 func (p *PostgresStore) List(ctx context.Context) ([]Record, error) {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return p.listRecords(ctx)
+}
+
+func (p *PostgresStore) listRecords(ctx context.Context) ([]Record, error) {
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		SELECT %s
@@ -278,6 +335,11 @@ func (p *PostgresStore) List(ctx context.Context) ([]Record, error) {
 
 // UpdateStatus updates the response status and flags for a record.
 func (p *PostgresStore) UpdateStatus(ctx context.Context, id string, status int, fromCache bool, streaming bool) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		UPDATE %s
@@ -305,15 +367,62 @@ func (p *PostgresStore) UpdateStatus(ctx context.Context, id string, status int,
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
 }
 
+func (p *PostgresStore) UpdateLifecycle(
+	ctx context.Context,
+	id string,
+	state string,
+	endedAt time.Time,
+	durationMS int64,
+	reason string,
+) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	reason = sanitizePostgresText(reason)
+	//nolint:gosec // tableName is validated during store creation
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET lifecycle_state = $2,
+		    ended_at = $3,
+		    duration_ms = $4,
+		    terminal_reason = $5
+		WHERE id = $1
+		  AND lifecycle_state = $6
+	`, p.tableName)
+	fn := func() error {
+		result, err := p.db.ExecContext(ctx, query, id, state, endedAt, durationMS, reason, LifecycleInProgress)
+		if err != nil {
+			return fmt.Errorf("failed to update replay lifecycle: %w", err)
+		}
+		if _, err := result.RowsAffected(); err != nil {
+			return err
+		}
+		// Zero rows means another terminal transition already won. Lifecycle
+		// updates are compare-and-set and therefore idempotent.
+		return nil
+	}
+	if p.asyncWrites {
+		return p.runAsyncAndWait(ctx, fn)
+	}
+	return fn()
+}
+
 // AttachRequest updates the request body for a record.
 func (p *PostgresStore) AttachRequest(ctx context.Context, id string, body string, truncated bool) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	body = sanitizePostgresText(body)
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		UPDATE %s
@@ -340,8 +449,7 @@ func (p *PostgresStore) AttachRequest(ctx context.Context, id string, body strin
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
@@ -349,6 +457,12 @@ func (p *PostgresStore) AttachRequest(ctx context.Context, id string, body strin
 
 // AttachResponse updates the response body for a record.
 func (p *PostgresStore) AttachResponse(ctx context.Context, id string, body string, truncated bool) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	body = sanitizePostgresText(body)
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		UPDATE %s
@@ -375,8 +489,49 @@ func (p *PostgresStore) AttachResponse(ctx context.Context, id string, body stri
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
+		return p.runAsyncAndWait(ctx, fn)
+	}
+
+	return fn()
+}
+
+// AttachPrompt stores the prompt of a record written without it.
+func (p *PostgresStore) AttachPrompt(ctx context.Context, id string, prompt StoredPrompt) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	text := sanitizePostgresText(prompt.Text)
+	//nolint:gosec // tableName is validated during store creation
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET prompt = $2,
+		    prompt_truncated = $3,
+		    prompt_original_bytes = $4,
+		    prompt_original_sha256 = $5
+		WHERE id = $1
+	`, p.tableName)
+
+	fn := func() error {
+		result, err := p.db.ExecContext(ctx, query, id, text, prompt.Truncated, prompt.OriginalBytes, prompt.OriginalSHA256)
+		if err != nil {
+			return fmt.Errorf("failed to update prompt: %w", err)
+		}
+
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return fmt.Errorf("record with ID %s not found", id)
+		}
+
 		return nil
+	}
+
+	if p.asyncWrites {
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
@@ -384,7 +539,12 @@ func (p *PostgresStore) AttachResponse(ctx context.Context, id string, body stri
 
 // AppendOutcome links post-route feedback to a replay record.
 func (p *PostgresStore) AppendOutcome(ctx context.Context, id string, outcome Outcome) error {
-	outcomeJSON, err := json.Marshal([]Outcome{cloneOutcome(outcome)})
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	outcomeJSON, err := postgresOutcomeJSON(outcome)
 	if err != nil {
 		return fmt.Errorf("failed to marshal outcome: %w", err)
 	}
@@ -414,18 +574,31 @@ func (p *PostgresStore) AppendOutcome(ctx context.Context, id string, outcome Ou
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
 }
 
 // UpdateHallucinationStatus updates hallucination detection results for a record.
-func (p *PostgresStore) UpdateHallucinationStatus(ctx context.Context, id string, detected bool, confidence float32, spans []string) error {
-	spansJSON, err := json.Marshal(spans)
+func (p *PostgresStore) UpdateHallucinationStatus(ctx context.Context, id string, detected bool, confidence float32, spans []string, spanDetails []HallucinationSpan, score ...HallucinationScore) error {
+	release, err := p.lifecycle.beginMutation()
 	if err != nil {
-		return fmt.Errorf("failed to marshal hallucination spans: %w", err)
+		return err
+	}
+	defer release()
+	spansJSON, spanDetailsJSON, err := postgresHallucinationJSON(spans, spanDetails)
+	if err != nil {
+		return err
+	}
+
+	availability := HallucinationScore{}
+	if len(score) > 0 {
+		availability = score[0]
+	}
+	scoreJSON, err := json.Marshal(map[string]interface{}{"hallucination_score_available": availability.Available, "hallucination_score_kind": availability.Kind})
+	if err != nil {
+		return err
 	}
 
 	//nolint:gosec // tableName is validated during store creation
@@ -433,12 +606,14 @@ func (p *PostgresStore) UpdateHallucinationStatus(ctx context.Context, id string
 		UPDATE %s
 		SET hallucination_detected = $2,
 		    hallucination_confidence = $3,
-		    hallucination_spans = $4
+		    hallucination_spans = $4,
+		    hallucination_span_details = $5,
+ safety_evidence = COALESCE(safety_evidence, '{}'::jsonb) || $6::jsonb
 		WHERE id = $1
 	`, p.tableName)
 
 	fn := func() error {
-		result, err := p.db.ExecContext(ctx, query, id, detected, confidence, spansJSON)
+		result, err := p.db.ExecContext(ctx, query, id, detected, confidence, spansJSON, spanDetailsJSON, scoreJSON)
 		if err != nil {
 			return fmt.Errorf("failed to update hallucination status: %w", err)
 		}
@@ -455,8 +630,7 @@ func (p *PostgresStore) UpdateHallucinationStatus(ctx context.Context, id string
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
@@ -464,18 +638,29 @@ func (p *PostgresStore) UpdateHallucinationStatus(ctx context.Context, id string
 
 // UpdateUsageCost updates token usage and pricing-derived cost fields for a record.
 func (p *PostgresStore) UpdateUsageCost(ctx context.Context, id string, usage UsageCost) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	providerCacheJSON, err := json.Marshal(usage.ProviderCache)
+	if err != nil {
+		return fmt.Errorf("marshal provider cache accounting: %w", err)
+	}
 	//nolint:gosec // tableName is validated during store creation
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET prompt_tokens = $2,
 		    cached_prompt_tokens = $3,
-		    completion_tokens = $4,
-		    total_tokens = $5,
-		    actual_cost = $6,
-		    baseline_cost = $7,
-		    cost_savings = $8,
-		    currency = $9,
-		    baseline_model = $10
+		    cache_write_tokens = $4,
+		    completion_tokens = $5,
+		    total_tokens = $6,
+		    actual_cost = $7,
+		    baseline_cost = $8,
+		    cost_savings = $9,
+		    currency = $10,
+		    baseline_model = $11,
+		    provider_cache = $12
 		WHERE id = $1
 	`, p.tableName)
 
@@ -486,6 +671,7 @@ func (p *PostgresStore) UpdateUsageCost(ctx context.Context, id string, usage Us
 			id,
 			nullableIntArg(usage.PromptTokens),
 			nullableIntArg(usage.CachedPromptTokens),
+			nullableIntArg(usage.CacheWriteTokens),
 			nullableIntArg(usage.CompletionTokens),
 			nullableIntArg(usage.TotalTokens),
 			nullableFloat64Arg(usage.ActualCost),
@@ -493,6 +679,7 @@ func (p *PostgresStore) UpdateUsageCost(ctx context.Context, id string, usage Us
 			nullableFloat64Arg(usage.CostSavings),
 			nullableStringArg(usage.Currency),
 			nullableStringArg(usage.BaselineModel),
+			providerCacheJSON,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to update usage cost: %w", err)
@@ -510,8 +697,7 @@ func (p *PostgresStore) UpdateUsageCost(ctx context.Context, id string, usage Us
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
@@ -519,7 +705,12 @@ func (p *PostgresStore) UpdateUsageCost(ctx context.Context, id string, usage Us
 
 // UpdateToolTrace updates tool-calling trace details for a record.
 func (p *PostgresStore) UpdateToolTrace(ctx context.Context, id string, trace ToolTrace) error {
-	traceJSON, err := marshalReplayOptionalJSON(&trace)
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	traceJSON, err := postgresToolTraceJSON(trace)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tool trace: %w", err)
 	}
@@ -549,8 +740,7 @@ func (p *PostgresStore) UpdateToolTrace(ctx context.Context, id string, trace To
 	}
 
 	if p.asyncWrites {
-		p.asyncChan <- asyncOp{fn: fn}
-		return nil
+		return p.runAsyncAndWait(ctx, fn)
 	}
 
 	return fn()
@@ -574,10 +764,16 @@ func (p *PostgresStore) cleanupOldRecords(ctx context.Context) error {
 
 // Close closes the PostgreSQL connection and stops async writer.
 func (p *PostgresStore) Close() error {
-	if p.asyncWrites {
-		close(p.done)
-	}
-	return p.db.Close()
+	return p.lifecycle.close(func() error {
+		if p.asyncWrites {
+			return closeAsyncWriter(p.asyncChan, p.done, p.writerDone, p.db.Close)
+		}
+		return p.db.Close()
+	})
+}
+
+func (p *PostgresStore) runAsyncAndWait(ctx context.Context, fn func() error) error {
+	return runAsyncOp(ctx, p.asyncChan, fn)
 }
 
 func (p *PostgresStore) schedulePostgresCleanup() {
@@ -585,6 +781,13 @@ func (p *PostgresStore) schedulePostgresCleanup() {
 		return
 	}
 	go func() {
-		_ = p.cleanupOldRecords(context.Background())
+		release, err := p.lifecycle.beginMutation()
+		if err != nil {
+			return
+		}
+		defer release()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.cleanupOldRecords(ctx)
 	}()
 }

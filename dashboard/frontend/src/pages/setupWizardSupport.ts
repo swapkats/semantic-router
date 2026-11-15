@@ -1,9 +1,25 @@
+import {
+  DEFAULT_SETUP_PROVIDER_ID,
+  DEFAULT_SETUP_RUNTIME_BASE_URL,
+  getSetupProviderOption,
+  isSetupRuntimeProvider,
+  type ProviderKind,
+} from "./setupWizardProviderCatalog";
+
 export type SetupStep = 0 | 1 | 2;
-export type ProviderKind = "vllm" | "openai-compatible" | "anthropic";
+export type { ProviderKind } from "./setupWizardProviderCatalog";
 export type SetupValidationState = "idle" | "validating" | "valid" | "error";
-export type SetupActivationState = "idle" | "activating" | "error";
+export type SetupActivationState = "idle" | "activating" | "persisted" | "error";
 export type SetupRoutingMode = "scratch" | "remote" | "preset";
 export type RemoteImportState = "idle" | "importing" | "imported" | "error";
+export type PresetCatalogState = "loading" | "ready" | "error";
+export type PresetRequestState =
+  | "idle"
+  | "loading"
+  | "ready"
+  | "importing"
+  | "imported"
+  | "error";
 
 export interface ModelDraft {
   id: string;
@@ -19,26 +35,39 @@ export interface ModelDraftFieldErrors {
   baseUrl?: string;
 }
 
+export interface RemovedModelSnapshot {
+  model: ModelDraft;
+  index: number;
+  wasDefault: boolean;
+}
+
+export interface SetupModelPage {
+  items: ModelDraft[];
+  page: number;
+  pageCount: number;
+  total: number;
+  startIndex: number;
+}
+
+export interface SetupRequestGuard {
+  begin: () => number;
+  invalidate: () => void;
+  isCurrent: (generation: number) => boolean;
+}
+
 interface BuiltModel {
   name: string;
   provider_model_id: string;
   backend_refs: Array<{
     name: string;
     weight: number;
-    endpoint?: string;
+    /** host:port for a local runtime, or the provider's full URL. */
+    endpoint: string;
     protocol: "http" | "https";
-    base_url?: string;
-    provider?: "openai" | "anthropic";
+    provider: ProviderKind;
     api_key?: string;
   }>;
-  api_format?: "anthropic";
-}
-
-export interface ProviderOption {
-  id: ProviderKind;
-  label: string;
-  description: string;
-  placeholder: string;
+  api_format?: "responses" | "messages";
 }
 
 export interface SetupConfigCounts {
@@ -54,30 +83,6 @@ export interface ImportedSetupConfig {
   counts: SetupConfigCounts;
 }
 
-export const PROVIDER_OPTIONS: ProviderOption[] = [
-  {
-    id: "vllm",
-    label: "Local vLLM",
-    description:
-      "Best for first-run with a local or self-hosted OpenAI-compatible endpoint.",
-    placeholder: "vllm:8000",
-  },
-  {
-    id: "openai-compatible",
-    label: "OpenAI-compatible API",
-    description:
-      "Works for hosted endpoints that expose the OpenAI chat/completions surface.",
-    placeholder: "https://api.openai.com",
-  },
-  {
-    id: "anthropic",
-    label: "Anthropic Messages API",
-    description:
-      "Uses Anthropic-compatible request translation inside the router.",
-    placeholder: "https://api.anthropic.com",
-  },
-];
-
 export const SETUP_STEP_LABELS: ReadonlyArray<[string, string]> = [
   ["1", "Connect model"],
   ["2", "Choose routing"],
@@ -85,10 +90,107 @@ export const SETUP_STEP_LABELS: ReadonlyArray<[string, string]> = [
 ];
 
 export const DEFAULT_REMOTE_SETUP_CONFIG_URL =
-  "https://raw.githubusercontent.com/vllm-project/semantic-router/main/deploy/recipes/balance.yaml";
+  "https://raw.githubusercontent.com/vllm-project/semantic-router/main/config/recipes/balance/config.yaml";
 
 const DEFAULT_MODEL_NAME = "qwen/qwen3.5-rocm";
-const DEFAULT_VLLM_BASE_URL = "vllm:8000";
+export const SETUP_MODELS_PER_PAGE = 4;
+
+export function createSetupRequestGuard(): SetupRequestGuard {
+  let currentGeneration = 0;
+  return {
+    begin: () => {
+      currentGeneration += 1;
+      return currentGeneration;
+    },
+    invalidate: () => {
+      currentGeneration += 1;
+    },
+    isCurrent: (generation) => generation === currentGeneration,
+  };
+}
+
+export function filterSetupModels(
+  models: ModelDraft[],
+  rawQuery: string,
+): ModelDraft[] {
+  const query = rawQuery.trim().toLowerCase();
+  if (!query) {
+    return models;
+  }
+
+  return models.filter((model) =>
+    [
+      model.name,
+      model.baseUrl,
+      model.endpointName,
+      model.providerKind,
+    ].some((value) => value.toLowerCase().includes(query)),
+  );
+}
+
+export function paginateSetupModels(
+  models: ModelDraft[],
+  requestedPage: number,
+  pageSize = SETUP_MODELS_PER_PAGE,
+): SetupModelPage {
+  const safePageSize = Math.max(1, Math.floor(pageSize));
+  const pageCount = Math.max(1, Math.ceil(models.length / safePageSize));
+  const page = Math.min(Math.max(1, Math.floor(requestedPage)), pageCount);
+  const startIndex = (page - 1) * safePageSize;
+
+  return {
+    items: models.slice(startIndex, startIndex + safePageSize),
+    page,
+    pageCount,
+    total: models.length,
+    startIndex,
+  };
+}
+
+export function removeSetupModel(
+  models: ModelDraft[],
+  modelId: string,
+  defaultModelId: string,
+): {
+  models: ModelDraft[];
+  defaultModelId: string;
+  removed: RemovedModelSnapshot | null;
+} {
+  const index = models.findIndex((model) => model.id === modelId);
+  if (index < 0 || models.length <= 1) {
+    return { models, defaultModelId, removed: null };
+  }
+
+  const model = models[index];
+  const nextModels = models.filter((candidate) => candidate.id !== modelId);
+  const wasDefault = defaultModelId === modelId;
+  return {
+    models: nextModels,
+    defaultModelId: wasDefault ? (nextModels[0]?.id ?? "") : defaultModelId,
+    removed: { model, index, wasDefault },
+  };
+}
+
+export function restoreSetupModel(
+  models: ModelDraft[],
+  removed: RemovedModelSnapshot,
+  defaultModelId: string,
+): { models: ModelDraft[]; defaultModelId: string } {
+  if (models.some((model) => model.id === removed.model.id)) {
+    return { models, defaultModelId };
+  }
+
+  const restoredModels = [...models];
+  restoredModels.splice(
+    Math.min(Math.max(0, removed.index), restoredModels.length),
+    0,
+    removed.model,
+  );
+  return {
+    models: restoredModels,
+    defaultModelId: removed.wasDefault ? removed.model.id : defaultModelId,
+  };
+}
 
 export function createSetupConfigCounts(
   overrides: Partial<SetupConfigCounts> = {},
@@ -109,23 +211,44 @@ export function createModelDraft(
   return {
     id: `model-${Date.now()}-${seed}`,
     name: existingModels.length === 0 ? DEFAULT_MODEL_NAME : "",
-    providerKind: "vllm",
-    baseUrl: nextVllmBaseUrl(existingModels),
+    providerKind: DEFAULT_SETUP_PROVIDER_ID,
+    baseUrl: nextRuntimeBaseUrl(existingModels),
     accessKey: "",
     endpointName: "primary",
   };
 }
 
-function nextVllmBaseUrl(existingModels: ModelDraft[]): string {
+export function switchSetupModelProvider(
+  model: ModelDraft,
+  providerKind: ProviderKind,
+): ModelDraft {
+  const previousDefault = getSetupProviderOption(model.providerKind).initialBaseUrl;
+  const nextDefault = getSetupProviderOption(providerKind).initialBaseUrl;
+  const baseUrl = model.baseUrl.trim();
+  const generatedVllmEndpoint = model.providerKind === "vllm" && /^vllm:\d+$/.test(baseUrl);
+  return {
+    ...model,
+    providerKind,
+    baseUrl: !baseUrl || baseUrl === previousDefault || generatedVllmEndpoint
+      ? nextDefault
+      : model.baseUrl,
+  };
+}
+
+function nextRuntimeBaseUrl(existingModels: ModelDraft[]): string {
   const usedEndpoints = new Set(
     existingModels
-      .map((model) => normalizeVllmEndpoint(model))
+      .map((model) => normalizeRuntimeEndpoint(model))
       .filter((endpoint): endpoint is string => Boolean(endpoint)),
   );
 
   let port = 8000;
-  let candidate = DEFAULT_VLLM_BASE_URL;
-  while (usedEndpoints.has(normalizeBaseUrl(candidate, "vllm") ?? "")) {
+  let candidate = DEFAULT_SETUP_RUNTIME_BASE_URL;
+  while (
+    usedEndpoints.has(
+      normalizeBaseUrl(candidate, DEFAULT_SETUP_PROVIDER_ID) ?? "",
+    )
+  ) {
     port += 1;
     candidate = `vllm:${port}`;
   }
@@ -137,10 +260,10 @@ function normalizeModelName(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function normalizeVllmEndpoint(
+function normalizeRuntimeEndpoint(
   model: Pick<ModelDraft, "baseUrl" | "providerKind">,
 ): string | null {
-  if (model.providerKind !== "vllm") {
+  if (!isSetupRuntimeProvider(model.providerKind)) {
     return null;
   }
 
@@ -170,10 +293,6 @@ function inferProtocol(
   endpoint: string,
   providerKind: ProviderKind,
 ): "http" | "https" {
-  if (providerKind === "anthropic") {
-    return "https";
-  }
-
   if (
     endpoint.startsWith("localhost") ||
     endpoint.startsWith("127.0.0.1") ||
@@ -184,6 +303,10 @@ function inferProtocol(
   }
 
   if (endpoint.includes(":80")) {
+    return "http";
+  }
+
+  if (getSetupProviderOption(providerKind).initialBaseUrl.startsWith("http://")) {
     return "http";
   }
 
@@ -267,7 +390,7 @@ export function getModelDraftFieldErrors(
       return;
     }
 
-    if (model.providerKind !== "vllm") {
+    if (!isSetupRuntimeProvider(model.providerKind)) {
       return;
     }
 
@@ -341,7 +464,7 @@ export function getStepOneErrors(
           model.baseUrl,
           model.providerKind,
         ).endpoint;
-        if (model.providerKind === "vllm") {
+        if (isSetupRuntimeProvider(model.providerKind)) {
           const endpointKey = parsedEndpoint.toLowerCase();
           if (localEndpoints.has(endpointKey)) {
             errors.push(
@@ -388,6 +511,42 @@ export function countConfigSignals(rawSignals: unknown): number {
   );
 }
 
+export function summarizeSetupConfig(
+  config: Record<string, unknown> | null,
+): SetupConfigCounts {
+  if (!config) {
+    return createSetupConfigCounts();
+  }
+
+  const providers =
+    config.providers && typeof config.providers === "object"
+      ? (config.providers as Record<string, unknown>)
+      : {};
+  const recipes = Array.isArray(config.recipes)
+    ? config.recipes.filter(
+        (recipe): recipe is Record<string, unknown> =>
+          Boolean(recipe) && typeof recipe === "object" && !Array.isArray(recipe),
+      )
+    : [];
+  const models = Array.isArray(providers.models) ? providers.models.length : 0;
+  const decisions = recipes.reduce(
+    (total, recipe) =>
+      total + (Array.isArray(recipe.decisions) ? recipe.decisions.length : 0),
+    0,
+  );
+  const signals = recipes.reduce(
+    (total, recipe) => total + countConfigSignals(recipe.signals),
+    0,
+  );
+
+  return createSetupConfigCounts({
+    models,
+    decisions,
+    signals,
+    canActivate: models > 0 && decisions > 0,
+  });
+}
+
 export function buildSetupConfig(
   models: ModelDraft[],
   defaultModelId: string,
@@ -402,30 +561,34 @@ export function buildSetupConfig(
       `${slugify(model.name) || `model-${index + 1}`}-primary`;
     const apiKey = model.accessKey.trim() || undefined;
     const trimmedBaseUrl = model.baseUrl.trim().replace(/\/$/, "");
-    const backendRef: BuiltModel["backend_refs"][number] =
-      model.providerKind === "vllm"
-        ? {
-            name: endpointName,
-            weight: 100,
-            endpoint,
-            protocol,
-            api_key: apiKey,
-          }
-        : {
-            name: endpointName,
-            weight: 100,
-            protocol,
-            base_url: trimmedBaseUrl,
-            provider:
-              model.providerKind === "anthropic" ? "anthropic" : "openai",
-            api_key: apiKey,
-          };
+    const provider = getSetupProviderOption(model.providerKind);
+    const backendRef: BuiltModel["backend_refs"][number] = isSetupRuntimeProvider(
+      model.providerKind,
+    )
+      ? {
+          name: endpointName,
+          weight: 100,
+          endpoint,
+          protocol,
+          provider: model.providerKind,
+          api_key: apiKey,
+        }
+      : {
+          name: endpointName,
+          weight: 100,
+          protocol,
+          endpoint: trimmedBaseUrl,
+          provider: model.providerKind,
+          api_key: apiKey,
+        };
 
     return {
       name: model.name.trim(),
       provider_model_id: model.name.trim(),
       backend_refs: [backendRef],
-      api_format: model.providerKind === "anthropic" ? "anthropic" : undefined,
+      ...(provider.apiFormat === "chat_completions"
+        ? {}
+        : { api_format: provider.apiFormat }),
     };
   });
 
@@ -459,16 +622,15 @@ export function buildSetupConfig(
     providers: {
       models: builtModels,
       defaults: {
-        default_model: defaultModel.name,
+        model: defaultModel.name,
       },
     },
-    routing: {
-      modelCards: builtModels.map((model) => ({
-        name: model.name,
-        modality: "text",
-      })),
-      decisions: [catchAllDecision],
-    },
+    recipes: [
+      {
+        name: "default",
+        decisions: [catchAllDecision],
+      },
+    ],
   };
 
   return config;

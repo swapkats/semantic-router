@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"sync"
 	"time"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelpricing"
 )
 
 const routerMemoryTTL = 24 * time.Hour
@@ -23,16 +26,31 @@ type RouterSessionSnapshot struct {
 	SessionID string
 	UserID    string
 
-	CurrentModel string
-	LastSeen     time.Time
-	IdleFor      time.Duration
+	CurrentModel     string
+	CurrentCandidate *config.ModelRef `json:"current_candidate,omitempty"`
+	LastSeen         time.Time
+	IdleFor          time.Duration
+	// LastSwitchAt is the time of the most recent model change; zero when the
+	// session has never switched.
+	LastSwitchAt time.Time `json:"last_switch_at,omitempty"`
+	// SwitchTimestamps are the recent model-change times in unix millis,
+	// pruned by the session's evidence-window TTL. The gate counts switches
+	// inside its configured window from these.
+	SwitchTimestamps        []int64 `json:"switch_timestamps,omitempty"`
+	OutcomeWindowSize       int     `json:"outcome_window_size,omitempty"`
+	OutcomeWindowTTLSeconds int     `json:"outcome_window_ttl_seconds,omitempty"`
 
 	TurnCount   int
 	SwitchCount int
 	ModelTurns  map[string]int
+	// UserTurnCount counts committed requests outside a tool loop, so it moves
+	// with user input rather than with tool hops or client-side history edits.
+	UserTurnCount       int `json:"user_turn_count,omitempty"`
+	LastReleaseUserTurn int `json:"last_release_user_turn,omitempty"`
 
 	CumulativePromptTokens          int64
 	CumulativeCachedTokens          int64
+	CumulativeCacheWriteTokens      int64
 	CumulativeEstimatedCachedTokens int64
 	CumulativeCompletionTokens      int64
 	CumulativeCost                  float64
@@ -43,20 +61,25 @@ type RouterSessionSnapshot struct {
 	LastDecisionReason        string
 	LastCacheAccountingSource string
 	LastPolicy                map[string]interface{}
+
+	RecentOutcomes []TurnOutcome `json:"recent_outcomes,omitempty"`
 }
 
 // SessionDecisionParams records the pre-dispatch policy result for one session
 // turn. Usage and response-side costs are attached later by RecordSessionUsage.
 type SessionDecisionParams struct {
-	SessionID      string
-	UserID         string
-	PreviousModel  string
-	SelectedModel  string
-	DecisionName   string
-	TurnIndex      int
-	ActiveToolLoop bool
-	Policy         map[string]interface{}
-	Timestamp      time.Time
+	SessionID         string
+	UserID            string
+	PreviousModel     string
+	SelectedModel     string
+	SelectedCandidate *config.ModelRef
+	DecisionName      string
+	TurnIndex         int
+	ActiveToolLoop    bool
+	UserTurn          bool
+	Released          bool
+	Policy            map[string]interface{}
+	Timestamp         time.Time
 }
 
 // SessionUsageParams records response-side usage into router-owned session
@@ -66,6 +89,9 @@ type SessionUsageParams struct {
 	Model                       string
 	PromptTokens                int
 	CachedPromptTokens          int
+	CacheWriteTokens            int
+	CacheWrite5mTokens          int
+	CacheWrite1hTokens          int
 	EstimatedCachedPromptTokens int
 	CompletionTokens            int
 	Cost                        float64
@@ -78,15 +104,24 @@ type routerSessionState struct {
 	sessionID string
 	userID    string
 
-	currentModel string
-	lastSeen     time.Time
+	currentModel     string
+	currentCandidate *config.ModelRef
+	lastSeen         time.Time
+	lastSwitchAt     time.Time
+	// switchTimestamps mirrors LastSwitchAt as a bounded series for the
+	// oscillation guard's window-scoped count.
+	switchTimestamps []int64
 
 	turnCount   int
 	switchCount int
 	modelTurns  map[string]int
 
+	userTurnCount       int
+	lastReleaseUserTurn int
+
 	cumulativePrompt                int64
 	cumulativeCached                int64
+	cumulativeCacheWrite            int64
 	cumulativeEstimatedCached       int64
 	cumulativeCompletion            int64
 	cumulativeCost                  float64
@@ -97,17 +132,34 @@ type routerSessionState struct {
 	lastDecisionReason        string
 	lastCacheAccountingSource string
 	lastPolicy                map[string]interface{}
+
+	recentOutcomes    []TurnOutcome
+	outcomeWindowSize int
+	outcomeWindowTTL  time.Duration
 }
 
 type routerSessionMemoryStore struct {
-	mu       sync.Mutex
-	sessions map[string]*routerSessionState
-	nowFn    func() time.Time
+	mu        sync.Mutex
+	sessions  map[string]*routerSessionState
+	nowFn     func() time.Time
+	lastEvict time.Time
 }
 
 var globalRouterSessionMemory = &routerSessionMemoryStore{
 	sessions: make(map[string]*routerSessionState),
 	nowFn:    time.Now,
+}
+
+func cloneSessionCandidate(ref *config.ModelRef) *config.ModelRef {
+	if ref == nil {
+		return nil
+	}
+	copy := *ref
+	if ref.UseReasoning != nil {
+		enabled := *ref.UseReasoning
+		copy.UseReasoning = &enabled
+	}
+	return &copy
 }
 
 // RecordSessionDecision updates router-owned session memory from the policy
@@ -119,6 +171,7 @@ func RecordSessionDecision(p SessionDecisionParams) {
 	RecordLastModel(p.SessionID, p.SelectedModel)
 
 	s := globalRouterSessionMemory
+	defer persistRouterSessionState(p.SessionID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -127,7 +180,7 @@ func RecordSessionDecision(p SessionDecisionParams) {
 		now = s.nowFn()
 	}
 	s.evictExpiredLocked(now)
-	st := s.sessionLocked(p.SessionID)
+	st := s.sessionLocked(p.SessionID, now)
 	if p.UserID != "" {
 		st.userID = p.UserID
 	}
@@ -137,8 +190,12 @@ func RecordSessionDecision(p SessionDecisionParams) {
 	}
 	if previous != "" && previous != p.SelectedModel {
 		st.switchCount++
+		st.lastSwitchAt = now
+		_, windowTTL := st.windowPolicy()
+		st.switchTimestamps = pruneSwitchTimestamps(append(st.switchTimestamps, now.UnixMilli()), windowTTL, now)
 	}
 	st.currentModel = p.SelectedModel
+	st.currentCandidate = cloneSessionCandidate(p.SelectedCandidate)
 	st.lastSeen = now
 	if p.TurnIndex+1 > st.turnCount {
 		st.turnCount = p.TurnIndex + 1
@@ -146,6 +203,12 @@ func RecordSessionDecision(p SessionDecisionParams) {
 		st.turnCount++
 	}
 	st.modelTurns[p.SelectedModel]++
+	if p.UserTurn {
+		st.userTurnCount++
+		if p.Released {
+			st.lastReleaseUserTurn = st.userTurnCount
+		}
+	}
 	st.activeToolLoop = p.ActiveToolLoop
 	st.lastDecisionName = p.DecisionName
 	if p.Policy != nil {
@@ -155,12 +218,15 @@ func RecordSessionDecision(p SessionDecisionParams) {
 }
 
 // RecordSessionUsage attaches response usage and cost to router-owned session
-// memory. It does not create a model checkout when no prior decision exists.
+// memory. Flows without a dispatch decision (such as Looper) retain their last
+// observed response model. Once RecordSessionDecision establishes ownership,
+// responses must not change it: they can complete out of order.
 func RecordSessionUsage(p SessionUsageParams) {
 	if p.SessionID == "" || p.Model == "" {
 		return
 	}
 	s := globalRouterSessionMemory
+	defer persistRouterSessionState(p.SessionID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -169,13 +235,24 @@ func RecordSessionUsage(p SessionUsageParams) {
 		now = s.nowFn()
 	}
 	s.evictExpiredLocked(now)
-	st := s.sessionLocked(p.SessionID)
-	st.currentModel = p.Model
+	st := s.sessionLocked(p.SessionID, now)
+	if st.turnCount == 0 {
+		st.currentModel = p.Model
+	}
 	st.lastSeen = now
-	st.cumulativePrompt += int64(p.PromptTokens)
-	st.cumulativeCached += int64(clampCachedPromptTokens(p.PromptTokens, p.CachedPromptTokens))
+	usage := modelpricing.Normalize(modelpricing.Usage{
+		PromptTokens:       p.PromptTokens,
+		CachedInputTokens:  p.CachedPromptTokens,
+		CacheWriteTokens:   p.CacheWriteTokens,
+		CacheWrite5mTokens: p.CacheWrite5mTokens,
+		CacheWrite1hTokens: p.CacheWrite1hTokens,
+		CompletionTokens:   p.CompletionTokens,
+	})
+	st.cumulativePrompt += int64(usage.PromptTokens)
+	st.cumulativeCached += int64(usage.CachedInputTokens)
+	st.cumulativeCacheWrite += int64(usage.CacheWriteTokens)
 	st.cumulativeEstimatedCached += int64(clampCachedPromptTokens(p.PromptTokens, p.EstimatedCachedPromptTokens))
-	st.cumulativeCompletion += int64(p.CompletionTokens)
+	st.cumulativeCompletion += int64(usage.CompletionTokens)
 	st.cumulativeCost += p.Cost
 	if p.EstimatedCacheSavings > 0 {
 		st.cumulativeEstimatedCacheSavings += p.EstimatedCacheSavings
@@ -187,16 +264,25 @@ func RecordSessionUsage(p SessionUsageParams) {
 
 // GetRouterSessionSnapshot returns a clone of the router-owned session memory.
 func GetRouterSessionSnapshot(sessionID string, now time.Time) (RouterSessionSnapshot, bool) {
+	return routerSessionSnapshot(sessionID, now, true)
+}
+
+// PeekRouterSessionSnapshot reads the same routing state without expiring local
+// entries or hydrating shared storage into the live session cache.
+func PeekRouterSessionSnapshot(sessionID string, now time.Time) (RouterSessionSnapshot, bool) {
+	return routerSessionSnapshot(sessionID, now, false)
+}
+
+func routerSessionSnapshot(sessionID string, now time.Time, mutate bool) (RouterSessionSnapshot, bool) {
 	if sessionID == "" {
 		return RouterSessionSnapshot{}, false
 	}
 	s := globalRouterSessionMemory
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	st := s.sessions[sessionID]
 	if st == nil {
-		return RouterSessionSnapshot{}, false
+		s.mu.Unlock()
+		return loadSharedRouterSessionSnapshotMode(sessionID, now, mutate)
 	}
 	if now.IsZero() {
 		now = s.nowFn()
@@ -206,20 +292,31 @@ func GetRouterSessionSnapshot(sessionID string, now time.Time) (RouterSessionSna
 		idleFor = 0
 	}
 	if idleFor > routerMemoryTTL {
-		delete(s.sessions, sessionID)
+		if mutate {
+			delete(s.sessions, sessionID)
+		}
+		s.mu.Unlock()
 		return RouterSessionSnapshot{}, false
 	}
-	return RouterSessionSnapshot{
+	snapshot := RouterSessionSnapshot{
 		SessionID:                       st.sessionID,
 		UserID:                          st.userID,
 		CurrentModel:                    st.currentModel,
+		CurrentCandidate:                cloneSessionCandidate(st.currentCandidate),
 		LastSeen:                        st.lastSeen,
+		LastSwitchAt:                    st.lastSwitchAt,
+		SwitchTimestamps:                cloneInt64Slice(st.switchTimestamps),
+		OutcomeWindowSize:               st.outcomeWindowSize,
+		OutcomeWindowTTLSeconds:         int(st.outcomeWindowTTL / time.Second),
 		IdleFor:                         idleFor,
 		TurnCount:                       st.turnCount,
 		SwitchCount:                     st.switchCount,
 		ModelTurns:                      cloneIntMap(st.modelTurns),
+		UserTurnCount:                   st.userTurnCount,
+		LastReleaseUserTurn:             st.lastReleaseUserTurn,
 		CumulativePromptTokens:          st.cumulativePrompt,
 		CumulativeCachedTokens:          st.cumulativeCached,
+		CumulativeCacheWriteTokens:      st.cumulativeCacheWrite,
 		CumulativeEstimatedCachedTokens: st.cumulativeEstimatedCached,
 		CumulativeCompletionTokens:      st.cumulativeCompletion,
 		CumulativeCost:                  st.cumulativeCost,
@@ -229,12 +326,17 @@ func GetRouterSessionSnapshot(sessionID string, now time.Time) (RouterSessionSna
 		LastDecisionReason:              st.lastDecisionReason,
 		LastCacheAccountingSource:       st.lastCacheAccountingSource,
 		LastPolicy:                      clonePolicyMap(st.lastPolicy),
-	}, true
+		RecentOutcomes:                  cloneTurnOutcomes(st.recentOutcomes),
+	}
+	s.mu.Unlock()
+	return snapshot, true
 }
 
-func (s *routerSessionMemoryStore) sessionLocked(sessionID string) *routerSessionState {
+// sessionLocked returns the live session or a fresh one. An entry idle past
+// routerMemoryTTL starts over: the throttled sweep may not have removed it yet.
+func (s *routerSessionMemoryStore) sessionLocked(sessionID string, now time.Time) *routerSessionState {
 	st := s.sessions[sessionID]
-	if st != nil {
+	if st != nil && now.Sub(st.lastSeen) <= routerMemoryTTL {
 		return st
 	}
 	if len(s.sessions) >= maxRouterSessions {
@@ -248,7 +350,14 @@ func (s *routerSessionMemoryStore) sessionLocked(sessionID string) *routerSessio
 	return st
 }
 
+// evictExpiredLocked is throttled to one full sweep per evictInterval, like
+// evictLocked; sessionLocked resets expired entries the sweep has not reached.
+// Callers must hold s.mu.
 func (s *routerSessionMemoryStore) evictExpiredLocked(now time.Time) {
+	if !s.lastEvict.IsZero() && now.Sub(s.lastEvict) < evictInterval {
+		return
+	}
+	s.lastEvict = now
 	for k, v := range s.sessions {
 		if now.Sub(v.lastSeen) > routerMemoryTTL {
 			delete(s.sessions, k)
@@ -288,6 +397,47 @@ func cloneIntMap(in map[string]int) map[string]int {
 	return out
 }
 
+func cloneInt64Slice(in []int64) []int64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int64, len(in))
+	copy(out, in)
+	return out
+}
+
+// pruneSwitchTimestamps keeps the model-change times newer than ttl. Callers
+// pass the append time so the series stays bounded without reads mutating it.
+func pruneSwitchTimestamps(timestamps []int64, ttl time.Duration, now time.Time) []int64 {
+	if len(timestamps) == 0 || ttl <= 0 || now.IsZero() {
+		return timestamps
+	}
+	cutoff := now.Add(-ttl).UnixMilli()
+	kept := timestamps[:0]
+	for _, ts := range timestamps {
+		if ts >= cutoff {
+			kept = append(kept, ts)
+		}
+	}
+	return kept
+}
+
+// CountRecentSwitches returns how many recorded model changes fall inside the
+// window ending at now. The gate feeds its configured window TTL.
+func CountRecentSwitches(timestamps []int64, window time.Duration, now time.Time) int {
+	if len(timestamps) == 0 || window <= 0 || now.IsZero() {
+		return 0
+	}
+	cutoff := now.Add(-window).UnixMilli()
+	count := 0
+	for _, ts := range timestamps {
+		if ts >= cutoff && ts <= now.UnixMilli() {
+			count++
+		}
+	}
+	return count
+}
+
 func clonePolicyMap(in map[string]interface{}) map[string]interface{} {
 	if in == nil {
 		return nil
@@ -319,6 +469,7 @@ func ResetRouterSessionMemoryForTesting() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions = make(map[string]*routerSessionState)
+	s.lastEvict = time.Time{}
 }
 
 // routerSessionCount returns the number of tracked sessions (tests only).

@@ -1,6 +1,7 @@
 package dsl
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -9,11 +10,30 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
+// routingYAMLDocument is the routing fragment the DSL owns: its recipes and
+// entrypoints, and the facts its MODEL declarations state on providers.models[]
+// entries (each model's transport stays in the base configuration).
 type routingYAMLDocument struct {
-	Routing config.CanonicalRouting `yaml:"routing"`
+	Providers   *routingFragmentProviders    `yaml:"providers,omitempty"`
+	Recipes     []config.CanonicalRecipe     `yaml:"recipes,omitempty"`
+	Entrypoints []config.CanonicalEntrypoint `yaml:"entrypoints,omitempty"`
 }
 
-// EmitRoutingYAML compiles DSL source and emits the v0.3 routing fragment.
+type routingFragmentProviders struct {
+	Models []config.CanonicalProviderModel `yaml:"models"`
+}
+
+// modelFactEntries are the providers.models[] entries stating the facts of
+// MODEL declarations.
+func modelFactEntries(cfg *config.RouterConfig) []config.CanonicalProviderModel {
+	var models []config.CanonicalProviderModel
+	for _, card := range config.ModelCardsFromRouterConfig(cfg) {
+		models = append(models, config.CanonicalProviderModel{Name: card.Name, ModelFacts: card.ModelFacts})
+	}
+	return models
+}
+
+// EmitRoutingYAML compiles DSL source and emits the v0.5 routing fragment.
 func EmitRoutingYAML(input string) ([]byte, []error) {
 	cfg, errs := Compile(input)
 	if len(errs) > 0 {
@@ -28,8 +48,10 @@ func EmitRoutingYAML(input string) ([]byte, []error) {
 
 // EmitRoutingYAMLFromConfig marshals only the DSL-owned routing surface.
 func EmitRoutingYAMLFromConfig(cfg *config.RouterConfig) ([]byte, error) {
-	doc := routingYAMLDocument{
-		Routing: config.CanonicalRoutingFromRouterConfig(cfg),
+	canonical := config.CanonicalConfigFromRouterConfig(cfg)
+	doc := routingYAMLDocument{Recipes: canonical.Recipes, Entrypoints: canonical.Entrypoints}
+	if models := modelFactEntries(cfg); len(models) > 0 {
+		doc.Providers = &routingFragmentProviders{Models: models}
 	}
 	return yaml.Marshal(doc)
 }
@@ -39,11 +61,12 @@ func DecompileRouting(cfg *config.RouterConfig) (string, error) {
 	d := &decompiler{cfg: cfg}
 	d.pluginTemplates = make(map[string]*pluginTemplate)
 	d.extractPluginTemplates()
+	d.decompileRoutingStrategy()
 
 	d.writeSection("SIGNALS")
 	d.decompileSignals()
 
-	models := config.CanonicalRoutingFromRouterConfig(cfg).ModelCards
+	models := config.ModelCardsFromRouterConfig(cfg)
 	if len(models) > 0 {
 		d.writeSection("MODELS")
 		d.decompileRoutingModels(models)
@@ -63,11 +86,38 @@ func DecompileRouting(cfg *config.RouterConfig) (string, error) {
 // DecompileRoutingToAST converts runtime config to a routing-only AST.
 func DecompileRoutingToAST(cfg *config.RouterConfig) *Program {
 	d := &decompiler{cfg: cfg}
-	prog := &Program{}
+	prog := &Program{Strategy: string(cfg.Strategy), ModelBindings: cloneModelBindings(cfg.RecipeBindings()), RecipePlugins: cfg.Plugins, CandidateRequirements: cfg.CandidateRequirements.Clone()}
 	d.appendSignalsToProgram(prog)
 	d.appendModelsToProgram(prog)
 	d.appendRoutesToProgram(prog)
 	return prog
+}
+
+func (d *decompiler) decompileRoutingStrategy() {
+	// A recipe view's ModelBindings carry the global bindings as well; those
+	// stay in global.model_catalog.bindings.
+	bindings := d.cfg.RecipeBindings()
+	if d.cfg.Strategy == "" && len(bindings) == 0 && d.cfg.CandidateRequirements == nil && len(d.cfg.Plugins) == 0 {
+		return
+	}
+	d.writeSection("ROUTING PROFILE")
+	d.write("ROUTING {\n")
+	d.decompileRoutingPolicies()
+	if d.cfg.Strategy != "" {
+		d.write("  strategy: %s\n", d.cfg.Strategy)
+	}
+	if len(bindings) > 0 {
+		// Convert the canonical structs through their JSON tags, then use the
+		// DSL formatter so object keys retain the grammar's identifier syntax.
+		encoded, _ := json.Marshal(bindings)
+		var fields map[string]interface{}
+		_ = json.Unmarshal(encoded, &fields)
+		d.write("  model_bindings: %s\n", formatPluginConfigValue(fields))
+	}
+	if len(d.cfg.Plugins) > 0 {
+		d.write("  plugins: %s\n", formatRecipePlugins(d.cfg.Plugins))
+	}
+	d.write("}\n\n")
 }
 
 func (d *decompiler) appendSignalsToProgram(prog *Program) {
@@ -101,8 +151,6 @@ func (d *decompiler) appendProjectionScores(prog *Program) {
 			decl.Inputs = append(decl.Inputs, &ProjectionScoreInputDecl{
 				SignalType:  input.Type,
 				SignalName:  input.Name,
-				KB:          input.KB,
-				Metric:      input.Metric,
 				Weight:      input.Weight,
 				ValueSource: input.ValueSource,
 				Match:       input.Match,
@@ -140,27 +188,13 @@ func (d *decompiler) appendProjectionMappings(prog *Program) {
 }
 
 func (d *decompiler) appendCoreSignals(prog *Program) {
-	for _, cat := range d.cfg.Categories {
-		prog.Signals = append(prog.Signals, d.categoryToSignal(&cat))
-	}
+	d.appendApplicationSignals(prog, config.SignalTypeDomain)
 	for _, kw := range d.cfg.KeywordRules {
 		prog.Signals = append(prog.Signals, d.keywordToSignal(&kw))
 	}
-	for _, emb := range d.cfg.EmbeddingRules {
-		prog.Signals = append(prog.Signals, d.embeddingToSignal(&emb))
-	}
-	for _, fc := range d.cfg.FactCheckRules {
-		prog.Signals = append(prog.Signals, d.factCheckToSignal(&fc))
-	}
-	for _, uf := range d.cfg.UserFeedbackRules {
-		prog.Signals = append(prog.Signals, d.userFeedbackToSignal(&uf))
-	}
-	for _, rule := range d.cfg.ReaskRules {
-		prog.Signals = append(prog.Signals, d.reaskToSignal(&rule))
-	}
-	for _, pref := range d.cfg.PreferenceRules {
-		prog.Signals = append(prog.Signals, d.preferenceToSignal(&pref))
-	}
+	d.appendApplicationSignals(prog, config.SignalTypeFactCheck)
+	d.appendApplicationSignals(prog, config.SignalTypeUserFeedback)
+	d.appendApplicationSignals(prog, config.SignalTypeTurnRelation)
 }
 
 func (d *decompiler) appendOperationalSignals(prog *Program) {
@@ -170,40 +204,27 @@ func (d *decompiler) appendOperationalSignals(prog *Program) {
 	for _, ctx := range d.cfg.ContextRules {
 		prog.Signals = append(prog.Signals, d.contextToSignal(&ctx))
 	}
-	for _, structure := range d.cfg.StructureRules {
-		prog.Signals = append(prog.Signals, d.structureToSignal(&structure))
-	}
-	for _, comp := range d.cfg.ComplexityRules {
-		prog.Signals = append(prog.Signals, d.complexityToSignal(&comp))
-	}
-	for _, mod := range d.cfg.ModalityRules {
-		prog.Signals = append(prog.Signals, d.modalityToSignal(&mod))
-	}
+	d.appendApplicationSignals(prog, config.SignalTypeComplexity)
+	d.appendApplicationSignals(prog, config.SignalTypeModality)
 	for _, rb := range d.cfg.RoleBindings {
 		prog.Signals = append(prog.Signals, d.roleBindingToSignal(&rb))
 	}
 	for i := range d.cfg.ConversationRules {
 		prog.Signals = append(prog.Signals, d.conversationToSignal(&d.cfg.ConversationRules[i]))
 	}
-	for i := range d.cfg.EventRules {
-		prog.Signals = append(prog.Signals, d.eventRuleToDecl(&d.cfg.EventRules[i]))
-	}
 }
 
 func (d *decompiler) appendSafetySignals(prog *Program) {
-	for _, jb := range d.cfg.JailbreakRules {
-		prog.Signals = append(prog.Signals, d.jailbreakToSignal(&jb))
-	}
-	for _, pii := range d.cfg.PIIRules {
-		prog.Signals = append(prog.Signals, d.piiToSignal(&pii))
-	}
-	for _, kb := range d.cfg.KBRules {
-		prog.Signals = append(prog.Signals, d.kbSignalToDecl(&kb))
+	for _, signalType := range []string{
+		config.SignalTypeSafety, config.SignalTypeJailbreak, config.SignalTypeHallucination,
+		config.SignalTypeRefusal, config.SignalTypePII,
+	} {
+		d.appendApplicationSignals(prog, signalType)
 	}
 }
 
 func (d *decompiler) appendModelsToProgram(prog *Program) {
-	for _, model := range config.CanonicalRoutingFromRouterConfig(d.cfg).ModelCards {
+	for _, model := range config.ModelCardsFromRouterConfig(d.cfg) {
 		prog.Models = append(prog.Models, routingModelToDecl(model))
 	}
 }
@@ -227,17 +248,16 @@ func (d *decompiler) writeRoutingModelFields(model config.RoutingModel) {
 	if model.ContextWindowSize > 0 {
 		d.write("  context_window_size: %d\n", model.ContextWindowSize)
 	}
+	if model.MaxOutputTokens > 0 {
+		d.write("  max_output_tokens: %d\n", model.MaxOutputTokens)
+	}
 	d.writeOptionalRoutingModelString("description", model.Description)
 	d.writeOptionalRoutingModelArray("capabilities", model.Capabilities)
 	d.writeRoutingModelLoRAs(model.LoRAs)
 	d.writeOptionalRoutingModelArray("tags", model.Tags)
-	if model.QualityScore != 0 {
-		d.write(
-			"  quality_score: %s\n",
-			strconv.FormatFloat(model.QualityScore, 'f', -1, 64),
-		)
+	if modalities := model.Modalities; modalities != nil {
+		d.write("  modalities: { input: %s, output: %s }\n", quotedStringArray(modalities.Input), quotedStringArray(modalities.Output))
 	}
-	d.writeOptionalRoutingModelString("modality", model.Modality)
 }
 
 func (d *decompiler) writeOptionalRoutingModelString(key, value string) {
@@ -277,6 +297,9 @@ func routingModelToDecl(model config.RoutingModel) *ModelDecl {
 	if model.ContextWindowSize > 0 {
 		fields["context_window_size"] = IntValue{V: model.ContextWindowSize}
 	}
+	if model.MaxOutputTokens > 0 {
+		fields["max_output_tokens"] = IntValue{V: model.MaxOutputTokens}
+	}
 	if model.Description != "" {
 		fields["description"] = StringValue{V: model.Description}
 	}
@@ -299,11 +322,11 @@ func routingModelToDecl(model config.RoutingModel) *ModelDecl {
 	if len(model.Tags) > 0 {
 		fields["tags"] = stringsToArray(model.Tags)
 	}
-	if model.QualityScore != 0 {
-		fields["quality_score"] = FloatValue{V: model.QualityScore}
-	}
-	if model.Modality != "" {
-		fields["modality"] = StringValue{V: model.Modality}
+	if modalities := model.Modalities; modalities != nil {
+		fields["modalities"] = ObjectValue{Fields: map[string]Value{
+			"input":  stringsToArray(modalities.Input),
+			"output": stringsToArray(modalities.Output),
+		}}
 	}
 	return &ModelDecl{Name: model.Name, Fields: fields}
 }

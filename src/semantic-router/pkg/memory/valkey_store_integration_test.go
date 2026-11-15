@@ -1,9 +1,10 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -16,27 +17,21 @@ import (
 	glide "github.com/valkey-io/valkey-glide/go/v2"
 	glideconfig "github.com/valkey-io/valkey-glide/go/v2/config"
 
-	candle_binding "github.com/vllm-project/semantic-router/candle-binding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/internal/testutil/storagetest"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 // These tests require:
 //  1. A running Valkey instance with search module.
 //     Default: localhost:6379. Override with VALKEY_HOST / VALKEY_PORT env vars.
-//  2. BERT model initialized for embeddings.
+//  2. Deterministic vectors injected for storage/index behavior.
 //
 // Set SKIP_VALKEY_TESTS=true to skip.
 
 func setupValkeyMemoryIntegration(t *testing.T) (*ValkeyStore, *glide.Client) {
 	t.Helper()
 
-	if os.Getenv("SKIP_VALKEY_TESTS") == "true" {
-		t.Skip("Valkey integration tests skipped due to SKIP_VALKEY_TESTS=true")
-	}
-
-	if err := candle_binding.InitModel("sentence-transformers/all-MiniLM-L6-v2", true); err != nil {
-		t.Skipf("Failed to initialize BERT model: %v", err)
-	}
+	storagetest.Require(t, "valkey")
 
 	host := "localhost"
 	port := 6379
@@ -74,7 +69,7 @@ func setupValkeyMemoryIntegration(t *testing.T) (*ValkeyStore, *glide.Client) {
 
 	client, err := glide.NewClient(clientConfig)
 	if err != nil {
-		t.Skipf("Cannot connect to Valkey at %s:%d: %v", host, port, err)
+		storagetest.Unavailable(t, "valkey", fmt.Sprintf("Cannot connect to Valkey at %s:%d: %v", host, port, err))
 	}
 
 	memCfg := config.MemoryConfig{
@@ -88,7 +83,8 @@ func setupValkeyMemoryIntegration(t *testing.T) (*ValkeyStore, *glide.Client) {
 		ValkeyConfig: vc,
 		Enabled:      true,
 		EmbeddingConfig: &EmbeddingConfig{
-			Model: EmbeddingModelBERT,
+			Provider:   storageMemoryVectors(),
+			Deployment: "qwen3-embedding",
 		},
 	})
 	if err != nil {
@@ -145,6 +141,7 @@ func cleanupValkeyKeys(ctx context.Context, client *glide.Client, prefix string)
 // CheckConnection
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_CheckConnection(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -157,6 +154,7 @@ func TestValkeyStoreInteg_CheckConnection(t *testing.T) {
 // Store + Get (full CRUD lifecycle)
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_StoreAndGet(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -197,6 +195,7 @@ func TestValkeyStoreInteg_StoreAndGet(t *testing.T) {
 // Get — not found
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_GetNotFound(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -210,6 +209,7 @@ func TestValkeyStoreInteg_GetNotFound(t *testing.T) {
 // Retrieve (semantic search)
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_Retrieve(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -251,13 +251,70 @@ func TestValkeyStoreInteg_Retrieve(t *testing.T) {
 		Threshold: 0.3, // Low threshold for integration test
 	})
 	require.NoError(t, err)
-	assert.NotEmpty(t, results, "should find at least one result")
+	// The fixture embeds the query and the dark mode memory identically; the
+	// other two memories sit at a cosine near 0, below the 0.3 threshold.
+	require.Len(t, results, 1)
+	assert.Equal(t, memories[0].Content, results[0].Memory.Content)
+	assert.InDelta(t, 1.0, float64(results[0].Score), 1e-3)
+}
 
-	// Verify results have scores
-	for _, r := range results {
-		assert.NotEmpty(t, r.Memory.ID)
-		assert.NotEmpty(t, r.Memory.Content)
-		assert.Positive(t, r.Score, "score should be positive")
+// StorageIntegration: valkey
+func TestValkeyStoreInteg_Retrieve_ProjectScopeWidensPastLegacyCandidates(t *testing.T) {
+	store, client := setupValkeyMemoryIntegration(t)
+	ctx := context.Background()
+	const legacyCount = 50
+	const query = "What are the user's display preferences?"
+	userID := fmt.Sprintf("legacy_project_user_%d", time.Now().UnixNano())
+
+	queryEmbedding, err := storageMemoryVectors().Embed(ctx, query)
+	require.NoError(t, err)
+	scopedEmbedding := append([]float32(nil), queryEmbedding...)
+	scopedEmbedding[0] = -scopedEmbedding[0]
+
+	for i := 0; i < legacyCount; i++ {
+		legacy := &Memory{
+			ID:        fmt.Sprintf("legacy_default_%d_%d", time.Now().UnixNano(), i),
+			Type:      MemoryTypeSemantic,
+			Content:   "legacy unscoped display preference",
+			UserID:    userID,
+			Embedding: queryEmbedding,
+		}
+		require.NoError(t, store.Store(ctx, legacy))
+
+		// Emulate the pre-fix write path: the indexed field said "default"
+		// while metadata (the scope source of truth) remained unscoped.
+		_, err = client.HSet(ctx, store.hashKey(legacy.ID), map[string]string{"project_id": "default"})
+		require.NoError(t, err)
+	}
+
+	scoped := &Memory{
+		ID:        fmt.Sprintf("named_default_%d", time.Now().UnixNano()),
+		Type:      MemoryTypeSemantic,
+		Content:   "explicit default display preference",
+		UserID:    userID,
+		ProjectID: "default",
+		Embedding: scopedEmbedding,
+	}
+	require.NoError(t, store.Store(ctx, scoped))
+	time.Sleep(500 * time.Millisecond)
+
+	for _, mode := range []struct {
+		name string
+		opts RetrieveOptions
+	}{
+		{name: "vector"},
+		{name: "hybrid", opts: RetrieveOptions{HybridSearch: true, HybridMode: "weighted"}},
+		{name: "adaptive", opts: RetrieveOptions{AdaptiveThreshold: true}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			opts := mode.opts
+			opts.Query, opts.UserID, opts.ProjectID, opts.Limit, opts.Threshold = query, userID, "default", 5, 0.9
+			results, err := store.Retrieve(ctx, opts)
+
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			assert.Equal(t, scoped.ID, results[0].Memory.ID)
+		})
 	}
 }
 
@@ -265,6 +322,7 @@ func TestValkeyStoreInteg_Retrieve(t *testing.T) {
 // Retrieve — empty results
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_RetrieveEmpty(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -283,6 +341,7 @@ func TestValkeyStoreInteg_RetrieveEmpty(t *testing.T) {
 // Retrieve with type filter
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_RetrieveWithTypeFilter(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -317,6 +376,7 @@ func TestValkeyStoreInteg_RetrieveWithTypeFilter(t *testing.T) {
 // User-scoped isolation
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_UserScopedIsolation(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -356,6 +416,7 @@ func TestValkeyStoreInteg_UserScopedIsolation(t *testing.T) {
 // Update
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_Update(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -393,6 +454,7 @@ func TestValkeyStoreInteg_Update(t *testing.T) {
 // Update — not found
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_UpdateNotFound(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -408,6 +470,7 @@ func TestValkeyStoreInteg_UpdateNotFound(t *testing.T) {
 // Forget
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_Forget(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -437,6 +500,7 @@ func TestValkeyStoreInteg_Forget(t *testing.T) {
 // ForgetByScope — user only
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ForgetByScope_UserOnly(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -473,6 +537,7 @@ func TestValkeyStoreInteg_ForgetByScope_UserOnly(t *testing.T) {
 // ForgetByScope — with type filter
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ForgetByScope_WithTypeFilter(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -508,6 +573,7 @@ func TestValkeyStoreInteg_ForgetByScope_WithTypeFilter(t *testing.T) {
 // ForgetByScope — missing UserID
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ForgetByScope_MissingUserID(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -521,6 +587,7 @@ func TestValkeyStoreInteg_ForgetByScope_MissingUserID(t *testing.T) {
 // List
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_List(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -558,6 +625,7 @@ func TestValkeyStoreInteg_List(t *testing.T) {
 // List — missing UserID
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_List_MissingUserID(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -573,6 +641,7 @@ func TestValkeyStoreInteg_List_MissingUserID(t *testing.T) {
 
 // TestValkeyStoreInteg_DuplicateKeys verifies that storing a memory with an
 // already-existing ID returns an error, matching the Store interface contract.
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_DuplicateKeys(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -600,10 +669,57 @@ func TestValkeyStoreInteg_DuplicateKeys(t *testing.T) {
 	assert.Equal(t, "First version", retrieved.Content)
 }
 
+// StorageIntegration: valkey
+func TestValkeyStoreInteg_ConcurrentDuplicateID(t *testing.T) {
+	store, _ := setupValkeyMemoryIntegration(t)
+	ctx := context.Background()
+
+	const writers = 12
+	id := fmt.Sprintf("mem_concurrent_dup_%d", time.Now().UnixNano())
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- store.Store(ctx, &Memory{
+				ID:      id,
+				Type:    MemoryTypeSemantic,
+				Content: fmt.Sprintf("complete concurrent memory %d", i),
+				UserID:  fmt.Sprintf("concurrent_user_%d", i),
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	duplicates := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, errValkeyMemoryAlreadyExists):
+			duplicates++
+		default:
+			t.Errorf("unexpected store error: %v", err)
+		}
+	}
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, writers-1, duplicates)
+
+	stored, err := store.Get(ctx, id)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Content, "complete concurrent memory ")
+	assert.NotEmpty(t, stored.UserID)
+	assert.NotEmpty(t, stored.Embedding)
+}
+
 // ---------------------------------------------------------------------------
 // Concurrent access
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ConcurrentAccess(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -649,6 +765,7 @@ func TestValkeyStoreInteg_ConcurrentAccess(t *testing.T) {
 // ForgetByScope — with project filter
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ForgetByScope_WithProjectFilter(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()
@@ -684,6 +801,7 @@ func TestValkeyStoreInteg_ForgetByScope_WithProjectFilter(t *testing.T) {
 // ConsolidateUser (standalone function with ValkeyStore)
 // ---------------------------------------------------------------------------
 
+// StorageIntegration: valkey
 func TestValkeyStoreInteg_ConsolidateUser(t *testing.T) {
 	store, _ := setupValkeyMemoryIntegration(t)
 	ctx := context.Background()

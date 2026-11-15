@@ -4,10 +4,56 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "grafana": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "grafana.ini": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "live": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "allowed_origins": {
+                  "type": "string",
+                  "description": "Comma-separated trusted Dashboard origins. Empty preserves Grafana's default origin checks."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 0,
       "description": "Number of Semantic Router pod replicas when autoscaling is disabled."
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "standalone",
+            "extproc"
+          ],
+          "description": "standalone: the Router serves config.listeners itself; extproc: the Router serves ext_proc gRPC for a gateway in front of it."
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "description": "Standalone only: a kubernetes.io/tls Secret mounted at /app/config/certs for listener TLS."
+            }
+          }
+        }
+      }
     },
     "autoscaling": {
       "type": "object",
@@ -48,6 +94,44 @@
         }
       }
     },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "storageClassName": {
+              "type": "string"
+            },
+            "accessMode": {
+              "type": "string",
+              "enum": [
+                "ReadWriteOnce",
+                "ReadWriteOncePod",
+                "ReadWriteMany"
+              ]
+            },
+            "size": {
+              "type": "string"
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "existingClaim": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
     "safetyGuards": {
       "type": "object",
       "additionalProperties": true,
@@ -55,6 +139,63 @@
         "rejectMultiReplicaLocalLearningState": {
           "type": "boolean",
           "description": "Reject multi-replica router renders when active config enables Router Learning request-time local state."
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "alerts": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render PrometheusRule alerts for Semantic Router metrics."
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "thresholds": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "requestErrorRate": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "completionLatencyP95Seconds": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "firstResponseObservationP95Seconds": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "responseDurationPerOutputTokenP95Seconds": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "routingLatencyP95Seconds": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "inflightRequests": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "cacheHitRate": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -91,6 +232,33 @@
               }
             }
           }
+        }
+      }
+    },
+    "configOverride": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "minProperties": 1,
+      "description": "Complete canonical Router config that atomically replaces chart config defaults before Kubernetes integration rewrites."
+    },
+    "decisionModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deployment": {"type": "string", "minLength": 1, "pattern": "^\\S+$"}
+      },
+      "description": "Optional exact default judgment deployment reference; empty preserves the config's own. The deployment declares its artifact, device and revision."
+    },
+    "configMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "applyValuesRevision": {
+          "type": "string",
+          "description": "Change this revision to apply chart config values once on upgrade; the same revision preserves later runtime edits."
         }
       }
     },

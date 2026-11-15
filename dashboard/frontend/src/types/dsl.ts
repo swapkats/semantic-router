@@ -4,6 +4,8 @@
  *   signalCompile, signalValidate, signalDecompile, signalFormat, signalParseAST
  */
 
+import type { RouterConfigWarning } from '../utils/configSaveWarnings'
+
 // ---------- Diagnostics ----------
 
 export type DiagLevel = 'error' | 'warning' | 'constraint'
@@ -113,6 +115,7 @@ export interface ASTModelRef {
   model: string
   reasoning?: boolean
   effort?: string
+  mode?: string
   lora?: string
   paramSize?: string
   weight?: number
@@ -169,7 +172,25 @@ export interface ASTTestBlockDecl {
   pos: ASTPosition
 }
 
+export interface ASTEntrypointDecl {
+  modelNames: string[]
+  recipe: string
+  pos: ASTPosition
+}
+
+export interface ASTRecipeDecl {
+  name: string
+  description?: string
+  program: ASTProgram
+  pos: ASTPosition
+}
+
 export interface ASTProgram {
+  candidateRequirements?: { capabilities?: 'declared'; context?: 'known_limits' }
+  modelBindings?: Record<string, Record<string, string>>
+  strategy?: string
+  entrypoints?: ASTEntrypointDecl[]
+  recipes?: ASTRecipeDecl[]
   signals: ASTSignalDecl[]
   projectionPartitions?: ASTProjectionPartitionDecl[]
   projectionScores?: ASTProjectionScoreDecl[]
@@ -217,7 +238,14 @@ export interface FormatResult {
 
 // ---------- Deploy Types ----------
 
-export type DeployStep = 'compiling' | 'validating' | 'backing_up' | 'writing' | 'reloading' | 'done' | 'error'
+export type DeployStep =
+  | 'compiling'
+  | 'validating'
+  | 'backing_up'
+  | 'writing'
+  | 'reloading'
+  | 'done'
+  | 'error'
 
 export interface DeployProgress {
   step: DeployStep
@@ -228,6 +256,8 @@ export interface DeployResult {
   status: 'success' | 'error'
   version?: string
   message: string
+  /** The Router's warnings about the deployed configuration. */
+  warnings?: RouterConfigWarning[]
 }
 
 export interface ConfigVersion {
@@ -237,114 +267,9 @@ export interface ConfigVersion {
   filename: string
 }
 
-// ---------- Natural Language Builder ----------
-
-export type BuilderNLConnectionMode = 'default' | 'custom'
-export type BuilderNLProviderKind = 'vllm' | 'openai-compatible' | 'anthropic'
-
-export interface BuilderNLConnection {
-  providerKind: BuilderNLProviderKind
-  modelName: string
-  baseUrl: string
-  accessKey?: string
-  endpointName?: string
-}
-
-export interface BuilderNLGenerateRequest {
-  prompt: string
-  currentDsl?: string
-  connectionMode: BuilderNLConnectionMode
-  customConnection?: BuilderNLConnection
-  temperature?: number
-  maxRetries?: number
-  timeoutSeconds?: number
-}
-
-export interface BuilderNLVerifyRequest {
-  connectionMode: BuilderNLConnectionMode
-  customConnection?: BuilderNLConnection
-  timeoutSeconds?: number
-}
-
-export interface BuilderNLReview {
-  ready: boolean
-  summary: string
-  warnings: string[]
-  checks: string[]
-}
-
-export type BuilderNLProgressLevel = 'info' | 'success' | 'warning' | 'error'
-
-export interface BuilderNLProgressEvent {
-  phase: string
-  level: BuilderNLProgressLevel
-  message: string
-  attempt?: number
-  kind?: 'stage' | 'heartbeat'
-  elapsedSeconds?: number
-  timestamp: number
-}
-
-export interface BuilderNLValidation {
-  ready: boolean
-  diagnostics: Diagnostic[]
-  errorCount: number
-  compileError?: string
-}
-
-export interface BuilderNLStagedDraft {
-  prompt: string
-  dsl: string
-  baseYaml: string
-  summary: string
-  suggestedTestQuery?: string
-  review: BuilderNLReview
-  validation: BuilderNLValidation
-}
-
-export interface BuilderNLVerifyResponse {
-  ready: boolean
-  summary: string
-  connectionMode: BuilderNLConnectionMode
-  providerKind?: BuilderNLProviderKind
-  modelName?: string
-  targetModelName?: string
-  endpoint?: string
-}
-
-export interface BuilderNLGenerateResponse {
-  dsl: string
-  baseYaml: string
-  summary: string
-  suggestedTestQuery?: string
-  review: BuilderNLReview
-  validation: BuilderNLValidation
-}
-
 // ---------- Editor State ----------
 
-export type EditorMode = 'dsl' | 'visual' | 'nl'
-
-export interface EditorState {
-  /** Current DSL source text in the editor */
-  dslSource: string
-  /** Compiled YAML output */
-  yamlOutput: string
-  /** Compiled CRD output */
-  crdOutput: string
-  /** Current diagnostics from validation */
-  diagnostics: Diagnostic[]
-  /** Whether WASM runtime is loaded and ready */
-  wasmReady: boolean
-  /** Loading state for async operations */
-  loading: boolean
-  /** Current active editor mode */
-  mode: EditorMode
-  /** Whether there are unsaved changes */
-  dirty: boolean
-  /** Last successful compile timestamp */
-  lastCompileAt: number | null
-}
+export type EditorMode = 'dsl' | 'visual'
 
 // ---------- WASM Bridge Interface ----------
 

@@ -1,6 +1,10 @@
 # Test Envoy config for Authorino integration
 # Authorino gRPC is port-forwarded from kind cluster to localhost:50055
 # Semantic Router ext_proc is on localhost:50051
+# Authorino integration-test fixture. Its provider-specific routes are
+# intentional test vectors for credential injection, not a maintained provider
+# or model inventory. Provider-aware runtime configs are generated from the
+# user config and model catalog.
 static_resources:
   listeners:
   - name: listener_0
@@ -32,7 +36,7 @@ static_resources:
                   upstream_host: "%UPSTREAM_HOST%"
                   upstream_cluster: "%UPSTREAM_CLUSTER%"
                   request_id: "%REQ(X-REQUEST-ID)%"
-                  selected_model: "%REQ(X-SELECTED-MODEL)%"
+                  selected_model: "%REQ(X-VSR-ROUTE-MODEL)%"
           route_config:
             name: local_route
             virtual_hosts:
@@ -43,7 +47,7 @@ static_resources:
               - match:
                   prefix: "/"
                   headers:
-                  - name: x-selected-model
+                  - name: x-vsr-route-model
                     string_match:
                       prefix: "claude-"
                 route:
@@ -54,7 +58,7 @@ static_resources:
               - match:
                   prefix: "/"
                   headers:
-                  - name: x-selected-model
+                  - name: x-vsr-route-model
                     string_match:
                       safe_regex:
                         regex: "^(gpt-|o1-|o3-|chatgpt-).*"
@@ -82,6 +86,11 @@ static_resources:
           - name: envoy.filters.http.ext_proc
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+              # A decision's reliability block reaches Envoy's router through these
+              # per-request headers; ext_proc may set no other x-envoy-* header.
+              mutation_rules:
+                allow_expression:
+                  regex: "^x-envoy-(upstream-rq-timeout-ms|upstream-rq-per-try-timeout-ms|max-retries|retry-on|retriable-status-codes)$"
               grpc_service:
                 envoy_grpc:
                   cluster_name: extproc_service
@@ -194,6 +203,11 @@ static_resources:
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
         sni: api.openai.com
+        auto_sni_san_validation: true
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
 
   # Anthropic API cluster
   - name: anthropic_api_cluster
@@ -216,6 +230,11 @@ static_resources:
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
         sni: api.anthropic.com
+        auto_sni_san_validation: true
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
 
 admin:
   address:

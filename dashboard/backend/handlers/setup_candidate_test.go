@@ -1,0 +1,200 @@
+package handlers
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/vllm-project/semantic-router/dashboard/backend/setupmode"
+	routerconfig "github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
+
+func importSetupRoundTrip(t *testing.T, configPath string, patch map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	// The fixture server is on loopback; declare it the way an operator would
+	// declare a real internal target (#1388).
+	allowLoopbackForTest(t)
+	payload := mustJSONRaw(t, patch)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	w := httptest.NewRecorder()
+	body := mustJSONRaw(t, SetupImportRemoteRequest{URL: server.URL})
+	SetupImportRemoteHandler(configPath, setupmode.New(configPath, false))(
+		w, httptest.NewRequest(http.MethodPost, "/api/setup/import-remote", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("import failed: %d %s", w.Code, w.Body.String())
+	}
+	var response SetupImportRemoteResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	var imported map[string]interface{}
+	if err := json.Unmarshal(response.Config, &imported); err != nil {
+		t.Fatal(err)
+	}
+	return imported
+}
+
+func validateSetupRoundTrip(t *testing.T, configPath string, patch map[string]interface{}) json.RawMessage {
+	t.Helper()
+	w := httptest.NewRecorder()
+	body := mustJSONRaw(t, SetupConfigRequest{Config: mustJSONRaw(t, patch)})
+	SetupValidateHandler(configPath, setupmode.New(configPath, false))(
+		w, httptest.NewRequest(http.MethodPost, "/api/setup/validate", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("validation failed: %d %s", w.Code, w.Body.String())
+	}
+	var response SetupValidateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Config
+}
+
+func activateSetupRoundTrip(t *testing.T, configPath, root string, configJSON json.RawMessage) *routerconfig.RouterConfig {
+	t.Helper()
+	w := httptest.NewRecorder()
+	body := mustJSONRaw(t, SetupConfigRequest{Config: configJSON})
+	SetupActivateHandler(configPath, false, root, setupmode.New(configPath, false))(
+		w, httptest.NewRequest(http.MethodPost, "/api/setup/activate", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("activation failed: %d %s", w.Code, w.Body.String())
+	}
+	active, err := routerconfig.Parse(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return active
+}
+
+func TestSetupSparseGlobalRoundTripPreservesOmittedFields(t *testing.T) {
+	configPath, root, _ := setupActivationRegressionRuntime(t)
+	patch := createValidSetupPatch()
+	global := map[string]interface{}{"stores": map[string]interface{}{
+		"response_cache": map[string]interface{}{"max_entries": 2048},
+	}}
+	patch["global"] = global
+	imported := importSetupRoundTrip(t, configPath, patch)
+	if !reflect.DeepEqual(imported["global"], jsonValue(t, global)) {
+		t.Fatalf("import authored omitted global fields: %#v", imported["global"])
+	}
+	returned := validateSetupRoundTrip(t, configPath, imported)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(returned, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	assertManagedSetupAuthoredGlobal(t, global, returned)
+	resolvedGlobal := decoded["global"].(map[string]interface{})
+	if !reflect.DeepEqual(resolvedGlobal["stores"], jsonValue(t, global["stores"])) {
+		t.Fatalf("validation changed the authored stores: %#v", resolvedGlobal["stores"])
+	}
+	active := activateSetupRoundTrip(t, configPath, root, returned)
+	defaults := routerconfig.DefaultGlobalConfig().SemanticCache
+	if active.SemanticCache.MaxEntries != 2048 || active.SemanticCache.TTLSeconds != defaults.TTLSeconds || active.SemanticCache.BackendType != defaults.BackendType {
+		t.Fatalf("sparse store override changed inherited settings: %+v", active.SemanticCache)
+	}
+	if active.ManagementAPI.BindAddress != "0.0.0.0" {
+		t.Fatalf("omitted management listener became authored: %+v", active.ManagementAPI)
+	}
+}
+
+func TestSetupCandidatePreservesGlobalReplacementAndBootstrapInheritance(t *testing.T) {
+	root := t.TempDir()
+	configPath := createBootstrapSetupConfig(t, root)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseGlobal := map[string]interface{}{"stores": map[string]interface{}{
+		"response_cache": map[string]interface{}{"max_entries": 2048},
+	}}
+	globalYAML, err := marshalYAMLBytes(map[string]interface{}{"global": baseGlobal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, append(data, globalYAML...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, replace := range []bool{false, true} {
+		patch := createValidSetupPatch()
+		want := baseGlobal
+		if replace {
+			want = map[string]interface{}{"stores": map[string]interface{}{}}
+			patch["global"] = want
+		}
+		returned := validateSetupRoundTrip(t, configPath, patch)
+		var decoded map[string]interface{}
+		if err := json.Unmarshal(returned, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(decoded["global"], jsonValue(t, want)) {
+			t.Fatalf("whole-global replacement=%v changed semantics: %#v", replace, decoded["global"])
+		}
+	}
+}
+
+// jsonValue is value as a JSON response decodes it: numbers become float64.
+func jsonValue(t *testing.T, value interface{}) interface{} {
+	t.Helper()
+	var decoded interface{}
+	if err := json.Unmarshal(mustJSONRaw(t, value), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
+
+func TestSetupCandidateRepeatedSerializationPreservesAuthoredManagement(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("VLLM_SR_RUNTIME_CONFIG_PATH", configPath)
+	// The Dashboard writes no empty listener itself, and the Router refuses one.
+	empty := map[string]interface{}{"services": map[string]interface{}{"management_api": nil}}
+	if _, err := decodeStrictSetupConfig(mustJSONRaw(t, map[string]interface{}{"version": "v0.5", "global": empty})); err == nil || !strings.Contains(err.Error(), "global.services.management_api is empty") {
+		t.Fatalf("empty management listener error = %v", err)
+	}
+	for _, listener := range []interface{}{map[string]interface{}{}, map[string]interface{}{"bind_address": "127.0.0.1"}} {
+		global := map[string]interface{}{"services": map[string]interface{}{"management_api": listener}}
+		candidate, err := decodeStrictSetupConfig(mustJSONRaw(t, map[string]interface{}{"version": "v0.5", "global": global}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := marshalYAMLBytes(candidate.globalOverrideRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var first []byte
+		for i := 0; i < 3; i++ {
+			data, activationErr := marshalYAMLBytes(candidate.canonicalTransport())
+			if activationErr != nil {
+				t.Fatal(activationErr)
+			}
+			if i == 0 {
+				first = data
+			} else if !bytes.Equal(first, data) {
+				t.Fatal("serialization mutated a reusable candidate")
+			}
+			encoded, encodeErr := rawJSONMessage(candidate.canonicalTransport())
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			var decoded map[string]interface{}
+			if decodeErr := json.Unmarshal(encoded, &decoded); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if !reflect.DeepEqual(decoded["global"], global) {
+				t.Fatalf("authored management node was changed: %#v", decoded["global"])
+			}
+		}
+		after, err := marshalYAMLBytes(candidate.globalOverrideRaw)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("authored global node was mutated: %v", err)
+		}
+	}
+}

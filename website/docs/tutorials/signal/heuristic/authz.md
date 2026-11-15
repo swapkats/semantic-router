@@ -2,14 +2,15 @@
 
 ## Overview
 
-`authz` turns identity and policy bindings into reusable routing inputs. It maps to `config/signal/authz/` and is declared under `routing.signals.role_bindings`.
+`authz` turns identity and policy bindings into reusable routing inputs under
+`recipes[].signals.role_bindings`.
 
 This family is heuristic: it matches request identity against explicit roles and subjects instead of classifier output.
 
 ## Key Advantages
 
 - Routes premium, internal, or tenant-scoped traffic without extra model inference.
-- Keeps access policy visible inside `routing.decisions`.
+- Keeps access policy visible inside `recipes[].decisions`.
 - Reuses the same identity rule across multiple routes.
 - Makes RBAC-driven routing auditable in YAML.
 
@@ -30,24 +31,53 @@ Use `authz` when:
 
 ## Configuration
 
-Source fragment family: `config/signal/authz/`
-
 ```yaml
-routing:
-  signals:
-    role_bindings:
-      - name: admin
-        description: Requests from platform administrators.
-        role: admin
-        subjects:
-          - kind: Group
-            name: platform-admins
-      - name: premium_user
-        description: Requests from paid end users.
-        role: premium_user
-        subjects:
-          - kind: Group
-            name: premium-tier
+recipes:
+  - name: default
+    signals:
+      role_bindings:
+        - name: platform-admins-binding
+          description: Requests from platform administrators.
+          role: admin
+          subjects:
+            - kind: Group
+              name: platform-admins
+        - name: premium-tier-binding
+          description: Requests from paid end users.
+          role: premium_user
+          subjects:
+            - kind: Group
+              name: premium-tier
 ```
 
+A binding matches a request when the caller's user ID or one of its groups is
+among its `subjects`, and then emits its `role` as the `authz` signal. The
+binding's `name` only identifies the binding in logs; several bindings can grant
+the same role.
+
 Use `role_bindings` when the signal should fire from authenticated identity and policy metadata instead of prompt content.
+
+## Example Decision
+
+A decision references the role, never the binding's name:
+
+```yaml
+recipes:
+  - name: default
+    decisions:
+      - name: route_admins
+        description: Route platform administrators to the strongest model.
+        priority: 200
+        rules:
+          type: authz
+          name: admin
+        modelRefs:
+          - model: strong-model
+```
+
+## Dependencies and Limitations
+
+Identity comes from `global.services.authz`; the signal does not authenticate a
+request by itself. Trust only headers set or sanitized by your authentication
+layer. See a complete example:
+[`config/fragments/signal/authz/rbac.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/signal/authz/rbac.yaml).

@@ -1,6 +1,10 @@
 package selection
 
-import "time"
+import (
+	"time"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+)
 
 // AgenticPhase describes where the request sits in a tool-using conversation.
 type AgenticPhase string
@@ -19,6 +23,7 @@ type AgenticSessionContext struct {
 	ID                 string
 	UserID             string
 	TurnIndex          int
+	PreviousCandidate  *config.ModelRef
 	PreviousModel      string
 	PreviousResponseID string
 
@@ -33,8 +38,14 @@ type AgenticSessionContext struct {
 	MemoryCost                  float64
 	MemoryEstimatedCacheSavings float64
 	MemoryCacheAccountingSource string
+	MemoryUserTurnCount         int
+	MemoryLastReleaseUserTurn   int
 	LastDecisionName            string
 	LastDecisionReason          string
+
+	// ReleaseHonored marks a client release that protection has accepted;
+	// the selector treats it as a continuity boundary.
+	ReleaseHonored bool
 
 	HistoryTokens int
 	ContextTokens int

@@ -1,108 +1,282 @@
-import { FLEET_SIM_NAV_ITEMS } from '../utils/fleetSimApi'
+import type { ProductIconName } from './ProductIcon'
 
-export type LayoutDropdownKey = 'manager' | 'analysisOps'
+export type LayoutDropdownKey = 'build' | 'operate'
 
 export type LayoutConfigSection =
   | 'models'
   | 'signals'
   | 'projections'
   | 'decisions'
+  | 'entrypoints-recipes'
   | 'global-config'
   | 'mcp'
 
 type LayoutRouteMenuItem = {
   kind: 'route'
   label: string
+  icon: ProductIconName
   to: string
+  reloadDocument?: boolean
+  target?: '_blank'
+  matchMode?: 'exact' | 'prefix'
 }
 
 type LayoutConfigMenuItem = {
   kind: 'config'
   label: string
+  icon: ProductIconName
   configSection: LayoutConfigSection
 }
 
 export type LayoutMenuItem = LayoutRouteMenuItem | LayoutConfigMenuItem
 
 export interface LayoutMenuSection {
-  title?: string
+  title: string
+  description?: string
   items: LayoutMenuItem[]
+}
+
+export interface LayoutMenuCategory {
+  key: string
+  label: string
+  description: string
+  sections: LayoutMenuSection[]
 }
 
 export interface LayoutNavLink {
   label: string
+  icon: ProductIconName
   to: string
   matchMode?: 'exact' | 'prefix'
 }
 
 export const PRIMARY_NAV_LINKS: LayoutNavLink[] = [
-  { label: 'Dashboard', to: '/dashboard' },
-  { label: 'Playground', to: '/playground' },
-  { label: 'Brain', to: '/topology' },
-  { label: 'DSL', to: '/builder' },
-  { label: 'Insight', to: '/insights', matchMode: 'prefix' },
+  { label: 'Dashboard', icon: 'dashboard', to: '/dashboard' },
+  { label: 'Playground', icon: 'playground', to: '/playground' },
 ]
 
-export const SECONDARY_NAV_LINKS: LayoutNavLink[] = []
+const CONFIG_SECTIONS = new Set<LayoutConfigSection>([
+  'models',
+  'signals',
+  'projections',
+  'decisions',
+  'entrypoints-recipes',
+  'global-config',
+  'mcp',
+])
 
-export const MANAGER_MENU_SECTIONS: LayoutMenuSection[] = [
+const CONFIG_SECTION_ALIASES: Record<string, LayoutConfigSection> = {
+  global: 'global-config',
+  'router-config': 'global-config',
+  routes: 'decisions',
+  endpoints: 'models',
+  entrypoints: 'entrypoints-recipes',
+  recipes: 'entrypoints-recipes',
+}
+
+export function normalizeConfigSection(section: string): LayoutConfigSection | undefined {
+  const normalized = section.toLowerCase()
+  if (CONFIG_SECTION_ALIASES[normalized]) return CONFIG_SECTION_ALIASES[normalized]
+  return CONFIG_SECTIONS.has(normalized as LayoutConfigSection)
+    ? (normalized as LayoutConfigSection)
+    : undefined
+}
+
+export function getConfigSectionFromPathname(pathname: string): LayoutConfigSection | undefined {
+  if (pathname !== '/config' && !pathname.startsWith('/config/')) return undefined
+
+  const section = pathname.split('/')[2] || 'global-config'
+  return normalizeConfigSection(section)
+}
+
+export const BUILD_MENU_CATEGORIES: LayoutMenuCategory[] = [
   {
-    items: [
-      { kind: 'route', label: 'Users', to: '/users' },
-      { kind: 'route', label: 'Security Policy', to: '/security' },
-      { kind: 'route', label: 'ClawOS', to: '/clawos' },
+    key: 'routing',
+    label: 'Routing',
+    description: 'Design the signal-to-decision path that selects each model route.',
+    sections: [
+      {
+        title: 'Models',
+        description: 'Connect models and compose public model endpoints.',
+        items: [
+          { kind: 'config', label: 'Models', icon: 'model', configSection: 'models' },
+          {
+            kind: 'config',
+            label: 'Mixture-of-Models',
+            icon: 'mixture',
+            configSection: 'entrypoints-recipes',
+          },
+        ],
+      },
+      {
+        title: 'Intelligence',
+        description: 'Shape the evidence and decisions behind every route.',
+        items: [
+          { kind: 'config', label: 'Signals', icon: 'signal', configSection: 'signals' },
+          {
+            kind: 'config',
+            label: 'Projections',
+            icon: 'projection',
+            configSection: 'projections',
+          },
+          { kind: 'config', label: 'Decisions', icon: 'decision', configSection: 'decisions' },
+        ],
+      },
+      {
+        title: 'Build',
+        description: 'See the whole system or edit its configuration.',
+        items: [
+          { kind: 'route', label: 'Brain', icon: 'topology', to: '/topology' },
+          { kind: 'route', label: 'Builder', icon: 'code', to: '/builder' },
+        ],
+      },
     ],
   },
   {
-    items: [
-      { kind: 'config', label: 'Models', configSection: 'models' },
-      { kind: 'config', label: 'Decisions', configSection: 'decisions' },
-      { kind: 'config', label: 'Signals', configSection: 'signals' },
-      { kind: 'config', label: 'Projections', configSection: 'projections' },
+    key: 'system-one',
+    label: 'System One',
+    description: 'Manage, test, and monitor the decision models behind routing intelligence.',
+    sections: [
+      {
+        title: 'Decision Models',
+        description: 'Select a decision model, deploy it, and manage its lifecycle.',
+        items: [{ kind: 'route', label: 'Decision Models', icon: 'model', to: '/decision-model' }],
+      },
+      {
+        title: 'Decision Playground',
+        description: 'Explore Choice, Score, Noul, Set, and Span with the System One API.',
+        items: [
+          {
+            kind: 'route',
+            label: 'Decision Playground',
+            icon: 'evaluation',
+            to: '/decision-model/playground',
+          },
+        ],
+      },
+      {
+        title: 'Decision Monitoring',
+        description: 'Follow readiness, traffic, latency, and cache performance.',
+        items: [
+          {
+            kind: 'route',
+            label: 'Decision Monitoring',
+            icon: 'chart',
+            to: '/decision-model/monitoring',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    key: 'outcomes',
+    label: 'Outcomes',
+    description: 'Inspect routing choices, measure quality, and tune model behavior.',
+    sections: [
+      {
+        title: 'Inspect',
+        description: 'Understand what the router selected and why.',
+        items: [
+          {
+            kind: 'route',
+            label: 'Insights',
+            icon: 'insight',
+            to: '/insights',
+            matchMode: 'prefix',
+          },
+        ],
+      },
+      {
+        title: 'Evaluate',
+        description: 'Benchmark signal and system-level behavior.',
+        items: [{ kind: 'route', label: 'Evaluation', icon: 'evaluation', to: '/evaluation' }],
+      },
     ],
   },
 ]
 
-export const KNOWLEDGE_BASE_MENU_SECTIONS: LayoutMenuSection[] = [
+export const OPERATE_MENU_CATEGORIES: LayoutMenuCategory[] = [
   {
-    title: 'Knowledge Base',
-    items: [
-      { kind: 'route', label: 'Bases', to: '/knowledge-bases/bases' },
-      { kind: 'route', label: 'Groups', to: '/knowledge-bases/groups' },
-      { kind: 'route', label: 'Labels', to: '/knowledge-bases/labels' },
+    key: 'runtime',
+    label: 'Runtime',
+    description: 'Check service readiness and diagnose the live routing path.',
+    sections: [
+      {
+        title: 'Models',
+        description: 'Explore model capabilities and deployment requirements.',
+        items: [{ kind: 'route', label: 'Model Hub', icon: 'model', to: '/models' }],
+      },
+      {
+        title: 'Health',
+        description: 'Track router services and loaded model readiness.',
+        items: [{ kind: 'route', label: 'Status', icon: 'status', to: '/status' }],
+      },
+      {
+        title: 'Diagnostics',
+        description: 'Read runtime events and investigate failures.',
+        items: [{ kind: 'route', label: 'Logs', icon: 'logs', to: '/logs' }],
+      },
     ],
   },
-]
-
-export const ANALYSIS_OPERATIONS_MENU_SECTIONS: LayoutMenuSection[] = [
   {
-    title: 'Analysis',
-    items: [
-      { kind: 'config', label: 'Global Config', configSection: 'global-config' },
-      { kind: 'route', label: 'Evaluation', to: '/evaluation' },
-      { kind: 'route', label: 'ML Setup', to: '/ml-setup' },
-      { kind: 'config', label: 'MCP Setup', configSection: 'mcp' },
+    key: 'observability',
+    label: 'Observability',
+    description: 'Follow metrics and traces across every routed request.',
+    sections: [
+      {
+        title: 'Metrics',
+        description: 'Open the operational dashboard for fleet and router telemetry.',
+        items: [{ kind: 'route', label: 'Grafana', icon: 'chart', to: '/monitoring' }],
+      },
+      {
+        title: 'Tracing',
+        description: 'Inspect request paths across the serving system.',
+        items: [{ kind: 'route', label: 'Tracing', icon: 'trace', to: '/tracing' }],
+      },
     ],
   },
   {
-    title: 'Observability',
-    items: [
-      { kind: 'route', label: 'Status', to: '/status' },
-      { kind: 'route', label: 'Logs', to: '/logs' },
-      { kind: 'route', label: 'Monitoring', to: '/monitoring' },
-      { kind: 'route', label: 'Tracing', to: '/tracing' },
+    key: 'platform-access',
+    label: 'Platform & Access',
+    description: 'Manage global defaults and who can change the control plane.',
+    sections: [
+      {
+        title: 'Platform',
+        description: 'Configure router-wide defaults and infrastructure bindings.',
+        items: [
+          {
+            kind: 'config',
+            label: 'Global Config',
+            icon: 'settings',
+            configSection: 'global-config',
+          },
+          {
+            kind: 'route',
+            label: 'Schema Reference',
+            icon: 'code',
+            to: '/config/reference',
+          },
+          {
+            kind: 'route',
+            label: 'Router API Docs',
+            icon: 'code',
+            to: '/api/router/docs',
+            reloadDocument: true,
+            target: '_blank',
+          },
+        ],
+      },
+      {
+        title: 'Integrations',
+        description: 'Extend the control plane with external tools.',
+        items: [{ kind: 'config', label: 'MCP Servers', icon: 'tool', configSection: 'mcp' }],
+      },
+      {
+        title: 'Access',
+        description: 'Administer dashboard identities and roles.',
+        items: [{ kind: 'route', label: 'Users', icon: 'user', to: '/users' }],
+      },
     ],
-  },
-]
-
-export const FLEET_SIM_MENU_SECTIONS: LayoutMenuSection[] = [
-  {
-    title: 'Simulator',
-    items: FLEET_SIM_NAV_ITEMS.map((item) => ({
-      kind: 'route' as const,
-      label: item.label,
-      to: item.to,
-    })),
   },
 ]
 
@@ -110,34 +284,58 @@ export function isLayoutMenuItemActive(
   item: LayoutMenuItem,
   pathname: string,
   isConfigPage: boolean,
-  configSection?: string
+  configSection?: string,
 ): boolean {
   if (item.kind === 'config') {
     return isConfigPage && configSection === item.configSection
   }
 
-  return pathname === item.to
+  return item.matchMode === 'prefix' ? pathname.startsWith(item.to) : pathname === item.to
 }
 
-export function hasActiveLayoutMenuSection(
-  sections: LayoutMenuSection[],
+export function hasActiveLayoutMenuCategory(
+  categories: LayoutMenuCategory[],
   pathname: string,
   isConfigPage: boolean,
-  configSection?: string
+  configSection?: string,
 ): boolean {
-  return sections.some(section =>
-    section.items.some(item => isLayoutMenuItemActive(item, pathname, isConfigPage, configSection))
+  return categories.some((category) =>
+    category.sections.some((section) =>
+      section.items.some((item) =>
+        isLayoutMenuItemActive(item, pathname, isConfigPage, configSection),
+      ),
+    ),
   )
 }
 
-export function filterLayoutMenuSections(
-  sections: LayoutMenuSection[],
-  predicate: (item: LayoutMenuItem) => boolean
-): LayoutMenuSection[] {
-  return sections
-    .map(section => ({
-      ...section,
-      items: section.items.filter(predicate),
+export function findActiveLayoutMenuCategory(
+  categories: LayoutMenuCategory[],
+  pathname: string,
+  isConfigPage: boolean,
+  configSection?: string,
+): string | undefined {
+  return categories.find((category) =>
+    category.sections.some((section) =>
+      section.items.some((item) =>
+        isLayoutMenuItemActive(item, pathname, isConfigPage, configSection),
+      ),
+    ),
+  )?.key
+}
+
+export function filterLayoutMenuCategories(
+  categories: LayoutMenuCategory[],
+  predicate: (item: LayoutMenuItem, category: LayoutMenuCategory) => boolean,
+): LayoutMenuCategory[] {
+  return categories
+    .map((category) => ({
+      ...category,
+      sections: category.sections
+        .map((section) => ({
+          ...section,
+          items: section.items.filter((item) => predicate(item, category)),
+        }))
+        .filter((section) => section.items.length > 0),
     }))
-    .filter(section => section.items.length > 0)
+    .filter((category) => category.sections.length > 0)
 }

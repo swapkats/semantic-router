@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
@@ -11,7 +11,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
-// GET /info/classifier dumps the live runtime config. Resolved upstream
+// GET /api/v1/inventory/classifier dumps the live runtime config. Resolved upstream
 // credentials (api_key_env expanded into VLLMEndpoint.APIKey /
 // ModelParams.AccessKey) must never appear in that JSON response.
 func TestClassifierInfoRedactsResolvedSecrets(t *testing.T) {
@@ -31,7 +31,7 @@ func TestClassifierInfoRedactsResolvedSecrets(t *testing.T) {
 	}
 	s := &ClassificationAPIServer{config: cfg}
 
-	req := httptest.NewRequest(http.MethodGet, "/info/classifier", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/inventory/classifier", nil)
 	rr := httptest.NewRecorder()
 	s.handleClassifierInfo(rr, req)
 
@@ -39,6 +39,37 @@ func TestClassifierInfoRedactsResolvedSecrets(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	if strings.Contains(rr.Body.String(), canary) {
-		t.Fatalf("/info/classifier leaked a resolved credential value in its response body")
+		t.Fatalf("/api/v1/inventory/classifier leaked a resolved credential value in its response body")
+	}
+}
+
+// The loader keeps a password such as $Secr3tPass as written, since only an
+// uppercase name is an environment reference. It must not pass as one here.
+func TestClassifierInfoRedactsADollarPasswordThatIsNoReference(t *testing.T) {
+	cfg, err := config.ParseYAMLBytes([]byte(`version: v0.5
+global:
+  services:
+    response_api:
+      store_backend: redis
+      redis:
+        address: 127.0.0.1:6379
+        password: "$Secr3tPass"
+`))
+	if err != nil {
+		t.Fatalf("ParseYAMLBytes() error = %v", err)
+	}
+	if cfg.ResponseAPI.Redis.Password != "$Secr3tPass" {
+		t.Fatalf("loaded password = %q", cfg.ResponseAPI.Redis.Password)
+	}
+	s := &ClassificationAPIServer{config: cfg}
+
+	rr := httptest.NewRecorder()
+	s.handleClassifierInfo(rr, httptest.NewRequest(http.MethodGet, "/api/v1/inventory/classifier", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "Secr3tPass") {
+		t.Fatalf("/api/v1/inventory/classifier showed a password that is not an environment reference")
 	}
 }

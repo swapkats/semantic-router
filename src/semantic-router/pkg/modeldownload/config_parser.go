@@ -1,7 +1,6 @@
 package modeldownload
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,8 +10,8 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
-// ExtractModelPaths extracts all model paths from the configuration
-// It recursively searches for fields named "ModelID", "Qwen3ModelPath", "GemmaModelPath",
+// ExtractModelPaths extracts canonical local model paths from the configuration.
+// It recursively searches for fields named "ModelID", "Qwen3ModelPath",
 // or any field ending with "ModelPath" (but excludes non-model paths like mapping_path, tools_db_path)
 func ExtractModelPaths(cfg *config.RouterConfig) []string {
 	var paths []string
@@ -31,7 +30,7 @@ func extractFromValue(v reflect.Value, paths *[]string, seen map[string]bool) {
 	}
 
 	// Dereference pointers
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return
 		}
@@ -42,6 +41,11 @@ func extractFromValue(v reflect.Value, paths *[]string, seen map[string]bool) {
 	case reflect.Struct:
 		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
+			// Opaque compiled registries contain remote provider model IDs,
+			// which are not router-owned artifacts even when an alias matches.
+			if !t.Field(i).IsExported() {
+				continue
+			}
 			field := v.Field(i)
 			recordModelPath(t.Field(i).Name, field, paths, seen)
 			extractFromValue(field, paths, seen)
@@ -64,7 +68,9 @@ func recordModelPath(fieldName string, field reflect.Value, paths *[]string, see
 		return
 	}
 
-	path := field.String()
+	// Registry aliases are local artifacts too. Resolve before filtering and
+	// deduplication so bare aliases use the same provisioning contract as paths.
+	path := config.ResolveModelPath(field.String())
 	if path == "" || !strings.HasPrefix(path, "models/") || seen[path] {
 		return
 	}
@@ -78,93 +84,19 @@ func recordModelPath(fieldName string, field reflect.Value, paths *[]string, see
 }
 
 func isModelPathField(fieldName string) bool {
-	return fieldName == "ModelID" ||
-		fieldName == "Qwen3ModelPath" ||
-		fieldName == "GemmaModelPath" ||
-		strings.HasSuffix(fieldName, "ModelPath")
+	return fieldName == "ModelID" || strings.HasSuffix(fieldName, "ModelPath")
 }
 
 // isModelDirectory checks if a path looks like a model directory (not a file)
 func isModelDirectory(path string) bool {
-	// If the basename has a file extension, treat it as a file rather than a model directory.
-	if filepath.Ext(filepath.Base(path)) != "" {
-		return false
-	}
-	return true
-}
-
-// BuildModelSpecs builds ModelSpec list from config and registry
-func BuildModelSpecs(cfg *config.RouterConfig) ([]ModelSpec, error) {
-	// Extract all model paths from config
-	paths := filterDisabledOptionalModelPaths(cfg, ExtractModelPaths(cfg))
-	requiredFilesByModel := ExtractRequiredFilesByModel(cfg)
-	addEmbeddingModelRequiredFiles(cfg, requiredFilesByModel)
-
-	// Allow empty paths for API-only configurations
-	if len(paths) == 0 {
-		return []ModelSpec{}, nil
-	}
-
-	// Get model registry from config
-	registry := cfg.MoMRegistry
-	if len(registry) == 0 {
-		return nil, fmt.Errorf("mom_registry is empty in configuration")
-	}
-
-	// Build specs
-	var specs []ModelSpec
-	for _, path := range paths {
-		repoID, ok := registry[path]
-		if !ok {
-			return nil, fmt.Errorf("model path %s not found in mom_registry", path)
-		}
-
-		requiredFiles := append([]string{}, DefaultRequiredFiles...)
-		for _, extra := range requiredFilesByModel[path] {
-			if extra != "" && !slices.Contains(requiredFiles, extra) {
-				requiredFiles = append(requiredFiles, extra)
-			}
-		}
-
-		specs = append(specs, ModelSpec{
-			LocalPath:     path,
-			RepoID:        repoID,
-			Revision:      "main",
-			RequiredFiles: requiredFiles,
-		})
-	}
-
-	return specs, nil
-}
-
-// embeddingModelWeightFiles are the files the candle embedding runtime loads to bring a
-// semantic embedding model up. They are deliberately stricter than the nested-weight
-// heuristic in IsModelComplete: a directory holding only config.json + onnx/ (the layout
-// shipped in the image) otherwise satisfies that heuristic via the nested *.onnx files and
-// the safetensors/tokenizer download is never triggered, leaving embedding_ready=false (#2172).
-var embeddingModelWeightFiles = []string{"model.safetensors", "tokenizer.json"}
-
-// addEmbeddingModelRequiredFiles marks the configured semantic embedding model as requiring
-// its safetensors weights and tokenizer so a partial (ONNX-only) directory is detected as
-// incomplete and the full snapshot is re-downloaded.
-func addEmbeddingModelRequiredFiles(cfg *config.RouterConfig, requiredFilesByModel map[string][]string) {
-	if cfg.EmbeddingModels.UsesRemoteEmbeddingBackend() {
-		return
-	}
-
-	// MmBertModelPath holds the configured semantic embedding model directory.
-	path := cfg.MmBertModelPath
-	if path == "" || !strings.HasPrefix(path, "models/") {
-		return
-	}
-
-	existing := requiredFilesByModel[path]
-	for _, fileName := range embeddingModelWeightFiles {
-		if !slices.Contains(existing, fileName) {
-			existing = append(existing, fileName)
-		}
-	}
-	requiredFilesByModel[path] = existing
+	// Versioned model directories can contain dots (for example Vela-1.0).
+	// Only known artifact extensions identify a file; the model registry owns
+	// whether a directory is actually provisionable.
+	ext := strings.ToLower(filepath.Ext(filepath.Base(path)))
+	return !slices.Contains([]string{
+		".json", ".yaml", ".yml", ".txt", ".bin", ".pt", ".pth",
+		".safetensors", ".onnx", ".data", ".xml", ".model", ".gguf",
+	}, ext)
 }
 
 // ExtractRequiredFilesByModel derives per-model completeness requirements from
@@ -180,7 +112,7 @@ func collectRequiredFilesByModel(v reflect.Value, requiredFilesByModel map[strin
 		return
 	}
 
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return
 		}
@@ -191,8 +123,11 @@ func collectRequiredFilesByModel(v reflect.Value, requiredFilesByModel map[strin
 	case reflect.Struct:
 		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
-			field := v.Field(i)
 			fieldType := t.Field(i)
+			if !fieldType.IsExported() {
+				continue
+			}
+			field := v.Field(i)
 			fieldName := fieldType.Name
 
 			if strings.HasSuffix(fieldName, "MappingPath") && field.Kind() == reflect.String {
@@ -217,7 +152,7 @@ func recordRequiredMappingFile(requiredFilesByModel map[string][]string, mapping
 		return
 	}
 
-	modelPath := filepath.Dir(mappingPath)
+	modelPath := config.ResolveModelPath(filepath.Dir(mappingPath))
 	fileName := filepath.Base(mappingPath)
 	if modelPath == "." || modelPath == "models" || fileName == "" || fileName == "." {
 		return

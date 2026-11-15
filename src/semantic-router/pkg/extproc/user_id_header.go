@@ -1,7 +1,6 @@
 package extproc
 
 import (
-	"encoding/json"
 	"os"
 	"strings"
 
@@ -26,24 +25,15 @@ func headerValueCI(ctx *RequestContext, canonical string) string {
 	return ""
 }
 
-// authHeaderUserID returns the authenticated user id from the authz header.
+// authHeaderUserID returns the authenticated user id from the configured
+// user id header (x-authz-user-id by default).
 // Matching is case-insensitive on the header name: Envoy/HTTP2 may normalize
 // keys differently than our canonical constant, and direct map lookup would miss.
 func authHeaderUserID(ctx *RequestContext) string {
-	return headerValueCI(ctx, headers.AuthzUserID)
-}
-
-func chatCompletionUserFieldFromBody(body []byte) string {
-	if len(body) == 0 {
+	if ctx == nil {
 		return ""
 	}
-	var req struct {
-		User string `json:"user"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(req.User)
+	return headerValueCI(ctx, ctx.identity.GetUserIDHeader())
 }
 
 // cacheScopeUserID resolves the user id used only for semantic-cache key scoping.
@@ -72,7 +62,10 @@ func cacheScopeUserID(ctx *RequestContext) string {
 		}
 	}
 	if strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_E2E_USER_FROM_BODY")) == "true" {
-		u := chatCompletionUserFieldFromBody(ctx.OriginalRequestBody)
+		u := ""
+		if ctx.SemanticRequest != nil {
+			u = strings.TrimSpace(ctx.SemanticRequest.Metadata["user_id"])
+		}
 		if u != "" {
 			logging.ComponentDebugEvent("extproc", "cache_scope_user_resolved", map[string]interface{}{
 				"request_id": ctx.RequestID,
@@ -87,4 +80,36 @@ func cacheScopeUserID(ctx *RequestContext) string {
 		"body_fallback_enabled": strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_E2E_USER_FROM_BODY")) == "true",
 	})
 	return ""
+}
+
+func responseCacheScope(ctx *RequestContext) string {
+	plugin := requestResponseCache(ctx)
+	if plugin == nil {
+		return "global"
+	}
+	scope := strings.TrimSpace(plugin.Scope)
+	if scope == "" {
+		return "user"
+	}
+	return scope
+}
+
+func responseCacheScopeIdentity(ctx *RequestContext) string {
+	switch responseCacheScope(ctx) {
+	case "global":
+		return ""
+	case "tenant":
+		return headerValueCI(ctx, headers.AuthzTenantID)
+	case "team":
+		if team := headerValueCI(ctx, headers.AuthzTeamID); team != "" {
+			return team
+		}
+		groups := strings.Split(headerValueCI(ctx, ctx.identity.GetUserGroupsHeader()), ",")
+		if len(groups) > 0 {
+			return strings.TrimSpace(groups[0])
+		}
+		return ""
+	default:
+		return cacheScopeUserID(ctx)
+	}
 }

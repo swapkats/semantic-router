@@ -1,29 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useLocation } from 'react-router-dom'
+import ConfigSaveWarnings from '../components/ConfigSaveWarnings'
+import ProductIcon from '../components/ProductIcon'
+import { responseConfigWarnings, type RouterConfigWarning } from '../utils/configSaveWarnings'
 import styles from './ConfigPageRouterConfigSection.module.css'
-import pageStyles from './ConfigPage.module.css'
-import ConfigPageLegacyCategoriesSection from './ConfigPageLegacyCategoriesSection'
+import ConfigPageListenerVSRPanel from './ConfigPageListenerVSRPanel'
 import ConfigPageManagerLayout from './ConfigPageManagerLayout'
 import {
   buildEffectiveRouterConfig,
   buildRouterSectionCards,
-  ROUTER_LAYER_META,
+  editedRouterSectionPatch,
+  routerLayerMeta,
   type RouterSectionBadge,
 } from './configPageRouterDefaultsSupport'
 import type { OpenEditModal } from './configPageRouterSectionSupport'
-import type { CanonicalGlobalConfig, ConfigData, Tool } from './configPageSupport'
+import type { CanonicalGlobalConfig, ConfigData } from './configPageSupport'
 
 type GlobalEditorMode = 'visual' | 'raw'
 
 interface ConfigPageRouterConfigSectionProps {
   config: ConfigData | null
-  toolsData: Tool[]
-  toolsLoading: boolean
-  toolsError: string | null
   isReadonly: boolean
   openEditModal: OpenEditModal
-  saveConfig: (config: ConfigData) => Promise<void>
   refreshConfig: () => Promise<void>
-  showLegacyCategories?: boolean
+  saveConfig: (config: ConfigData) => Promise<void>
 }
 
 function badgeClassName(badge: RouterSectionBadge): string {
@@ -39,15 +39,12 @@ function badgeClassName(badge: RouterSectionBadge): string {
 
 export default function ConfigPageRouterConfigSection({
   config,
-  toolsData,
-  toolsLoading,
-  toolsError,
   isReadonly,
   openEditModal,
-  saveConfig,
   refreshConfig,
-  showLegacyCategories = false,
+  saveConfig,
 }: ConfigPageRouterConfigSectionProps) {
+  const { hash } = useLocation()
   const [routerDefaults, setRouterDefaults] = useState<CanonicalGlobalConfig | null>(null)
   const [editorMode, setEditorMode] = useState<GlobalEditorMode>('visual')
   const [rawYaml, setRawYaml] = useState('{}\n')
@@ -55,6 +52,13 @@ export default function ConfigPageRouterConfigSection({
   const [rawSaving, setRawSaving] = useState(false)
   const [rawError, setRawError] = useState<string | null>(null)
   const [rawDirty, setRawDirty] = useState(false)
+  const [saveWarnings, setSaveWarnings] = useState<RouterConfigWarning[]>([])
+
+  useEffect(() => {
+    if (editorMode === 'visual' && hash.startsWith('#global-section-')) {
+      document.getElementById(hash.slice(1))?.scrollIntoView({ block: 'start' })
+    }
+  }, [editorMode, hash])
 
   const loadRawGlobalConfig = useCallback(async () => {
     setRawLoading(true)
@@ -119,14 +123,9 @@ export default function ConfigPageRouterConfigSection({
     config,
     routerConfig: effectiveRouterConfig,
     routerDefaults,
-    toolsData,
-    toolsLoading,
-    toolsError,
   })
 
   const configuredCount = sectionCards.filter((card) => card.data !== undefined).length
-  const routerDefaultsCount = sectionCards.filter((card) => card.sourceLabel === 'router effective defaults').length
-  const missingCount = sectionCards.length - configuredCount
   const sectionGroups = useMemo(() => {
     const groups = new Map<string, typeof sectionCards>()
     for (const card of sectionCards) {
@@ -136,24 +135,13 @@ export default function ConfigPageRouterConfigSection({
     }
     return Array.from(groups.entries()).map(([layer, cards]) => ({
       layer,
-      meta: ROUTER_LAYER_META[layer as keyof typeof ROUTER_LAYER_META],
+      meta: routerLayerMeta(layer),
       cards,
     }))
   }, [sectionCards])
 
   const saveRouterSettings = async (updates: Partial<ConfigData>) => {
-    if (showLegacyCategories) {
-      if (!config) {
-        throw new Error('Configuration not loaded yet.')
-      }
-
-      await saveConfig({
-        ...config,
-        ...updates,
-      })
-      return
-    }
-
+    setSaveWarnings([])
     const response = await fetch('/api/router/config/global/update', {
       method: 'POST',
       headers: {
@@ -166,13 +154,14 @@ export default function ConfigPageRouterConfigSection({
       const errorText = await response.text()
       throw new Error(errorText || `HTTP ${response.status}: ${response.statusText}`)
     }
+    setSaveWarnings(await responseConfigWarnings(response))
 
     await refreshConfig()
     await loadRouterDefaults()
     await loadRawGlobalConfig()
   }
 
-  const handleEditSection = (card: typeof sectionCards[number]) => {
+  const handleEditSection = (card: (typeof sectionCards)[number]) => {
     const isConfigured = card.data !== undefined
 
     openEditModal(
@@ -180,7 +169,10 @@ export default function ConfigPageRouterConfigSection({
       card.editData,
       card.editFields,
       async (data) => {
-        await saveRouterSettings(card.save(data))
+        const updates = isConfigured ? editedRouterSectionPatch(card, data) : card.save(data)
+        if (updates) {
+          await saveRouterSettings(updates)
+        }
       },
       isConfigured ? 'edit' : 'add',
     )
@@ -189,6 +181,7 @@ export default function ConfigPageRouterConfigSection({
   const handleSaveRawYaml = async () => {
     setRawSaving(true)
     setRawError(null)
+    setSaveWarnings([])
     try {
       const response = await fetch('/api/router/config/global/raw/update', {
         method: 'POST',
@@ -202,6 +195,7 @@ export default function ConfigPageRouterConfigSection({
         const message = await response.text()
         throw new Error(message || `HTTP ${response.status}: ${response.statusText}`)
       }
+      setSaveWarnings(await responseConfigWarnings(response))
 
       await refreshConfig()
       await loadRouterDefaults()
@@ -217,29 +211,25 @@ export default function ConfigPageRouterConfigSection({
     <ConfigPageManagerLayout
       eyebrow="Runtime"
       title="Global Config"
-      description="Router-owned runtime defaults are merged with your `config.yaml` `global` override. This surface edits the canonical `global` block while preserving the router's built-in defaults."
-      configArea="Global"
-      scope="Router runtime defaults and overrides"
-      panelEyebrow="Runtime"
-      panelTitle="Canonical Global Config"
-      panelDescription="Review the resolved router defaults, edit layered `global` overrides, and keep runtime modules aligned with the canonical v0.3 structure."
-      pills={sectionGroups.map((group, index) => ({
-        label: group.meta?.title || group.layer,
-        active: index === 0,
-      }))}
+      description="Shape how the router runs. Start with a layer, then tune only what you need."
     >
-      <div className={pageStyles.sectionPanel}>
-        <div className={pageStyles.sectionTableBlock}>
-          <div className={styles.blockHeader}>
-            <div>
-              <h2 className={styles.blockTitle}>Global Config Overview</h2>
-              <p className={styles.blockDescription}>
-                {routerDefaults
-                  ? 'The router resolved effective defaults successfully. Edits in this section write back to `config.yaml` under `global:`.'
-                  : 'Effective router defaults are unavailable right now. Cards below still show the canonical `global` sections and any loaded config.yaml overrides.'}
-              </p>
-            </div>
-            <div className={styles.modeToggle} role="tablist" aria-label="Global config editor mode">
+      <div className={styles.globalWorkspace}>
+        <header className={styles.workspaceHeader}>
+          <div className={styles.workspaceHeading}>
+            <span className={styles.workspaceEyebrow}>Runtime layers</span>
+            <h2>One place for router-wide behavior</h2>
+            <p>
+              {routerDefaults
+                ? 'These are the saved configuration values. Edit a section to override what should change; Kubernetes deployments need a rollout to apply saved changes.'
+                : 'Router defaults are offline. Saved overrides remain available to inspect and edit.'}
+            </p>
+          </div>
+          <div className={styles.workspaceControls}>
+            <div
+              className={styles.modeToggle}
+              role="tablist"
+              aria-label="Global config editor mode"
+            >
               <button
                 type="button"
                 className={`${styles.modeButton} ${editorMode === 'visual' ? styles.modeButtonActive : ''}`}
@@ -255,69 +245,94 @@ export default function ConfigPageRouterConfigSection({
                 Raw YAML
               </button>
             </div>
-          </div>
-
-          <div className={styles.overviewGrid}>
-            <div className={styles.overviewCard}>
-              <span className={styles.overviewLabel}>Global Sections</span>
-              <strong className={styles.overviewValue}>{sectionCards.length}</strong>
-              <span className={styles.overviewHint}>Canonical `global` sections tracked by the dashboard.</span>
-            </div>
-            <div className={styles.overviewCard}>
-              <span className={styles.overviewLabel}>Resolved By Router</span>
-              <strong className={styles.overviewValue}>{routerDefaultsCount}</strong>
-              <span className={styles.overviewHint}>Sections currently backed by router-owned defaults or effective merged values.</span>
-            </div>
-            <div className={styles.overviewCard}>
-              <span className={styles.overviewLabel}>Missing Or Inactive</span>
-              <strong className={styles.overviewValue}>{missingCount}</strong>
-              <span className={styles.overviewHint}>Sections not currently present in the effective `global` surface.</span>
+            <div className={styles.workspaceStatus}>
+              <span>{configuredCount} configured</span>
+              <span aria-hidden="true">·</span>
+              <span>{sectionCards.length} sections</span>
             </div>
           </div>
-        </div>
+        </header>
+        <ConfigSaveWarnings warnings={saveWarnings} />
 
         {editorMode === 'visual' ? (
-          <>
-            <div className={pageStyles.sectionTableBlock}>
-              <div className={styles.blockHeader}>
-                <div>
-                  <h2 className={styles.blockTitle}>Runtime Global Sections</h2>
-                  <p className={styles.blockDescription}>
-                    Cards mirror the layered canonical `global` block. Each editor writes back to the matching `global.router`, `global.services`, `global.stores`, `global.integrations`, or `global.model_catalog` path.
-                  </p>
-                </div>
-              </div>
-
+          <div className={styles.visualWorkspace}>
+            <nav className={styles.layerNav} aria-label="Global config layers">
+              <span className={styles.layerNavLabel}>Layers</span>
               {sectionGroups.map((group) => (
-                <section key={group.layer} className={styles.sectionGroup}>
-                  <div className={styles.groupHeader}>
+                <button
+                  key={group.layer}
+                  type="button"
+                  className={styles.layerNavItem}
+                  onClick={() =>
+                    document
+                      .getElementById(`global-layer-${group.layer}`)
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  }
+                >
+                  <span>{group.meta.title}</span>
+                  <span>{group.cards.length}</span>
+                </button>
+              ))}
+            </nav>
+
+            <div className={styles.layerStack}>
+              {sectionGroups.map((group, groupIndex) => (
+                <section
+                  key={group.layer}
+                  id={`global-layer-${group.layer}`}
+                  className={styles.sectionGroup}
+                >
+                  <header className={styles.groupHeader}>
+                    <span className={styles.groupIndex}>
+                      {String(groupIndex + 1).padStart(2, '0')}
+                    </span>
                     <div>
                       <h3 className={styles.groupTitle}>{group.meta.title}</h3>
                       <p className={styles.groupDescription}>{group.meta.description}</p>
                     </div>
-                  </div>
-                  <div className={styles.sectionGrid}>
+                  </header>
+                  <div className={styles.sectionList}>
                     {group.cards.map((card) => (
-                      <article key={card.key} className={styles.systemCard}>
-                        <div className={styles.cardHeader}>
+                      <article
+                        key={card.key}
+                        id={`global-section-${card.key}`}
+                        className={styles.systemRow}
+                      >
+                        <div className={styles.rowMain}>
                           <div className={styles.cardCopy}>
-                            <span className={styles.cardEyebrow}>{card.eyebrow}</span>
-                            <h3 className={styles.cardTitle}>{card.title}</h3>
+                            <div className={styles.cardTitleRow}>
+                              <h4 className={styles.cardTitle}>{card.title}</h4>
+                              <span className={`${styles.badge} ${badgeClassName(card.status)}`}>
+                                {card.status.label}
+                              </span>
+                            </div>
                             <p className={styles.cardDescription}>{card.description}</p>
                           </div>
-                          <div className={styles.cardBadges}>
-                            <span className={`${styles.badge} ${badgeClassName({ label: card.sourceLabel, tone: card.sourceTone })}`}>
+                          <div className={styles.rowActions}>
+                            <span
+                              className={`${styles.sourceBadge} ${badgeClassName({ label: card.sourceLabel, tone: card.sourceTone })}`}
+                            >
                               {card.sourceLabel}
                             </span>
-                            <span className={`${styles.badge} ${badgeClassName(card.status)}`}>
-                              {card.status.label}
-                            </span>
+                            {!isReadonly && !card.deprecation ? (
+                              <button
+                                type="button"
+                                className={styles.editButton}
+                                onClick={() => handleEditSection(card)}
+                              >
+                                <ProductIcon name="edit" width={14} height={14} />
+                                {card.data !== undefined ? 'Edit' : 'Configure'}
+                              </button>
+                            ) : null}
                           </div>
                         </div>
+                        {card.deprecation ? (
+                          <p className={styles.cardDescription}>{card.deprecation}</p>
+                        ) : null}
 
-                        <div className={styles.summaryList}>
+                        <div className={styles.summaryGrid}>
                           {card.summary.map((item) => (
-                            <div key={`${card.key}-${item.label}`} className={styles.summaryRow}>
+                            <div key={`${card.key}-${item.label}`} className={styles.summaryItem}>
                               <span className={styles.summaryLabel}>{item.label}</span>
                               <span className={styles.summaryValue} title={item.value}>
                                 {item.value}
@@ -329,42 +344,36 @@ export default function ConfigPageRouterConfigSection({
                         {card.badges.length > 0 && (
                           <div className={styles.tagRow}>
                             {card.badges.map((badge) => (
-                              <span key={`${card.key}-${badge.label}`} className={`${styles.badge} ${badgeClassName(badge)}`}>
+                              <span
+                                key={`${card.key}-${badge.label}`}
+                                className={`${styles.badge} ${badgeClassName(badge)}`}
+                              >
                                 {badge.label}
                               </span>
                             ))}
                           </div>
                         )}
-
-                        <div className={styles.cardFooter}>
-                          <code className={styles.sectionKey}>{`global.${card.path.join('.')}`}</code>
-                          {!isReadonly ? (
-                            <div className={styles.cardActions}>
-                              <button
-                                className={pageStyles.sectionEditButton}
-                                onClick={() => {
-                                  handleEditSection(card)
-                                }}
-                              >
-                                {card.data !== undefined ? 'Edit Section' : 'Add Section'}
-                              </button>
-                            </div>
-                          ) : null}
-                        </div>
+                        <code className={styles.sectionKey}>{`global.${card.path.join('.')}`}</code>
                       </article>
                     ))}
                   </div>
                 </section>
               ))}
+              <ConfigPageListenerVSRPanel
+                config={config}
+                isReadonly={isReadonly}
+                saveConfig={saveConfig}
+              />
             </div>
-          </>
+          </div>
         ) : (
-          <div className={pageStyles.sectionTableBlock}>
+          <section className={styles.rawWorkspace}>
             <div className={styles.blockHeader}>
               <div>
                 <h2 className={styles.blockTitle}>Raw Global YAML</h2>
                 <p className={styles.blockDescription}>
-                  This editor shows the effective merged `global` block: router defaults plus your current overrides. Saving raw YAML writes the full `global:` block back to `config.yaml`.
+                  Edit the complete effective <code>global</code> block. Saved values override
+                  router defaults.
                 </p>
               </div>
               <div className={styles.rawToolbar}>
@@ -407,24 +416,16 @@ export default function ConfigPageRouterConfigSection({
               />
               <div className={styles.rawHintRow}>
                 <span className={styles.rawHint}>
-                  Empty content removes the `global:` override block. Router defaults remain available at runtime.
+                  Empty content removes the `global:` override block. Router defaults remain
+                  available at runtime.
                 </span>
                 <span className={styles.rawDirtyState}>
                   {rawLoading ? 'Loading…' : rawDirty ? 'Unsaved changes' : 'Saved'}
                 </span>
               </div>
             </div>
-          </div>
+          </section>
         )}
-
-        {showLegacyCategories ? (
-          <ConfigPageLegacyCategoriesSection
-            config={config}
-            isReadonly={isReadonly}
-            openEditModal={openEditModal}
-            saveConfig={saveConfig}
-          />
-        ) : null}
       </div>
     </ConfigPageManagerLayout>
   )

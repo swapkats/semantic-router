@@ -8,12 +8,45 @@ This directory holds smoke, demo, and harness manifests that the repository uses
 - response API and hallucination test configs
 - ONNX binding test configs
 
+`config.hallucination.yaml` is the local hallucination router config. It runs
+the default Vela Halu detector in a router-managed model runtime, so the flow
+can be exercised locally with
+`./bin/router -config=e2e/config/config.hallucination.yaml` once the runtime is
+installed (`make model-runtime-install`).
+
+A remote hallucination check (a `hallucination` binding to a `systemone`
+deployment in `global.model_catalog.bindings`) is exercised by the
+Kubernetes E2E `hallucination` profile (`e2e/profiles/hallucination/values.yaml`). That profile asks the
+System One fixture of the shared `tools/test/services/provider-mocker` image and asserts the
+`x-vsr-warnings: hallucination` header. Run it with
+`make e2e-test E2E_PROFILE=hallucination`.
 `config.remote-embedding-smoke.yaml` is a manual local smoke config for validating
 `global.model_catalog.embeddings.semantic.embedding_config.backend: openai_compatible`
 without changing the default `config/config.yaml`. It uses mock chat backends on
 `host.docker.internal:18000` and `host.docker.internal:18001`, and reads the
 embedding provider credential from `OPENAI_API_KEY`. For Azure OpenAI-compatible
-providers, change `global.model_catalog.embeddings.semantic.endpoint.base_url` to
-`https://<resource>.openai.azure.com/openai/v1` before running the smoke.
+providers that accept bearer authentication, change
+`global.model_catalog.embeddings.semantic.endpoint.base_url` to
+`https://<resource>.openai.azure.com/openai/v1` before running the smoke. Endpoints
+that require the legacy `api-key` header are not supported by the current adapter.
+
+Run it against the current local image with:
+
+```bash
+make vllm-sr-dev
+VLLM_SR_IMAGE=ghcr.io/vllm-project/semantic-router/vllm-sr:latest \
+  OPENAI_API_KEY="<provider-key>" vllm-sr serve \
+  --config e2e/config/config.remote-embedding-smoke.yaml \
+  --image-pull-policy never \
+  --minimal
+curl -fsS http://localhost:8080/startup-status | jq '.embedding_provider'
+```
+
+The automated `remote-embedding` profile uses an in-cluster deterministic mock
+provider and does not require a real API key:
+
+```bash
+make e2e-test E2E_PROFILE=remote-embedding
+```
 
 These files are intentionally outside `config/` so the public config directory stays limited to canonical user-facing config plus routing fragments.

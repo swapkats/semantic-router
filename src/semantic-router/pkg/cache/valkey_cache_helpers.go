@@ -2,9 +2,13 @@ package cache
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	valkeyutil "github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/valkey"
 )
 
 // pendingEntry holds the parsed fields from a pending cache entry search result.
@@ -84,10 +88,10 @@ func parsePendingSearchResult(results interface{}, requestID string, prefix stri
 		logging.Warnf("UpdateWithResponse: docID '%s' doesn't have expected prefix '%s'", entry.docID, prefix)
 	}
 
-	logging.Debugf("UpdateWithResponse: extracted docID='%s', model='%s', query='%s'", entry.docID, entry.model, entry.query)
+	logging.Debugf("UpdateWithResponse: extracted docID='%s', model='%s', query=%s", entry.docID, entry.model, logging.ContentDescriptor(entry.query))
 
 	if entry.model == "" || entry.query == "" {
-		logging.Warnf("UpdateWithResponse: missing required fields (model='%s', query='%s')", entry.model, entry.query)
+		logging.Warnf("UpdateWithResponse: missing required fields (model='%s', query=%s)", entry.model, logging.ContentDescriptor(entry.query))
 		return nil, fmt.Errorf("missing required fields in pending entry")
 	}
 
@@ -97,12 +101,62 @@ func parsePendingSearchResult(results interface{}, requestID string, prefix stri
 // searchMatch holds the parsed fields from a vector search result.
 type searchMatch struct {
 	distance     float64
+	query        string
 	responseBody interface{}
+	timestamp    int64
+	ttlSeconds   int64
+}
+
+func extractSearchMatch(fieldsMap map[string]interface{}) (*searchMatch, bool) {
+	distanceVal, exists := fieldsMap["vector_distance"]
+	if !exists {
+		return nil, false
+	}
+
+	distance, err := strconv.ParseFloat(fmt.Sprint(distanceVal), 64)
+	if err != nil || math.IsNaN(distance) || math.IsInf(distance, 0) {
+		logging.Debugf("ValkeyCache.FindSimilarWithThreshold: failed to parse distance value: %v", err)
+		return nil, false
+	}
+
+	var timestamp int64
+	if tsVal, exists := fieldsMap["timestamp"]; exists {
+		var ts int64
+		if _, err := fmt.Sscanf(fmt.Sprint(tsVal), "%d", &ts); err == nil && ts > 0 {
+			timestamp = ts
+		}
+	}
+	var ttlSeconds int64
+	if ttlVal, exists := fieldsMap["ttl_seconds"]; exists {
+		var ttl int64
+		if _, err := fmt.Sscanf(fmt.Sprint(ttlVal), "%d", &ttl); err == nil && ttl > 0 {
+			ttlSeconds = ttl
+		}
+	}
+
+	query, _ := fieldsMap["query"].(string)
+	return &searchMatch{
+		distance:     distance,
+		query:        query,
+		responseBody: fieldsMap["response_body"],
+		timestamp:    timestamp,
+		ttlSeconds:   ttlSeconds,
+	}, true
 }
 
 // parseBestMatch extracts the best-match distance and response body from a Valkey FT.SEARCH vector result.
 // Returns nil when no valid match is found.
 func parseBestMatch(searchResult interface{}) *searchMatch {
+	var best *searchMatch
+	for _, candidate := range parseSearchMatches(searchResult) {
+		if best == nil || candidate.distance < best.distance {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func parseSearchMatches(searchResult interface{}) []*searchMatch {
 	resultsArray, ok := searchResult.([]interface{})
 	if !ok || len(resultsArray) < 2 {
 		return nil
@@ -122,7 +176,7 @@ func parseBestMatch(searchResult interface{}) *searchMatch {
 	// FT.SEARCH returns results ordered by distance, but Go map iteration
 	// in the valkey-glide response loses that ordering. Iterate all docs and
 	// pick the best one.
-	var best *searchMatch
+	matches := make([]*searchMatch, 0, len(docMap))
 	for _, docValue := range docMap {
 		fieldsMap, mapOk := docValue.(map[string]interface{})
 		if !mapOk {
@@ -130,72 +184,35 @@ func parseBestMatch(searchResult interface{}) *searchMatch {
 			continue
 		}
 
-		distanceVal, exists := fieldsMap["vector_distance"]
-		if !exists {
+		candidate, matchOk := extractSearchMatch(fieldsMap)
+		if matchOk {
+			matches = append(matches, candidate)
+		}
+	}
+
+	return matches
+}
+
+// GLIDE represents results as a map; rank the eligible candidates rather than
+// assuming iteration order or letting a polarity rejection end the search.
+func selectValkeyPolarityMatches(searchResult interface{}, queryTokens []string, bounds SimilarityBounds, metric string) SimilarEntries {
+	ranked := similarHits{bounds: bounds}
+	for _, candidate := range parseSearchMatches(searchResult) {
+		similarity := float32(valkeyutil.DistanceToSimilarity(metric, candidate.distance))
+		ranked.saw(similarity)
+		body, bodyOK := candidate.responseBody.(string)
+		if similarity < bounds.MinSimilarity || !bodyOK || body == "" ||
+			!semanticCandidateMatchesPolarity(queryTokens, candidate.query) {
 			continue
 		}
-
-		var distance float64
-		if _, err := fmt.Sscanf(fmt.Sprint(distanceVal), "%f", &distance); err != nil {
-			logging.Debugf("ValkeyCache.FindSimilarWithThreshold: failed to parse distance value: %v", err)
+		storedAt, expiresAt := valkeyTiming(candidate)
+		if !expiresAt.IsZero() && !time.Now().Before(expiresAt) {
 			continue
 		}
-
-		if best == nil || distance < best.distance {
-			best = &searchMatch{
-				distance:     distance,
-				responseBody: fieldsMap["response_body"],
-			}
-		}
+		hit := lookupResultFromTimestamps([]byte(body), similarity, storedAt, expiresAt)
+		hit.Query = candidate.query
+		hit.NegationGuard = negationGuardOutcomeFor(queryTokens, candidate.query)
+		ranked.add(hit)
 	}
-
-	return best
-}
-
-// escapeTagValue escapes punctuation and whitespace in a string so it can be
-// safely used inside a Valkey/Redis TAG query expression (@field:{value}).
-// TAG queries treat punctuation characters as token separators; backslash-
-// escaping them preserves the literal value.
-// Reference: https://forum.redis.com/t/tag-fields-and-escaping/96
-func escapeTagValue(s string) string {
-	// Characters that must be backslash-escaped in TAG query values.
-	// These are the punctuation/space characters that the RediSearch/Valkey
-	// query tokenizer treats as separators.
-	const specialChars = " \t,.<>{}[]\"':;!@#$%^&*()-+=~|/\\"
-
-	var b strings.Builder
-	b.Grow(len(s) + 8) // most IDs need only a few extra backslashes
-	for _, c := range s {
-		if strings.ContainsRune(specialChars, c) {
-			b.WriteByte('\\')
-		}
-		b.WriteRune(c)
-	}
-	return b.String()
-}
-
-// distanceToSimilarity converts a vector distance to a similarity score based on the metric type.
-func distanceToSimilarity(metricType string, distance float64) float32 {
-	switch metricType {
-	case "COSINE":
-		return 1.0 - float32(distance)/2.0
-	case "IP":
-		return float32(distance)
-	case "L2":
-		return 1.0 / (1.0 + float32(distance))
-	default:
-		return 1.0 - float32(distance)
-	}
-}
-
-// extractResponseBody returns the response bytes from a search match, or nil if missing/empty.
-func extractResponseBody(match *searchMatch) []byte {
-	if match.responseBody == nil {
-		return nil
-	}
-	s := fmt.Sprint(match.responseBody)
-	if s == "" {
-		return nil
-	}
-	return []byte(s)
+	return ranked.entries()
 }

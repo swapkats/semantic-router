@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 /*
 Copyright 2025 vLLM Semantic Router.
@@ -19,6 +19,7 @@ limitations under the License.
 package apiserver
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -69,7 +70,7 @@ func (s *ClassificationAPIServer) handleCreateVectorStore(w http.ResponseWriter,
 
 	vs, err := manager.CreateStore(r.Context(), req)
 	if err != nil {
-		s.writeErrorResponse(w, http.StatusInternalServerError, "CREATE_FAILED", "failed to create vector store")
+		s.writeVectorStoreMutationError(w, err, "CREATE_FAILED", "failed to create vector store")
 		return
 	}
 
@@ -90,9 +91,9 @@ func (s *ClassificationAPIServer) handleListVectorStores(w http.ResponseWriter, 
 
 	stores := manager.ListStores(params)
 
-	response := map[string]interface{}{
-		"object": "list",
-		"data":   stores,
+	response := objectListResponse[*vectorstore.VectorStore]{
+		Object: "list",
+		Data:   stores,
 	}
 	s.writeJSONResponse(w, http.StatusOK, response)
 }
@@ -104,7 +105,7 @@ func (s *ClassificationAPIServer) handleGetVectorStore(w http.ResponseWriter, r 
 		return
 	}
 
-	id := extractPathParam(r.URL.Path, "/v1/vector_stores/")
+	id := extractPathParam(r.URL.Path, apiStorageVectorStoresPath+"/")
 	if id == "" {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "vector store ID is required")
 		return
@@ -126,7 +127,7 @@ func (s *ClassificationAPIServer) handleUpdateVectorStore(w http.ResponseWriter,
 		return
 	}
 
-	id := extractPathParam(r.URL.Path, "/v1/vector_stores/")
+	id := extractPathParam(r.URL.Path, apiStorageVectorStoresPath+"/")
 	if id == "" {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "vector store ID is required")
 		return
@@ -140,7 +141,7 @@ func (s *ClassificationAPIServer) handleUpdateVectorStore(w http.ResponseWriter,
 
 	vs, err := manager.UpdateStore(r.Context(), id, req)
 	if err != nil {
-		s.writeErrorResponse(w, http.StatusNotFound, "NOT_FOUND", "vector store not found")
+		s.writeVectorStoreMutationError(w, err, "UPDATE_FAILED", "failed to update vector store")
 		return
 	}
 
@@ -154,22 +155,35 @@ func (s *ClassificationAPIServer) handleDeleteVectorStore(w http.ResponseWriter,
 		return
 	}
 
-	id := extractPathParam(r.URL.Path, "/v1/vector_stores/")
+	id := extractPathParam(r.URL.Path, apiStorageVectorStoresPath+"/")
 	if id == "" {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "vector store ID is required")
 		return
 	}
 
 	if err := manager.DeleteStore(r.Context(), id); err != nil {
-		s.writeErrorResponse(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+		s.writeVectorStoreMutationError(w, err, "DELETE_FAILED", "failed to delete vector store")
 		return
 	}
 
-	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-		"id":      id,
-		"object":  "vector_store.deleted",
-		"deleted": true,
+	s.writeJSONResponse(w, http.StatusOK, objectDeletedResponse{
+		ID:      id,
+		Object:  "vector_store.deleted",
+		Deleted: true,
 	})
+}
+
+// writeVectorStoreMutationError answers 400 for metadata the router owns, 404
+// for a store that does not exist, and 500 when the change could not be made.
+func (s *ClassificationAPIServer) writeVectorStoreMutationError(w http.ResponseWriter, err error, code, message string) {
+	switch {
+	case errors.Is(err, vectorstore.ErrReservedMetadataKey):
+		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+	case errors.Is(err, vectorstore.ErrStoreNotFound):
+		s.writeErrorResponse(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+	default:
+		s.writeErrorResponse(w, http.StatusInternalServerError, code, message)
+	}
 }
 
 // extractPathParam extracts the ID parameter from a URL path after the given prefix.

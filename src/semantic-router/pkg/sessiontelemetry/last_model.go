@@ -32,9 +32,10 @@ type lastModelState struct {
 // telemetry and transition stores; durable cross-replica persistence is tracked
 // as follow-up debt.
 type lastModelStore struct {
-	mu       sync.Mutex
-	sessions map[string]*lastModelState
-	nowFn    func() time.Time
+	mu        sync.Mutex
+	sessions  map[string]*lastModelState
+	nowFn     func() time.Time
+	lastEvict time.Time
 }
 
 var globalLastModelStore = &lastModelStore{
@@ -77,6 +78,15 @@ func GetLastModel(sessionID string) (string, bool) {
 // GetLastModelInfo returns the most recent model and idle age for sessionID.
 // Passing a zero now uses the store clock.
 func GetLastModelInfo(sessionID string, now time.Time) (string, time.Duration, bool) {
+	return lastModelInfo(sessionID, now, true)
+}
+
+// PeekLastModelInfo leaves expired entries untouched for read-only preview.
+func PeekLastModelInfo(sessionID string, now time.Time) (string, time.Duration, bool) {
+	return lastModelInfo(sessionID, now, false)
+}
+
+func lastModelInfo(sessionID string, now time.Time, mutate bool) (string, time.Duration, bool) {
 	if sessionID == "" {
 		return "", 0, false
 	}
@@ -95,13 +105,22 @@ func GetLastModelInfo(sessionID string, now time.Time) (string, time.Duration, b
 		idleFor = 0
 	}
 	if idleFor > ttl {
-		delete(s.sessions, sessionID)
+		if mutate {
+			delete(s.sessions, sessionID)
+		}
 		return "", 0, false
 	}
 	return st.model, idleFor, true
 }
 
+// evictExpiredLocked is throttled to one full sweep per evictInterval, like
+// evictLocked. RecordLastModel overwrites every field, so an expired entry
+// reused before the next sweep carries nothing stale. Callers must hold s.mu.
 func (s *lastModelStore) evictExpiredLocked(t time.Time) {
+	if !s.lastEvict.IsZero() && t.Sub(s.lastEvict) < evictInterval {
+		return
+	}
+	s.lastEvict = t
 	for k, v := range s.sessions {
 		if t.Sub(v.lastSeen) > ttl {
 			delete(s.sessions, k)
@@ -136,6 +155,7 @@ func ResetLastModelForTesting() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions = make(map[string]*lastModelState)
+	s.lastEvict = time.Time{}
 }
 
 // setLastModelNowForTesting overrides the store clock for deterministic TTL

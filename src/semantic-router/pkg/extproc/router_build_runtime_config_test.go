@@ -47,30 +47,30 @@ func TestResolveInitialRouterConfigWithEmptyRuntimeRegistryParsesFileBeforeGloba
 func writeRuntimeRegistryFileConfig(t *testing.T, path string) {
 	t.Helper()
 	content := []byte(`
-version: v0.3
+version: v0.5
 listeners:
   - name: http
     address: 0.0.0.0
     port: 8888
 providers:
   defaults:
-    default_model: file-model
+    model: file-model
   models:
     - name: file-model
       backend_refs:
         - endpoint: 127.0.0.1:8000
-routing:
-  modelCards:
-    - name: file-model
-  decisions:
-    - name: default-route
-      priority: 1
-      rules:
-        operator: AND
-        conditions: []
-      modelRefs:
-        - model: file-model
-          use_reasoning: false
+          provider: vllm
+recipes:
+  - name: default
+    decisions:
+      - name: default-route
+        priority: 1
+        rules:
+          operator: AND
+          conditions: []
+        modelRefs:
+          - model: file-model
+            use_reasoning: false
 `)
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatalf("write runtime registry file config: %v", err)

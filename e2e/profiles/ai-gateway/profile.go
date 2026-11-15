@@ -4,43 +4,49 @@ import (
 	"context"
 
 	"github.com/vllm-project/semantic-router/e2e/pkg/framework"
+	"github.com/vllm-project/semantic-router/e2e/pkg/helpers"
 	gatewaystack "github.com/vllm-project/semantic-router/e2e/pkg/stacks/gateway"
 	"github.com/vllm-project/semantic-router/e2e/pkg/testmatrix"
-
 	_ "github.com/vllm-project/semantic-router/e2e/testcases"
 )
 
 const valuesFile = "e2e/profiles/ai-gateway/values.yaml"
 
 var resourceManifests = []string{
-	"deploy/kubernetes/ai-gateway/aigw-resources/base-model.yaml",
+	"e2e/profiles/ai-gateway/gateway-resources/backend.yaml",
 	"deploy/kubernetes/ai-gateway/aigw-resources/gwapi-resources.yaml",
+	"e2e/profiles/ai-gateway/gateway-resources/base-model-route.yaml",
+	"e2e/profiles/ai-gateway/gateway-resources/responses-route.yaml",
 }
 
-// Profile implements the default Kubernetes baseline test profile.
+// Profile implements the Envoy AI Gateway baseline test profile.
 type Profile struct {
 	stack *gatewaystack.Stack
 }
 
-// NewProfile creates the default Kubernetes profile backed by the shared AI Gateway stack.
+// NewProfile creates the baseline profile backed by the shared Envoy AI Gateway stack.
 func NewProfile() *Profile {
 	return &Profile{
 		stack: gatewaystack.New(gatewaystack.Config{
 			Name:                     "ai-gateway",
 			SemanticRouterValuesFile: valuesFile,
-			ResourceManifests:        resourceManifests,
+			// provider-mocker serves the System One and embedding fixtures,
+			// which the Router prepares as it starts.
+			PrerequisiteManifests: []string{"deploy/kubernetes/hallucination/provider-mocker.yaml"},
+			PrerequisiteWaits:     []helpers.DeploymentRef{{Namespace: "default", Name: "provider-mocker"}},
+			ResourceManifests:     resourceManifests,
 		}),
 	}
 }
 
 // Name returns the profile name.
 func (p *Profile) Name() string {
-	return "kubernetes"
+	return "envoy-ai-gateway"
 }
 
 // Description returns the profile description.
 func (p *Profile) Description() string {
-	return "Tests Semantic Router through the default Kubernetes baseline powered by Envoy AI Gateway"
+	return "Tests the baseline Semantic Router contract through Envoy AI Gateway"
 }
 
 // Setup deploys the shared gateway stack.
@@ -55,7 +61,12 @@ func (p *Profile) Teardown(ctx context.Context, opts *framework.TeardownOptions)
 
 // GetTestCases returns the list of test cases for this profile.
 func (p *Profile) GetTestCases() []string {
-	return testmatrix.Combine(testmatrix.BaselineRouterContract)
+	return testmatrix.Combine(
+		testmatrix.BaselineRouterContract,
+		// The delegated credential contract is off here; its header must
+		// still never reach the backend (issue #2286 default-disabled behavior).
+		[]string{"delegated-credential-disabled"},
+	)
 }
 
 // GetServiceConfig returns the service configuration for accessing the deployed service.

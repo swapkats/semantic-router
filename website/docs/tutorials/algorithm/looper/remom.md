@@ -2,14 +2,10 @@
 
 ## Overview
 
-`remom` is a **looper** algorithm for breadth-controlled multi-model orchestration with intelligent synthesis. It performs multi-round parallel reasoning and synthesizes the best answer from all responses.
+`remom` runs several candidate models across bounded rounds and synthesizes
+their responses into one answer.
 
-It aligns to `config/algorithm/looper/remom.yaml`.
-
-The runtime also supports a direct ReMoM model slug through
-`global.integrations.looper.remom.model_names`. The built-in default is
-`vllm-sr/remom`. Direct ReMoM calls evaluate only decisions with
-`algorithm.type=remom`, matching the direct Fusion and Flow model surfaces.
+Expose `remom` through an ordinary `entrypoints` mapping to a recipe. The public name has no built-in dispatch behavior: the selected recipe evaluates its signals and decisions, and `algorithm.type=remom` activates the algorithm. Use a dedicated recipe when this entrypoint should run only remom policies.
 
 **Inspired by**: [PaCoRe](https://arxiv.org/abs/2601.05593) — extended to support mixture of models.
 
@@ -30,6 +26,9 @@ ReMoM orchestrates multiple rounds of parallel model calls:
 2. **Compaction**: Optionally compact intermediate responses (full or last_n_tokens).
 3. **Round 2**: Launch `breadth_schedule[1]` calls, feeding compacted responses as context.
 4. **Final Synthesis**: One final call synthesizes all intermediate results into a coherent answer.
+
+ReMoM backend subrequests are non-streaming so each round receives complete
+outputs. A streaming client response is emitted only after final synthesis.
 
 The breadth schedule controls how many calls happen per round. For example `[32, 4]` means 32 calls in round 1, 4 in round 2, then 1 final synthesis call.
 
@@ -63,7 +62,7 @@ flowchart TD
 | `weighted` | Distribute calls proportional to model weights in `modelRefs` |
 | `equal` | Distribute calls equally across all candidate models |
 | `round_robin` | Cycle through candidate models in configured order |
-| `first_only` | All calls go to the first (highest-weight) model |
+| `first_only` | All calls go to the first declared model |
 
 ## What Problem Does It Solve?
 
@@ -85,43 +84,42 @@ Some tasks benefit from parallel exploration and later synthesis rather than one
 
 ## Configuration
 
-Register the direct model slug:
+Map the public name to the recipe shown below. Declare it as its own recipe, and point the entrypoint at it, to isolate it from the other recipes.
 
 ```yaml
-global:
-  integrations:
-    looper:
-      endpoint: http://localhost:8899/v1/chat/completions
-      remom:
-        model_names:
-          - vllm-sr/remom
+entrypoints:
+  - model_names: [vllm-sr/remom]
+    recipe: default
 ```
 
 Configure a ReMoM decision:
 
 ```yaml
-routing:
-  decisions:
-    - name: reasoning_panel
-      output_contract: Preserve any explicit output format exactly.
-      output_contract_spec:
-        type: reference_selection
-        reference:
-          source: candidate_responses
-          id_format: index
-        extract:
-          mode: exact
-          sources: [content]
-        postprocess:
-          - type: dereference_selected_reference
-      modelRefs:
-        - model: qwen3-32b
-        - model: deepseek-worker
-      algorithm:
-        type: remom
-        remom:
-          breadth_schedule: [3, 2]
-          model_distribution: weighted
+recipes:
+  - name: default
+    decisions:
+      - name: reasoning_panel
+        description: Combine a bounded reasoning panel into one answer.
+        priority: 100
+        output_contract: Preserve any explicit output format exactly.
+        output_contract_spec:
+          type: reference_selection
+          reference:
+            source: candidate_responses
+            id_format: index
+          extract:
+            mode: exact
+            sources: [content]
+          postprocess:
+            - type: dereference_selected_reference
+        modelRefs:
+          - model: qwen3-32b
+          - model: deepseek-worker
+        algorithm:
+          type: remom
+          remom:
+            breadth_schedule: [3, 2]
+            model_distribution: weighted
 ```
 
 `output_contract` is decision-scoped prompt text. Use it for benchmark or
@@ -129,15 +127,18 @@ application format requirements that should apply across ReMoM, Fusion, and
 Flow instead of hard-coding task-specific prompts into an algorithm.
 `output_contract_spec` is the typed router-executable contract for post-processing
 and normalization; keep runtime behavior there instead of encoding it as
-prompt-text heuristics. Extraction defaults to exact `content` matching; use
+prompt-text heuristics. Only Fusion, ReMoM and Flow decisions accept it.
+Dereferencing serves the selected reference's content and never its reasoning.
+Extraction defaults to exact `content` matching; use
 `extract.sources` or `extract.mode: json_object` only when the decision
 explicitly permits a wider parser.
 
-Algorithm-only fragment:
+Minimal algorithm configuration:
 
 ```yaml
 algorithm:
   type: remom
+  on_error: skip                       # skip or fail
   remom:
     breadth_schedule: [3, 2]            # Parallel calls before final synthesis
     model_distribution: weighted         # weighted, equal, round_robin, or first_only
@@ -147,12 +148,12 @@ algorithm:
     compaction_tokens: 1000              # Tokens to keep for last_n_tokens
     synthesis_template: ""               # Custom synthesis template (optional)
     max_concurrent: 3                    # Max concurrent calls per round
+    max_completion_tokens: 1024          # Completion limit for each subrequest
     round_timeout_seconds: 120           # Optional round-level wait cap
     min_successful_responses: 2          # Optional early-success quorum
     shuffle_seed: 42                     # Seed for response shuffling
     include_intermediate_responses: false # Include intermediate responses in output
     max_responses_per_round: null        # Limit responses per round
-    on_error: skip                       # skip or fail
 ```
 
 ### Parameters
@@ -161,15 +162,49 @@ algorithm:
 |-----------|------|---------|-------------|
 | `breadth_schedule` | list[int] | **required** | Parallel calls before the final synthesis call (e.g., `[3, 2]`) |
 | `model_distribution` | string | `weighted` | Strategy: `weighted`, `equal`, `round_robin`, `first_only` |
-| `temperature` | float | `1.0` | Temperature for model calls |
+| `temperature` | float | the request's | Temperature for model calls |
 | `include_reasoning` | bool | `false` | Include reasoning content in synthesis prompts |
 | `compaction_strategy` | string | `full` | Strategy: `full` or `last_n_tokens` |
 | `compaction_tokens` | int | `1000` | Tokens to keep for `last_n_tokens` compaction |
 | `synthesis_template` | string | — | Custom synthesis prompt template |
 | `max_concurrent` | int | — | Maximum concurrent model calls per round |
-| `round_timeout_seconds` | int | — | Maximum seconds to wait for a round before using partial responses when `on_error: skip` |
+| `max_completion_tokens` | int | request default | Maximum completion tokens applied to every ReMoM subrequest |
+| `round_timeout_seconds` | int | — | Maximum seconds to wait for a round before using partial responses when `algorithm.on_error: skip` |
 | `min_successful_responses` | int | — | Return from a parallel round after this many successful responses |
-| `shuffle_seed` | int | `42` | Random seed for response shuffling |
-| `include_intermediate_responses` | bool | `true` | Include intermediate responses in output |
+| `shuffle_seed` | int | `0` | Random seed for response shuffling |
+| `include_intermediate_responses` | bool | `false` | Include intermediate responses in output |
 | `max_responses_per_round` | int | — | Maximum responses to keep per round |
-| `on_error` | string | `skip` | Behavior on failure: `skip` or `fail` |
+
+Without a `remom` block, ReMoM runs `breadth_schedule: [4]` with
+`temperature: 1.0`, `shuffle_seed: 42` and `include_intermediate_responses:
+true`.
+
+`algorithm.on_error`, beside the type, decides what a failed call does: `skip`
+(the default) continues with the responses that succeeded, `fail` ends the run.
+Like every executor, ReMoM also reads `algorithm.budget`; see
+[Executors](../overview#executors).
+
+Each round shares request-derived and intermediate text with its assigned
+models, and the synthesis model receives the collected results. Bound breadth,
+completion tokens, concurrency, and timeouts before production use. See a
+complete example:
+[`config/fragments/algorithm/looper/remom.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/algorithm/looper/remom.yaml).
+
+## Optional trace transport
+
+Router-generated `reasoning_mom_responses` evidence is preserved in OpenAI Chat Completions JSON
+and SSE responses, including tool-call responses where the algorithm supports
+them. The trace is optional: if adding it would exceed the complete response
+limit or an individual SSE frame limit, the router omits the whole trace while
+serving the valid answer. It does not truncate trace JSON or answer text.
+
+OpenAI Responses and Anthropic Messages responses omit this Chat-specific
+extension. Both an unsupported target protocol and a size-based omission emit a
+`x-vsr-warnings` response header with action `dropped`, field `reasoning_mom_responses`,
+and reason `router_extension_unsupported_protocol` or
+`router_extension_size_limit`. The warning also accompanies immediate Looper
+responses. Required answer content remains subject to the normal protocol
+limits; an answer that cannot fit is rejected.
+
+Provider fields do not acquire router provenance by using the same name. The
+router validates provider content separately from its internal trace data.

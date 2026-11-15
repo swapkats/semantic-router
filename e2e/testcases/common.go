@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vllm-project/semantic-router/e2e/pkg/fixtures"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/vllm-project/semantic-router/e2e/pkg/fixtures"
 	pkgtestcases "github.com/vllm-project/semantic-router/e2e/pkg/testcases"
 )
 
@@ -17,17 +17,6 @@ import (
 // and returns the local port to use for HTTP requests and a cleanup function
 func setupServiceConnection(ctx context.Context, client *kubernetes.Clientset, opts pkgtestcases.TestCaseOptions) (string, func(), error) {
 	session, err := fixtures.OpenServiceSession(ctx, client, opts)
-	if err != nil {
-		return "", nil, err
-	}
-	return session.LocalPort(), session.Close, nil
-}
-
-// setupRouterAPIConnection sets up port forwarding to the semantic-router API service
-// This is used for accessing /api/v1/feedback and /api/v1/ratings endpoints
-// which are not exposed through the Envoy Gateway
-func setupRouterAPIConnection(ctx context.Context, client *kubernetes.Clientset, opts pkgtestcases.TestCaseOptions) (string, func(), error) {
-	session, err := fixtures.OpenRouterAPISession(ctx, client, opts)
 	if err != nil {
 		return "", nil, err
 	}
@@ -129,4 +118,15 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// headerListContains reports whether a comma-separated header value contains
+// the exact entry after trimming whitespace around each element.
+func headerListContains(headerValue string, entry string) bool {
+	for _, part := range strings.Split(headerValue, ",") {
+		if strings.TrimSpace(part) == entry {
+			return true
+		}
+	}
+	return false
 }

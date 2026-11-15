@@ -1,8 +1,25 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Request } from '@playwright/test'
 import {
+  dashboardSettingsResponse,
   mockAuthenticatedAppShell,
   mockAuthenticatedSession,
-} from "./support/auth";
+  TEST_CSRF_TOKEN,
+} from './support/auth'
+
+// Login and bootstrap set both cookies on the response. Only vsr_csrf is
+// script-readable; the browser sends vsr_session on later same-origin requests.
+const sessionResponseHeaders = (token: string) => ({
+  'Content-Type': 'application/json',
+  'Set-Cookie': [
+    `vsr_session=${token}; Path=/; HttpOnly; SameSite=Lax`,
+    `vsr_csrf=${TEST_CSRF_TOKEN}; Path=/; SameSite=Lax`,
+  ].join('\n'),
+})
+
+async function hasSessionCookie(request: Request, token: string): Promise<boolean> {
+  const cookie = await request.headerValue('cookie')
+  return cookie?.split(';').some((part) => part.trim() === `vsr_session=${token}`) ?? false
+}
 
 const baseSetupState = {
   setupMode: false,
@@ -12,264 +29,339 @@ const baseSetupState = {
   hasModels: true,
   hasDecisions: true,
   canActivate: true,
-};
+}
 
 const replayRecordWithDetailedToolTrace = {
-  id: "replay-sensitive-1",
-  timestamp: "2026-04-02T10:00:00Z",
-  request_id: "req-sensitive-1",
-  decision: "business-route",
+  id: 'replay-sensitive-1',
+  timestamp: '2026-04-02T10:00:00Z',
+  request_id: 'req-sensitive-1',
+  decision: 'business-route',
   decision_tier: 1,
   decision_priority: 210,
-  original_model: "test-model",
-  selected_model: "test-model",
-  reasoning_mode: "on",
-  selection_method: "static",
+  original_model: 'test-model',
+  selected_model: 'test-model',
+  reasoning_mode: 'on',
+  selection_method: 'static',
   signals: {
-    domain: ["business"],
+    domain: ['business'],
   },
   tool_trace: {
-    flow: "User Query -> Tool Calling -> Tool Execute -> LLM Answer",
-    stage: "assistant_final_response",
-    tool_names: ["fetch_price"],
+    flow: 'User Query -> Tool Calling -> Tool Execute -> LLM Answer',
+    stage: 'assistant_final_response',
+    tool_names: ['fetch_price'],
     steps: [
       {
-        type: "user_input",
-        text: "Confidential flow prompt 7A",
+        type: 'user_input',
+        text: 'Confidential flow prompt 7A',
       },
       {
-        type: "assistant_tool_call",
-        tool_name: "fetch_price",
-        arguments: "{\"ticker\":\"NVDA\",\"window\":\"90d\"}",
+        type: 'assistant_tool_call',
+        tool_name: 'fetch_price',
+        arguments: '{"ticker":"NVDA","window":"90d"}',
       },
       {
-        type: "client_tool_result",
-        tool_name: "fetch_price",
-        text: "Confidential tool result 7B",
+        type: 'client_tool_result',
+        tool_name: 'fetch_price',
+        text: 'Confidential tool result 7B',
       },
       {
-        type: "assistant_final_response",
-        text: "Confidential final answer 7C",
+        type: 'assistant_final_response',
+        text: 'Confidential final answer 7C',
       },
     ],
   },
-  request_body: "{\"input\":\"sensitive request\"}",
-  response_body: "{\"output\":\"sensitive response\"}",
+  request_body: '{"input":"sensitive request"}',
+  response_body: '{"output":"sensitive response"}',
   response_status: 200,
   from_cache: false,
   streaming: false,
-};
+}
 
 const redactedReplayRecordWithDetailedToolTrace = {
   ...replayRecordWithDetailedToolTrace,
-  request_body: "",
-  response_body: "",
+  request_body: '',
+  response_body: '',
   tool_trace: {
     ...replayRecordWithDetailedToolTrace.tool_trace,
     steps: [
       {
-        type: "user_input",
+        type: 'user_input',
         content_redacted: true,
       },
       {
-        type: "assistant_tool_call",
-        tool_name: "fetch_price",
+        type: 'assistant_tool_call',
+        tool_name: 'fetch_price',
         content_redacted: true,
       },
       {
-        type: "client_tool_result",
-        tool_name: "fetch_price",
-        status: "succeeded",
+        type: 'client_tool_result',
+        tool_name: 'fetch_price',
+        status: 'succeeded',
         content_redacted: true,
       },
       {
-        type: "assistant_final_response",
+        type: 'assistant_final_response',
         content_redacted: true,
       },
     ],
   },
-};
+}
 
-const transitionCopyPattern =
-  /A Symbolic Analysis of Relay and Switching Circuits/i;
+const transitionCopyPattern = /Entering control plane/i
 
-test.describe("Dashboard auth flow", () => {
-  test("redirects unauthenticated protected routes to login", async ({
+test.describe('Dashboard auth flow', () => {
+  test.beforeEach(async ({ page }) => {
+    // Missing fixtures must never call a developer's running Dashboard.
+    await page.route('**/api/**', (route) =>
+      route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Unmocked auth-flow API request' }),
+      }),
+    )
+  })
+
+  test('keeps the mobile sign-in form reachable below the story panel', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.route('**/api/setup/state', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseSetupState),
+      })
+    })
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ canRegister: false }),
+      })
+    })
+    await page.route('**/api/auth/me', async (route) => {
+      await route.fulfill({ status: 401, body: 'Unauthorized' })
+    })
+
+    await page.goto('/login')
+    const continueButton = page.getByRole('button', { name: 'Continue' })
+    const emailInput = page.getByLabel('Email')
+    const passwordInput = page.getByLabel('Password')
+    await continueButton.scrollIntoViewIfNeeded()
+    await expect(emailInput).toBeVisible()
+    await expect(emailInput).toHaveAttribute('name', 'email')
+    await expect(emailInput).toHaveAttribute('autocomplete', 'username')
+    await expect(passwordInput).toBeVisible()
+    await expect(passwordInput).toHaveAttribute('name', 'password')
+    await expect(passwordInput).toHaveAttribute('autocomplete', 'current-password')
+    await expect(continueButton).toBeVisible()
+  })
+
+  test('redirects unauthenticated protected routes to login', async ({ page }) => {
+    await page.route('**/api/setup/state', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseSetupState),
+      })
+    })
+
+    await page.route('**/api/settings', async (route) => {
+      await route.fulfill({ status: 401, body: 'Unauthorized' })
+    })
+
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ canRegister: false }),
+      })
+    })
+
+    await page.route('**/api/auth/me', (route) =>
+      route.fulfill({ status: 401, body: 'Unauthorized' }),
+    )
+
+    await page.goto('/playground', { waitUntil: 'domcontentloaded' })
+
+    await expect(page).toHaveURL(/\/login$/)
+    await expect(page.getByRole('heading', { name: 'Sign in', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: /create admin/i })).toHaveCount(0)
+  })
+
+  test('login shows the transition loader and reuses the session for protected requests', async ({
     page,
   }) => {
-    await page.route("**/api/setup/state", async (route) => {
+    test.slow()
+    await page.addInitScript(() => {
+      // A background tab may suspend animation frames. Authentication handoff must
+      // still complete from its wall-clock timer even when the visual scene is paused.
+      window.requestAnimationFrame = () => 1
+      window.cancelAnimationFrame = () => undefined
+    })
+    const issuedToken = 'issued-dashboard-token'
+    let settingsSessionObserved = false
+    let statusSessionObserved = false
+    const forwardedAuthorization: (string | null)[] = []
+
+    await page.route('**/api/setup/state', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(baseSetupState),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/settings", async (route) => {
-      await route.fulfill({ status: 401, body: "Unauthorized" });
-    });
-
-    await page.route("**/api/auth/bootstrap/can-register", async (route) => {
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ canRegister: false }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/playground", { waitUntil: "domcontentloaded" });
-
-    await expect(page).toHaveURL(/\/login$/);
-    await expect(
-      page.getByRole("heading", { name: "Sign in", exact: true }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: /create admin/i }),
-    ).toHaveCount(0);
-  });
-
-  test("login shows the transition loader and reuses the session for protected requests", async ({
-    page,
-  }) => {
-    test.slow();
-    const issuedToken = "issued-dashboard-token";
-    let settingsAuthHeader = "";
-    let statusAuthHeader = "";
-
-    await page.route("**/api/setup/state", async (route) => {
+    await page.route('**/api/auth/login', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(baseSetupState),
-      });
-    });
-
-    await page.route("**/api/auth/bootstrap/can-register", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ canRegister: false }),
-      });
-    });
-
-    await page.route("**/api/auth/login", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: sessionResponseHeaders(issuedToken),
         body: JSON.stringify({
           token: issuedToken,
           user: {
-            id: "user-admin-1",
-            email: "admin@example.com",
-            name: "Admin User",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'admin@example.com',
+            name: 'Admin User',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/me", async (route) => {
+    await page.route('**/api/auth/me', async (route) => {
+      if (!(await hasSessionCookie(route.request(), issuedToken))) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
+      }
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user: {
-            id: "user-admin-1",
-            email: "admin@example.com",
-            name: "Admin User",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'admin@example.com',
+            name: 'Admin User',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/settings", async (route) => {
-      settingsAuthHeader =
-        route.request().headers().authorization ?? settingsAuthHeader;
-      if (!route.request().headers().authorization) {
-        await route.fulfill({ status: 401, body: "Unauthorized" });
-        return;
+    await page.route('**/api/settings', async (route) => {
+      settingsSessionObserved = await hasSessionCookie(route.request(), issuedToken)
+      forwardedAuthorization.push(await route.request().headerValue('authorization'))
+      if (!settingsSessionObserved) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
       }
 
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          readonlyMode: false,
-          setupMode: false,
-          platform: "",
-          envoyUrl: "",
-        }),
-      });
-    });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse()),
+      })
+    })
 
-    await page.route("**/api/status", async (route) => {
-      statusAuthHeader = route.request().headers().authorization ?? "";
+    await page.route('**/api/status', async (route) => {
+      statusSessionObserved = await hasSessionCookie(route.request(), issuedToken)
+      forwardedAuthorization.push(await route.request().headerValue('authorization'))
+      if (!statusSessionObserved) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
+      }
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          overall: "healthy",
-          deployment_type: "local",
+          overall: 'healthy',
+          deployment_type: 'local',
           services: [],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/router/config/all", async (route) => {
+    await page.route('**/api/router/config/all', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          signals: {},
-          decisions: [],
+          version: 'v0.5',
           providers: { models: [] },
-          plugins: {},
+          recipes: [{ name: 'default' }],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/mcp/servers", async (route) => {
+    await page.route('**/api/mcp/servers', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([]),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/mcp/tools", async (route) => {
+    await page.route('**/api/mcp/tools', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tools: [] }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/login");
-    await page.getByPlaceholder("you@example.com").fill("admin@example.com");
-    await page.getByPlaceholder("••••••••").fill("secret-password");
-    await page.getByRole("button", { name: "Continue" }).click();
+    await page.goto('/login')
+    await page.getByPlaceholder('you@example.com').fill('admin@example.com')
+    await page.getByPlaceholder('••••••••').fill('secret-password')
+    await Promise.all([
+      page.waitForURL(/\/auth\/transition\?to=%2Fdashboard$/),
+      page.getByText(transitionCopyPattern).waitFor({ state: 'visible' }),
+      page.getByRole('button', { name: 'Continue' }).click(),
+    ])
+    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 })
+    await expect.poll(() => settingsSessionObserved).toBe(true)
+    await expect.poll(() => statusSessionObserved).toBe(true)
+    expect(forwardedAuthorization.every((header) => header === null)).toBe(true)
+    const sessionCookie = (await page.context().cookies()).find(
+      (cookie) => cookie.name === 'vsr_session',
+    )
+    expect(sessionCookie).toMatchObject({
+      value: issuedToken,
+      httpOnly: true,
+      sameSite: 'Lax',
+      path: '/',
+    })
+    const browserState = await page.evaluate(() => ({
+      cookie: document.cookie,
+      storedToken: localStorage.getItem('vsr_auth_token'),
+    }))
+    expect(browserState.cookie).toContain(`vsr_csrf=${TEST_CSRF_TOKEN}`)
+    expect(browserState.cookie).not.toContain('vsr_session')
+    expect(browserState.storedToken).toBeNull()
 
-    await expect(page).toHaveURL(/\/auth\/transition\?to=%2Fdashboard$/);
-    await expect(page.getByText(transitionCopyPattern)).toBeVisible();
-    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 });
-    await expect.poll(() => settingsAuthHeader).toBe(`Bearer ${issuedToken}`);
-    await expect.poll(() => statusAuthHeader).toBe(`Bearer ${issuedToken}`);
-  });
+    // A new page has no in-memory token; /api/auth/me must restore the cookie session.
+    await page.reload()
+    await expect(
+      page.getByRole('heading', { name: 'Compose the right model path.', exact: true }),
+    ).toBeVisible()
+    await expect(page).toHaveURL(/\/dashboard$/)
+  })
 
-  test("bootstrap registration passes through the transition loader", async ({
-    page,
-  }) => {
-    test.slow();
-    const issuedToken = "bootstrap-dashboard-token";
-    let registerPayload: Record<string, unknown> | null = null;
-    let setupStateRequestCount = 0;
+  test('bootstrap registration passes through the transition loader', async ({ page }) => {
+    test.slow()
+    const issuedToken = 'bootstrap-dashboard-token'
+    let registerPayload: Record<string, unknown> | null = null
+    let setupStateRequestCount = 0
 
-    await page.route("**/api/setup/state", async (route) => {
-      setupStateRequestCount += 1;
+    await page.route('**/api/setup/state', async (route) => {
+      setupStateRequestCount += 1
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(
           setupStateRequestCount === 1
             ? baseSetupState
@@ -283,692 +375,894 @@ test.describe("Dashboard auth flow", () => {
                 canActivate: false,
               },
         ),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/bootstrap/can-register", async (route) => {
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ canRegister: true }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/bootstrap/register", async (route) => {
-      registerPayload = route.request().postDataJSON() as Record<
-        string,
-        unknown
-      >;
+    await page.route('**/api/auth/bootstrap/register', async (route) => {
+      registerPayload = route.request().postDataJSON() as Record<string, unknown>
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: sessionResponseHeaders(issuedToken),
         body: JSON.stringify({
           token: issuedToken,
           user: {
-            id: "user-admin-1",
-            email: "ada@example.com",
-            name: "Ada Router",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'ada@example.com',
+            name: 'Ada Router',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/me", async (route) => {
+    await page.route('**/api/auth/me', async (route) => {
+      if (!(await hasSessionCookie(route.request(), issuedToken))) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
+      }
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user: {
-            id: "user-admin-1",
-            email: "ada@example.com",
-            name: "Ada Router",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'ada@example.com',
+            name: 'Ada Router',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/settings", async (route) => {
+    await page.route('**/api/setup/presets', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          readonlyMode: false,
-          setupMode: false,
-          platform: "",
-          envoyUrl: "",
-        }),
-      });
-    });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ presets: [] }),
+      })
+    })
 
-    await page.route("**/api/status", async (route) => {
+    await page.route('**/api/settings', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse()),
+      })
+    })
+
+    await page.route('**/api/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          overall: "healthy",
-          deployment_type: "local",
+          overall: 'healthy',
+          deployment_type: 'local',
           services: [],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/router/config/all", async (route) => {
+    await page.route('**/api/router/config/all', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          signals: {},
-          decisions: [],
+          version: 'v0.5',
           providers: { models: [] },
-          plugins: {},
+          recipes: [{ name: 'default' }],
         }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/login");
-
-    await expect(
-      page.getByRole("heading", {
-        name: "Who are you? What should we call you?",
-      }),
-    ).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Sign in" })).toHaveCount(0);
-
-    await page.getByLabel("What should we call you?").fill("Ada Router");
-    await page.getByRole("button", { name: "Next" }).click();
+    await page.goto('/login')
 
     await expect(
-      page.getByRole("heading", {
-        name: "Where should your future admin sign in?",
+      page.getByRole('heading', {
+        name: 'Name your first administrator.',
       }),
-    ).toBeVisible();
-    await page.getByLabel("Admin email").fill("ada@example.com");
-    await page.getByRole("button", { name: "Next" }).click();
+    ).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toHaveCount(0)
+
+    await page.getByLabel('What should we call you?').fill('Ada Router')
+    await page.getByRole('button', { name: 'Next' }).click()
 
     await expect(
-      page.getByRole("heading", {
-        name: "Set the key, then step into the future.",
+      page.getByRole('heading', {
+        name: 'Choose the administrator email.',
       }),
-    ).toBeVisible();
-    await page.getByLabel("Password").fill("future-password");
-    await page.getByRole("button", { name: "Enter Future" }).click();
+    ).toBeVisible()
+    const bootstrapEmail = page.getByLabel('Admin email')
+    await expect(bootstrapEmail).toHaveAttribute('autocomplete', 'username')
+    await bootstrapEmail.fill('ada@example.com')
+    await page.getByRole('button', { name: 'Next' }).click()
+
+    await expect(
+      page.getByRole('heading', {
+        name: 'Secure the workspace.',
+      }),
+    ).toBeVisible()
+    const bootstrapPassword = page.getByLabel('Password')
+    await expect(bootstrapPassword).toHaveAttribute('autocomplete', 'new-password')
+    await bootstrapPassword.fill('future-password')
+    await Promise.all([
+      page.waitForURL(/\/auth\/transition\?to=%2Fsetup$/),
+      page.getByText(transitionCopyPattern).waitFor({ state: 'visible' }),
+      page.getByRole('button', { name: 'Create admin and continue' }).click(),
+    ])
 
     await expect
       .poll(() => registerPayload)
       .toEqual({
-        email: "ada@example.com",
-        password: "future-password",
-        name: "Ada Router",
-      });
-    await expect.poll(() => setupStateRequestCount).toBeGreaterThanOrEqual(2);
-    await expect(page).toHaveURL(/\/auth\/transition\?to=%2Fsetup$/);
-    await expect(page.getByText(transitionCopyPattern)).toBeVisible();
-    await expect(page).toHaveURL(/\/setup$/, { timeout: 12000 });
-  });
+        email: 'ada@example.com',
+        password: 'future-password',
+        name: 'Ada Router',
+      })
+    await expect.poll(() => setupStateRequestCount).toBeGreaterThanOrEqual(2)
+    await expect(page).toHaveURL(/\/setup$/, { timeout: 12000 })
+  })
 
-  test("login preserves the original protected route through the transition page", async ({
+  test('bootstrap registration with complete configuration redirects to dashboard', async ({
     page,
   }) => {
-    test.slow();
+    test.slow()
+    const issuedToken = 'complete-config-bootstrap-token'
+    let registerRequestCount = 0
 
-    await page.route("**/api/setup/state", async (route) => {
+    await page.route('**/api/setup/state', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(baseSetupState),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/bootstrap/can-register", async (route) => {
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ canRegister: false }),
-      });
-    });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ canRegister: true }),
+      })
+    })
 
-    await page.route("**/api/auth/login", async (route) => {
+    await page.route('**/api/auth/bootstrap/register', async (route) => {
+      registerRequestCount += 1
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: sessionResponseHeaders(issuedToken),
         body: JSON.stringify({
-          token: "status-flow-token",
+          token: issuedToken,
           user: {
-            id: "user-admin-1",
-            email: "admin@example.com",
-            name: "Admin User",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'ada@example.com',
+            name: 'Ada Router',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/auth/me", async (route) => {
+    await page.route('**/api/auth/me', async (route) => {
+      if (!(await hasSessionCookie(route.request(), issuedToken))) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
+      }
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user: {
-            id: "user-admin-1",
-            email: "admin@example.com",
-            name: "Admin User",
-            role: "admin",
+            id: 'user-admin-1',
+            email: 'ada@example.com',
+            name: 'Ada Router',
+            role: 'admin',
           },
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/settings", async (route) => {
+    await page.route('**/api/settings', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          readonlyMode: false,
-          setupMode: false,
-          platform: "",
-          envoyUrl: "",
-        }),
-      });
-    });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse()),
+      })
+    })
 
-    await page.route("**/api/status", async (route) => {
+    await page.route('**/api/status', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          overall: "healthy",
-          deployment_type: "local",
+          overall: 'healthy',
+          deployment_type: 'local',
           services: [],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/mcp/servers", async (route) => {
+    await page.route('**/api/router/config/all', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify([]),
-      });
-    });
-
-    await page.route("**/api/mcp/tools", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tools: [] }),
-      });
-    });
-
-    await page.goto("/status", { waitUntil: "domcontentloaded" });
-    await expect(page).toHaveURL(/\/login$/);
-
-    await page.getByPlaceholder("you@example.com").fill("admin@example.com");
-    await page.getByPlaceholder("••••••••").fill("secret-password");
-    await page.getByRole("button", { name: "Continue" }).click();
-
-    await expect(page).toHaveURL(/\/auth\/transition\?to=%2Fstatus$/);
-    await expect(page.getByText(transitionCopyPattern)).toBeVisible();
-    await expect(page).toHaveURL(/\/status$/, { timeout: 12000 });
-    await expect(
-      page.getByRole("heading", { name: "System Status", exact: true }),
-    ).toBeVisible();
-  });
-
-  test("transition route rejects login targets and falls back to dashboard", async ({
-    page,
-  }) => {
-    test.slow();
-
-    await mockAuthenticatedSession(page, { token: "transition-fallback-token" });
-
-    await page.route("**/api/setup/state", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(baseSetupState),
-      });
-    });
-
-    await page.route("**/api/settings", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          readonlyMode: false,
-          setupMode: false,
-          platform: "",
-          envoyUrl: "",
-        }),
-      });
-    });
-
-    await page.route("**/api/status", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          overall: "healthy",
-          deployment_type: "local",
-          services: [],
-        }),
-      });
-    });
-
-    await page.route("**/api/router/config/all", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          signals: {},
-          decisions: [],
+          version: 'v0.5',
           providers: { models: [] },
-          plugins: {},
+          recipes: [{ name: 'default' }],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/mcp/servers", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify([]),
-      });
-    });
+    await page.goto('/login')
 
-    await page.route("**/api/mcp/tools", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tools: [] }),
-      });
-    });
+    await expect(
+      page.getByRole('heading', {
+        name: 'Name your first administrator.',
+      }),
+    ).toBeVisible()
 
-    await page.goto("/auth/transition?to=%2Flogin%3Fnext%3Dusers");
-    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 });
-  });
+    await page.getByLabel('What should we call you?').fill('Ada Router')
+    await page.getByRole('button', { name: 'Next' }).click()
+    await page.getByLabel('Admin email').fill('ada@example.com')
+    await page.getByRole('button', { name: 'Next' }).click()
+    await page.getByLabel('Password').fill('future-password')
 
-  test("setup mode keeps authenticated users on the setup wizard", async ({
+    await Promise.all([
+      page.waitForURL(/\/auth\/transition\?to=%2Fdashboard$/),
+      page.getByText(transitionCopyPattern).waitFor({ state: 'visible' }),
+      page.getByRole('button', { name: 'Create admin and continue' }).click(),
+    ])
+
+    await expect.poll(() => registerRequestCount).toBe(1)
+    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 })
+  })
+
+  test('login preserves the original protected route through the transition page', async ({
     page,
   }) => {
-    await mockAuthenticatedSession(page, { token: "setup-mode-token" });
+    test.slow()
 
-    await page.route("**/api/setup/state", async (route) => {
+    await page.route('**/api/setup/state', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseSetupState),
+      })
+    })
+
+    await page.route('**/api/auth/bootstrap/can-register', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ canRegister: false }),
+      })
+    })
+
+    await page.route('**/api/auth/login', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: sessionResponseHeaders('status-flow-token'),
+        body: JSON.stringify({
+          token: 'status-flow-token',
+          user: {
+            id: 'user-admin-1',
+            email: 'admin@example.com',
+            name: 'Admin User',
+            role: 'admin',
+          },
+        }),
+      })
+    })
+
+    await page.route('**/api/auth/me', async (route) => {
+      if (!(await hasSessionCookie(route.request(), 'status-flow-token'))) {
+        await route.fulfill({ status: 401, body: 'Unauthorized' })
+        return
+      }
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: {
+            id: 'user-admin-1',
+            email: 'admin@example.com',
+            name: 'Admin User',
+            role: 'admin',
+          },
+        }),
+      })
+    })
+
+    await page.route('**/api/settings', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse()),
+      })
+    })
+
+    await page.route('**/api/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          overall: 'healthy',
+          deployment_type: 'local',
+          services: [],
+        }),
+      })
+    })
+
+    await page.route('**/api/mcp/servers', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([]),
+      })
+    })
+
+    await page.route('**/api/mcp/tools', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tools: [] }),
+      })
+    })
+
+    await page.goto('/status', { waitUntil: 'domcontentloaded' })
+    await expect(page).toHaveURL(/\/login$/)
+
+    await page.getByPlaceholder('you@example.com').fill('admin@example.com')
+    await page.getByPlaceholder('••••••••').fill('secret-password')
+    await Promise.all([
+      page.waitForURL(/\/auth\/transition\?to=%2Fstatus$/),
+      page.getByText(transitionCopyPattern).waitFor({ state: 'visible' }),
+      page.getByRole('button', { name: 'Continue' }).click(),
+    ])
+    await expect(page).toHaveURL(/\/status$/, { timeout: 12000 })
+    await expect(page.getByRole('heading', { name: 'System status', exact: true })).toBeVisible()
+  })
+
+  for (const bootstrap of [false, true]) {
+    test(`${bootstrap ? 'bootstrap' : 'login'} failures re-enable the form for retry`, async ({
+      page,
+    }) => {
+      await page.route('**/api/setup/state', (route) => route.fulfill({ json: baseSetupState }))
+      await page.route('**/api/auth/me', (route) => route.fulfill({ status: 401 }))
+      await page.route('**/api/auth/bootstrap/can-register', (route) =>
+        route.fulfill({ json: { canRegister: bootstrap } }),
+      )
+      let attempts = 0
+      await page.route(`**/api/auth/${bootstrap ? 'bootstrap/register' : 'login'}`, (route) => {
+        attempts += 1
+        return route.fulfill({ status: 503, body: 'Session service unavailable' })
+      })
+      await page.goto('/login')
+      if (bootstrap) {
+        await page.getByLabel('What should we call you?').fill('Ada Router')
+        await page.getByRole('button', { name: 'Next', exact: true }).click()
+        await page.getByLabel('Admin email').fill('ada@example.com')
+        await page.getByRole('button', { name: 'Next', exact: true }).click()
+      } else {
+        await page.getByLabel('Email', { exact: true }).fill('ada@example.com')
+      }
+      await page.getByLabel('Password', { exact: true }).fill('future-password')
+      const submit = page.getByRole('button', {
+        name: bootstrap ? 'Create admin and continue' : 'Continue',
+        exact: true,
+      })
+      await submit.click()
+      await expect(page.getByText('Session service unavailable', { exact: true })).toBeVisible()
+      await expect(submit).toBeEnabled()
+      await submit.click()
+      await expect.poll(() => attempts).toBe(2)
+      await expect(submit).toBeEnabled()
+      await expect(page).toHaveURL(/\/login$/)
+    })
+  }
+
+  test('an existing cookie session bypasses the sign-in form', async ({ page }) => {
+    await mockAuthenticatedAppShell(page)
+    await page.route('**/api/router/config/all', (route) =>
+      route.fulfill({
+        json: {
+          version: 'v0.5',
+          providers: { models: [] },
+          recipes: [{ name: 'default' }],
+        },
+      }),
+    )
+    await page.goto('/login')
+    await expect(page).toHaveURL(/\/dashboard$/)
+    await expect(
+      page.getByRole('heading', { name: 'Compose the right model path.', exact: true }),
+    ).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Continue', exact: true })).toHaveCount(0)
+  })
+
+  test('transition route rejects login targets and falls back to dashboard', async ({ page }) => {
+    test.slow()
+
+    await mockAuthenticatedSession(page, {
+      token: 'transition-fallback-token',
+    })
+
+    await page.route('**/api/setup/state', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseSetupState),
+      })
+    })
+
+    await page.route('**/api/settings', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse()),
+      })
+    })
+
+    await page.route('**/api/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          overall: 'healthy',
+          deployment_type: 'local',
+          services: [],
+        }),
+      })
+    })
+
+    await page.route('**/api/router/config/all', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          version: 'v0.5',
+          providers: { models: [] },
+          recipes: [{ name: 'default' }],
+        }),
+      })
+    })
+
+    await page.route('**/api/mcp/servers', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([]),
+      })
+    })
+
+    await page.route('**/api/mcp/tools', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tools: [] }),
+      })
+    })
+
+    await page.goto('/auth/transition?to=%2Flogin%3Fnext%3Dusers')
+    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 })
+  })
+
+  test('setup mode keeps authenticated users on the setup wizard', async ({ page }) => {
+    await mockAuthenticatedSession(page, { token: 'setup-mode-token' })
+
+    await page.route('**/api/setup/state', async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...baseSetupState,
           setupMode: true,
           canActivate: false,
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/settings", async (route) => {
+    await page.route('**/api/settings', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          readonlyMode: false,
-          setupMode: true,
-          platform: "",
-          envoyUrl: "",
-        }),
-      });
-    });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardSettingsResponse({ setupMode: true })),
+      })
+    })
 
-    await page.goto("/dashboard", { waitUntil: "domcontentloaded" });
+    await page.goto('/dashboard', { waitUntil: 'domcontentloaded' })
 
-    await expect(page).toHaveURL(/\/setup$/);
-  });
+    await expect(page).toHaveURL(/\/setup$/)
+  })
 
-  test("read users inherit the readonly shell, keep ClawRoom access, and lose admin-only actions", async ({
+  test('read users inherit the readonly shell and lose MCP management and admin-only actions', async ({
     page,
   }) => {
     await mockAuthenticatedAppShell(page, {
       user: {
-        id: "user-read-1",
-        email: "reader@example.com",
-        name: "Read User",
-        role: "read",
+        id: 'user-read-1',
+        email: 'reader@example.com',
+        name: 'Read User',
+        role: 'read',
       },
       settings: {
         readonlyMode: true,
+        serverReadonly: true,
+        runtimeConfigWritable: false,
         setupMode: false,
-        platform: "",
-        envoyUrl: "",
+        platform: '',
+        envoyUrl: '',
       },
-    });
+    })
 
-    await page.route("**/api/router/config/all", async (route) => {
+    await page.route('**/api/router/config/all', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          signals: {},
-          decisions: [],
+          version: 'v0.5',
           providers: { models: [] },
-          plugins: {},
+          recipes: [{ name: 'default' }],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/router/config/global", async (route) => {
+    await page.route('**/api/router/config/global', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/router/config/yaml", async (route) => {
+    await page.route('**/api/router/config/yaml', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "text/plain" },
-        body: "signals: {}\ndecisions: []\nproviders:\n  models: []\nplugins: {}\n",
-      });
-    });
+        headers: { 'Content-Type': 'text/plain' },
+        body: 'version: v0.5\nproviders:\n  models: []\nrecipes:\n  - name: default\n',
+      })
+    })
 
-    await page.goto("/config");
-    await expect(page).toHaveURL(/\/config$/);
-    await expect(page.getByRole("link", { name: "Users" })).toHaveCount(0);
+    await page.goto('/config')
+    await expect(page).toHaveURL(/\/config\/global-config$/)
+    await expect(page.getByRole('link', { name: 'Users' })).toHaveCount(0)
 
-    await page.goto("/playground");
-    await expect(
-      page.getByRole("button", { name: /Enable HireClaw|Disable HireClaw/i }),
-    ).toBeEnabled();
-    await expect(
-      page.getByRole("button", { name: /Open ClawRoom view|Exit ClawRoom view/i }),
-    ).toHaveCount(0);
-
-    await page.getByRole("button", { name: /Enable HireClaw/i }).click();
-    await expect(
-      page.getByRole("button", { name: /Open ClawRoom view|Exit ClawRoom view/i }),
-    ).toBeEnabled();
-
-    await page.goto("/builder");
-    const deployButton = page.getByRole("button", { name: "Deploy" });
-    await expect(deployButton).toBeDisabled();
+    await page.goto('/builder')
+    const deployButton = page.getByRole('button', { name: 'Deploy' })
+    await expect(deployButton).toBeDisabled()
     await expect(deployButton).toHaveAttribute(
-      "title",
-      "Deploy is unavailable in read-only mode",
-    );
-  });
+      'title',
+      'Deploy is disabled by the server-wide read-only policy',
+    )
+  })
 
-  test("read users see replay flow structure with payloads redacted in record view", async ({
+  test('read users see replay flow structure with payloads redacted in record view', async ({
     page,
   }) => {
     await mockAuthenticatedAppShell(page, {
       user: {
-        id: "user-read-1",
-        email: "reader@example.com",
-        name: "Read User",
-        role: "read",
+        id: 'user-read-1',
+        email: 'reader@example.com',
+        name: 'Read User',
+        role: 'read',
       },
       settings: {
         readonlyMode: true,
         setupMode: false,
-        platform: "",
-        envoyUrl: "",
+        platform: '',
+        envoyUrl: '',
       },
-    });
+    })
 
-    await page.route("**/api/router/v1/router_replay/*", async (route) => {
+    await page.route('**/api/router/api/v1/observability/replays/*', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(redactedReplayRecordWithDetailedToolTrace),
-      });
-    });
+      })
+    })
 
-    await page.goto("/insights/replay-sensitive-1");
+    await page.goto('/insights/replay-sensitive-1')
 
-    await expect(page.getByText("Tool Call Success Rate")).toBeVisible();
-    await expect(page.getByText("100%")).toBeVisible();
-    await expect(page.getByText("Tool Calling (fetch_price)")).toBeVisible();
-    await expect(page.getByText("Tool Execute (fetch_price)")).toBeVisible();
-    await expect(page.getByText("Source: User")).toBeVisible();
-    await expect(page.getByText("Source: LLM")).toHaveCount(2);
-    await expect(page.getByText("Source: Agent")).toBeVisible();
-    await expect(page.getByText("Inputs and outputs are hidden for your role")).toHaveCount(4);
-    await expect(page.getByText("Confidential flow prompt 7A")).toHaveCount(0);
-    await expect(page.getByText("Confidential tool result 7B")).toHaveCount(0);
-    await expect(page.getByText("Confidential final answer 7C")).toHaveCount(0);
-  });
+    await page.getByRole('heading', { name: 'Record trace', exact: true }).click()
+    const trace = page
+      .locator('details')
+      .filter({ has: page.getByRole('heading', { name: 'Record trace', exact: true }) })
+    await trace.locator('summary').filter({ hasText: 'Turn 1' }).click()
+    await expect(trace.getByText('You', { exact: true })).toBeVisible()
+    await expect(trace.getByText('Response', { exact: true })).toBeVisible()
+    await trace
+      .locator('summary')
+      .filter({ hasText: /^fetch_price$/ })
+      .click()
+    await trace
+      .locator('summary')
+      .filter({ hasText: /^fetch_price result$/ })
+      .click()
+    await expect(trace.getByText('Arguments hidden for this role')).toBeVisible()
+    await expect(trace.getByText('Result hidden · succeeded')).toBeVisible()
+    await expect(trace.getByText('Content hidden for this role')).toBeVisible()
+    await expect(page.getByText(/NVDA/)).toHaveCount(0)
+    await expect(page.getByText('Confidential flow prompt 7A')).toHaveCount(0)
+    await expect(page.getByText('Confidential tool result 7B')).toHaveCount(0)
+    await expect(page.getByText('Confidential final answer 7C')).toHaveCount(0)
+  })
 
-  test("write users can inspect replay flow details in record view", async ({
-    page,
-  }) => {
+  test('write users can inspect replay flow details in record view', async ({ page }) => {
     await mockAuthenticatedAppShell(page, {
       user: {
-        id: "user-write-1",
-        email: "writer@example.com",
-        name: "Write User",
-        role: "write",
+        id: 'user-write-1',
+        email: 'writer@example.com',
+        name: 'Write User',
+        role: 'write',
       },
       settings: {
         readonlyMode: false,
         setupMode: false,
-        platform: "",
-        envoyUrl: "",
+        platform: '',
+        envoyUrl: '',
       },
-    });
+    })
 
-    await page.route("**/api/router/v1/router_replay/*", async (route) => {
+    await page.route('**/api/router/api/v1/observability/replays/*', async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(replayRecordWithDetailedToolTrace),
-      });
-    });
+      })
+    })
 
-    await page.goto("/insights/replay-sensitive-1");
+    await page.goto('/insights/replay-sensitive-1')
 
-    await expect(page.getByText("Source: User")).toBeVisible();
-    await expect(page.getByText("Source: LLM")).toHaveCount(2);
-    await expect(page.getByText("Source: Agent")).toBeVisible();
-    await expect(page.getByText("Confidential flow prompt 7A")).toBeVisible();
-    await expect(page.getByText("Confidential tool result 7B")).toBeVisible();
-    await expect(page.getByText("Confidential final answer 7C")).toBeVisible();
-  });
+    await page.getByRole('heading', { name: 'Record trace', exact: true }).click()
+    const trace = page
+      .locator('details')
+      .filter({ has: page.getByRole('heading', { name: 'Record trace', exact: true }) })
+    await trace.locator('summary').filter({ hasText: 'Turn 1' }).click()
+    await trace
+      .locator('summary')
+      .filter({ hasText: /^fetch_price$/ })
+      .click()
+    await trace
+      .locator('summary')
+      .filter({ hasText: /^fetch_price result$/ })
+      .click()
+    await expect(trace.getByText('You', { exact: true })).toBeVisible()
+    await expect(trace.getByText('Response', { exact: true })).toBeVisible()
+    await expect(trace.locator('pre').filter({ hasText: 'NVDA' })).toBeVisible()
+    await expect(
+      trace.getByText('Confidential flow prompt 7A', { exact: true }).last(),
+    ).toBeVisible()
+    await expect(trace.getByText('Confidential tool result 7B')).toBeVisible()
+    await expect(trace.getByText('Confidential final answer 7C')).toBeVisible()
+  })
 
-  test("authenticated admins can open the users page", async ({ page }) => {
-    await mockAuthenticatedAppShell(page);
+  test('authenticated admins can open the users page', async ({ page }) => {
+    await mockAuthenticatedAppShell(page)
 
-    await page.route("**/api/admin/users", async (route) => {
+    await page.route(/\/api\/admin\/users(?:\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           users: [
             {
-              id: "user-admin-1",
-              email: "admin@example.com",
-              name: "Admin User",
-              role: "admin",
-              status: "active",
+              id: 'user-admin-1',
+              email: 'admin@example.com',
+              name: 'Admin User',
+              role: 'admin',
+              status: 'active',
             },
           ],
         }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/users");
+    await page.goto('/users')
 
-    await expect(page).toHaveURL(/\/users$/);
-    await expect(page.getByRole("heading", { name: "Users" })).toBeVisible();
-  });
+    await expect(page).toHaveURL(/\/users$/)
+    await expect(page.getByRole('heading', { name: 'Users' })).toBeVisible()
+  })
 
-  test("users page manages accounts through centered dialogs", async ({
-    page,
-  }) => {
-    await mockAuthenticatedAppShell(page);
+  test('users page invites and edits accounts through centered dialogs', async ({ page }) => {
+    await mockAuthenticatedAppShell(page)
 
-    let createPayload: Record<string, unknown> | null = null;
-    let patchPayload: Record<string, unknown> | null = null;
-    let passwordPayload: Record<string, unknown> | null = null;
+    let invitationPayload: Record<string, unknown> | null = null
+    let patchPayload: Record<string, unknown> | null = null
+    let passwordPayload: Record<string, unknown> | null = null
 
-    await page.route("**/api/admin/users", async (route) => {
-      if (route.request().method() === "POST") {
-        createPayload = route.request().postDataJSON() as Record<
-          string,
-          unknown
-        >;
-        await route.fulfill({
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            id: "user-2",
-            email: createPayload.email,
-            name: createPayload.name,
-            role: createPayload.role,
-            status: "active",
-          }),
-        });
-        return;
-      }
-
+    await page.route(/\/api\/admin\/users(?:\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           users: [
             {
-              id: "user-admin-1",
-              email: "admin@example.com",
-              name: "Admin User",
-              role: "admin",
-              status: "active",
+              id: 'user-admin-1',
+              email: 'admin@example.com',
+              name: 'Admin User',
+              role: 'admin',
+              status: 'active',
             },
           ],
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/admin/users/user-admin-1", async (route) => {
-      patchPayload = route.request().postDataJSON() as Record<string, unknown>;
+    await page.route('**/api/admin/invitations', async (route) => {
+      invitationPayload = route.request().postDataJSON() as Record<string, unknown>
+      await route.fulfill({
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          invitation: {
+            id: 'invitation-2',
+            kind: 'personal',
+            email: invitationPayload.email,
+            name: invitationPayload.name,
+            role: invitationPayload.role,
+            expiresAt: 1893456000,
+          },
+          token: 'one-time-invitation-token',
+        }),
+      })
+    })
+
+    await page.route('**/api/admin/users/user-admin-1', async (route) => {
+      patchPayload = route.request().postDataJSON() as Record<string, unknown>
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          id: "user-admin-1",
-          email: "admin@example.com",
-          name: "Admin User",
+          id: 'user-admin-1',
+          email: 'admin@example.com',
+          name: 'Admin User',
           role: patchPayload.role,
           status: patchPayload.status,
         }),
-      });
-    });
+      })
+    })
 
-    await page.route("**/api/admin/users/password", async (route) => {
-      passwordPayload = route.request().postDataJSON() as Record<
-        string,
-        unknown
-      >;
+    await page.route('**/api/admin/users/password', async (route) => {
+      passwordPayload = route.request().postDataJSON() as Record<string, unknown>
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ok: true }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/users");
-    await expect(page).toHaveURL(/\/users$/);
+    await page.goto('/users')
+    await expect(page).toHaveURL(/\/users$/)
 
-    await page.getByRole("button", { name: "Create user" }).click();
-    const createDialog = page.getByRole("dialog", { name: "Create user" });
-    await expect(createDialog).toBeVisible();
-    await createDialog
-      .locator("#create-user-email")
-      .fill("writer@example.com");
-    await createDialog.locator("#create-user-name").fill("Writer User");
-    await createDialog.locator("#create-user-role").selectOption("write");
-    await createDialog
-      .locator("#create-user-password")
-      .fill("writer-password");
-    await createDialog.getByRole("button", { name: "Create user" }).click();
+    await page.getByRole('button', { name: 'Invite user' }).click()
+    const inviteDialog = page.getByRole('dialog', { name: 'Invite user' })
+    await expect(inviteDialog).toBeVisible()
+    await inviteDialog.getByLabel('Name').fill('Writer User')
+    await inviteDialog.getByLabel('Email').fill('writer@example.com')
+    await inviteDialog.getByText('Builder', { exact: true }).click()
+    await inviteDialog.getByRole('button', { name: 'Create invitation' }).click()
 
     await expect
-      .poll(() => createPayload)
+      .poll(() => invitationPayload)
       .toEqual({
-        email: "writer@example.com",
-        name: "Writer User",
-        password: "writer-password",
-        role: "write",
-      });
-    await expect(page.getByText("User created.")).toBeVisible();
+        kind: 'personal',
+        email: 'writer@example.com',
+        name: 'Writer User',
+        role: 'write',
+      })
+    const readyDialog = page.getByRole('dialog', { name: 'Welcome Writer User' })
+    await expect(readyDialog).toBeVisible()
+    await readyDialog.getByRole('button', { name: 'Done' }).click()
 
-    await page.getByRole("button", { name: "Edit" }).click();
-    const editDialog = page.getByRole("dialog", { name: "Edit user" });
-    await expect(editDialog).toBeVisible();
-    await editDialog.locator("#edit-user-role").selectOption("admin");
-    await editDialog.locator("#edit-user-status").selectOption("inactive");
-    await editDialog.locator("#edit-user-password").fill("rotated-password");
-    await editDialog.getByRole("button", { name: "Save changes" }).click();
+    await page.getByRole('button', { name: 'Edit user-admin-1', exact: true }).click()
+    const editDialog = page.getByRole('dialog', { name: 'Edit user' })
+    await expect(editDialog).toBeVisible()
+    await editDialog.locator('#edit-user-role').selectOption('admin')
+    await editDialog.locator('#edit-user-status').selectOption('inactive')
+    await editDialog.locator('#edit-user-password').fill('rotated-password')
+    await editDialog.getByRole('button', { name: 'Save changes' }).click()
 
     await expect
       .poll(() => patchPayload)
       .toEqual({
-        role: "admin",
-        status: "inactive",
-      });
+        role: 'admin',
+        status: 'inactive',
+      })
     await expect
       .poll(() => passwordPayload)
       .toEqual({
-        userId: "user-admin-1",
-        password: "rotated-password",
-      });
-    await expect(
-      page.getByText("User updated and password rotated."),
-    ).toBeVisible();
-  });
+        userId: 'user-admin-1',
+        password: 'rotated-password',
+      })
+    await expect(page.getByText('User updated and password rotated.')).toBeVisible()
+  })
 
-  test("protected browser transports append auth query tokens", async ({
-    page,
-  }) => {
-    const { token } = await mockAuthenticatedAppShell(page, {
-      token: "transport-auth-token",
-    });
+  test('protected browser transports carry no reusable credential', async ({ page }) => {
+    await mockAuthenticatedAppShell(page, { token: 'transport-auth-token' })
 
-    await page.route("**/api/admin/users", async (route) => {
+    await page.route(/\/api\/admin\/users(?:\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ users: [] }),
-      });
-    });
+      })
+    })
 
-    await page.goto("/users");
-    await expect(page).toHaveURL(/\/users$/);
+    await page.goto('/users')
+    await expect(page).toHaveURL(/\/users$/)
 
     const urls = await page.evaluate(() => {
-      const iframe = document.createElement("iframe");
-      iframe.src = "/embedded/openclaw/demo/";
+      const iframe = document.createElement('iframe')
+      iframe.src = '/embedded/grafana/'
 
-      const source = new EventSource("/api/openclaw/rooms/room-1/stream");
-      const sourceUrl = source.url;
-      source.close();
+      const source = new EventSource('/api/events')
+      const sourceUrl = source.url
+      source.close()
 
-      const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
       const socket = new WebSocket(
-        `${wsProtocol}://${window.location.host}/api/openclaw/rooms/room-1/ws`,
-      );
-      const socketUrl = socket.url;
-      socket.close();
+        `${wsProtocol}://${window.location.host}/embedded/grafana/api/live/ws`,
+      )
+      const socketUrl = socket.url
+      socket.close()
 
       return {
         cookie: document.cookie,
+        storageKeys: Object.keys(window.localStorage),
         iframeUrl: iframe.src,
         sourceUrl,
         socketUrl,
-      };
-    });
+      }
+    })
 
-    expect(urls.cookie).toContain(`vsr_session=${token}`);
-    expect(urls.iframeUrl).toContain(`authToken=${token}`);
-    expect(urls.sourceUrl).toContain(`authToken=${token}`);
-    expect(urls.socketUrl).toContain(`authToken=${token}`);
-  });
-});
+    // Proves cookies really were seeded, so the vsr_session assertion below means
+    // "HttpOnly hides it" rather than "no cookies exist".
+    expect(urls.cookie).toContain('vsr_csrf')
+    expect(urls.cookie).not.toContain('vsr_session')
+
+    expect(urls.storageKeys).not.toContain('vsr_auth_token')
+
+    // Issue #2465's first acceptance criterion, asserted directly.
+    expect(urls.iframeUrl).not.toContain('authToken')
+    expect(urls.sourceUrl).not.toContain('authToken')
+    expect(urls.socketUrl).not.toContain('authToken')
+  })
+
+  test('state-changing requests carry a CSRF token', async ({ page }) => {
+    await mockAuthenticatedAppShell(page)
+
+    let seenHeader: string | undefined
+    await page.route(/\/api\/admin\/users(?:\?.*)?$/, async (route) => {
+      if (route.request().method() === 'POST') {
+        seenHeader = route.request().headers()['x-csrf-token']
+      }
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ users: [] }),
+      })
+    })
+
+    await page.goto('/users')
+    await expect(page).toHaveURL(/\/users$/)
+
+    // Through window.fetch, which is the wrapper the app installs at startup.
+    await page.evaluate(async () => {
+      await fetch('/api/admin/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'new@example.com' }),
+      })
+    })
+
+    expect(seenHeader).toBe(TEST_CSRF_TOKEN)
+  })
+})

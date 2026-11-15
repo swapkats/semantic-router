@@ -41,27 +41,19 @@ type Signals struct {
 	// +kubebuilder:validation:MaxItems=100
 	Keywords []KeywordSignal `json:"keywords,omitempty" yaml:"keywords,omitempty"`
 
-	// Embeddings defines embedding-based signal extraction rules
-	// +optional
-	// +kubebuilder:validation:MaxItems=100
-	Embeddings []EmbeddingSignal `json:"embeddings,omitempty" yaml:"embeddings,omitempty"`
-
-	// Domains defines MMLU domain categories for classification
+	// Domains match the request's subject area. A domain's name is one of
+	// the domain labels (biology, business, chemistry, computer science,
+	// economics, engineering, health, history, law, math, other, philosophy,
+	// physics, psychology).
 	// +optional
 	// +kubebuilder:validation:MaxItems=14
 	Domains []DomainSignal `json:"domains,omitempty" yaml:"domains,omitempty"`
 
-	// FactCheckRules defines fact-check rules for signal classification
-	// Similar to KeywordRules and EmbeddingRules, but based on ML model classification
-	// Each rule has a name that can be referenced in decision conditions
+	// ContextRules match the request's token count.
 	// +optional
 	ContextRules []ContextRule `json:"contextRules,omitempty" yaml:"context_rules,omitempty"`
 
-	// Structure defines request-shape routing signals.
-	// +optional
-	// +kubebuilder:validation:MaxItems=100
-	Structure []StructureSignal `json:"structure,omitempty" yaml:"structure,omitempty"`
-
+	// FactCheckRules match a request whose answer needs fact checking.
 	// +optional
 	FactCheckRules []FactCheckRule `json:"factCheckRules,omitempty" yaml:"fact_check_rules,omitempty"`
 
@@ -69,11 +61,6 @@ type Signals struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=100
 	Conversation []ConversationSignal `json:"conversation,omitempty" yaml:"conversation,omitempty"`
-
-	// Events defines structured event metadata routing signals.
-	// +optional
-	// +kubebuilder:validation:MaxItems=100
-	Events []EventSignal `json:"events,omitempty" yaml:"events,omitempty"`
 }
 
 // FactCheckRule defines a rule for fact-check signal classification
@@ -98,40 +85,24 @@ type ContextRule struct {
 	// +kubebuilder:validation:MaxLength=100
 	Name string `json:"name" yaml:"name"`
 
-	// MinTokens is the minimum token count (supports K/M suffixes)
-	// +kubebuilder:validation:Required
+	// MinTokens is the inclusive minimum token count (supports K/M suffixes).
+	// Omit it to start the band at 0. At least one of MinTokens and MaxTokens
+	// must be set.
+	// +optional
 	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?[KMkm]?$`
-	MinTokens string `json:"minTokens" yaml:"min_tokens"`
+	MinTokens string `json:"minTokens,omitempty" yaml:"min_tokens,omitempty"`
 
-	// MaxTokens is the maximum token count (supports K/M suffixes)
-	// +kubebuilder:validation:Required
+	// MaxTokens is the inclusive maximum token count (supports K/M suffixes).
+	// Omit it to make the band open-ended so every request at or above
+	// MinTokens matches. Equal MinTokens and MaxTokens match exactly one count.
+	// +optional
 	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?[KMkm]?$`
-	MaxTokens string `json:"maxTokens" yaml:"max_tokens"`
+	MaxTokens string `json:"maxTokens,omitempty" yaml:"max_tokens,omitempty"`
 
 	// Description provides human-readable explanation
 	// +optional
 	// +kubebuilder:validation:MaxLength=500
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
-}
-
-type StructureSignal struct {
-	Name        string            `json:"name" yaml:"name"`
-	Description string            `json:"description,omitempty" yaml:"description,omitempty"`
-	Feature     StructureFeature  `json:"feature" yaml:"feature"`
-	Predicate   *NumericPredicate `json:"predicate,omitempty" yaml:"predicate,omitempty"`
-}
-
-type StructureFeature struct {
-	Type   string          `json:"type" yaml:"type"`
-	Source StructureSource `json:"source" yaml:"source"`
-}
-
-type StructureSource struct {
-	Type          string     `json:"type" yaml:"type"`
-	Pattern       string     `json:"pattern,omitempty" yaml:"pattern,omitempty"`
-	Keywords      []string   `json:"keywords,omitempty" yaml:"keywords,omitempty"`
-	CaseSensitive bool       `json:"caseSensitive,omitempty" yaml:"case_sensitive,omitempty"`
-	Sequences     [][]string `json:"sequences,omitempty" yaml:"sequences,omitempty"`
 }
 
 // ConversationSignal defines a conversation-shape routing signal.
@@ -154,18 +125,6 @@ type ConversationCRDFeature struct {
 type ConversationCRDSource struct {
 	Type string `json:"type" yaml:"type"`
 	Role string `json:"role,omitempty" yaml:"role,omitempty"`
-}
-
-// EventSignal defines a structured event metadata routing signal.
-// It detects event types, severities, action codes, and temporal urgency
-// from incident, audit, alert, or workflow payloads in the request.
-type EventSignal struct {
-	Name        string   `json:"name" yaml:"name"`
-	Description string   `json:"description,omitempty" yaml:"description,omitempty"`
-	EventTypes  []string `json:"eventTypes,omitempty" yaml:"event_types,omitempty"`
-	Severities  []string `json:"severities,omitempty" yaml:"severities,omitempty"`
-	ActionCodes []string `json:"actionCodes,omitempty" yaml:"action_codes,omitempty"`
-	Temporal    bool     `json:"temporal,omitempty" yaml:"temporal,omitempty"`
 }
 
 type NumericPredicate struct {
@@ -197,6 +156,11 @@ type KeywordSignal struct {
 	// +kubebuilder:validation:MaxLength=100
 	Name string `json:"name" yaml:"name"`
 
+	// Description provides a human-readable explanation of the rule
+	// +optional
+	// +kubebuilder:validation:MaxLength=500
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
+
 	// Operator defines the logical operator for keywords (AND/OR)
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=AND;OR
@@ -208,56 +172,25 @@ type KeywordSignal struct {
 	// +kubebuilder:validation:MaxItems=100
 	Keywords []string `json:"keywords" yaml:"keywords"`
 
+	// Method regex matches each keyword as a regular expression; by default
+	// a keyword matches literally, as a word of its own
+	// +optional
+	// +kubebuilder:validation:Enum=regex
+	Method string `json:"method,omitempty" yaml:"method,omitempty"`
+
 	// CaseSensitive specifies whether keyword matching is case-sensitive
 	// +optional
 	// +kubebuilder:default=false
 	CaseSensitive bool `json:"caseSensitive" yaml:"caseSensitive"`
-}
 
-// EmbeddingSignal defines an embedding-based signal extraction rule
-type EmbeddingSignal struct {
-	// Name is the unique identifier for this signal
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=100
-	Name string `json:"name" yaml:"name"`
-
-	// Threshold is the similarity threshold for matching (0.0-1.0)
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	Threshold float32 `json:"threshold" yaml:"threshold"`
-
-	// Candidates is the list of candidate phrases for semantic matching
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=100
-	Candidates []string `json:"candidates" yaml:"candidates"`
-
-	// AggregationMethod defines how to aggregate multiple candidate similarities
+	// Count makes an OR rule match on the number of its keyword occurrences
 	// +optional
-	// +kubebuilder:validation:Enum=mean;max;any
-	// +kubebuilder:default=max
-	AggregationMethod string `json:"aggregationMethod,omitempty" yaml:"aggregationMethod,omitempty"`
+	Count *NumericPredicate `json:"count,omitempty" yaml:"count,omitempty"`
 
-	// QueryModality declares which modality of the incoming request payload
-	// the query embedding is computed from. Candidates always remain text;
-	// the rule cosine-matches the text-anchor set against a query embedding
-	// produced from the declared modality, all in the shared multimodal
-	// embedding space.
-	//
-	// "text"  (default, backward-compatible): query embedded from request text.
-	// "image": query embedded from an image attachment (base64 data URI or
-	//          path). Requires the multi-modal embedding model to be loaded
-	//          via global.model_catalog.embeddings.semantic with
-	//          embedding_config.model_type=multimodal.
-	// "audio": query embedded from an audio attachment. Same requirement.
-	//
-	// Omitting this field is equivalent to "text" so existing rules behave
-	// identically.
+	// Density makes an OR rule match on its keyword occurrences per 1,000
+	// characters; set Count or Density, not both
 	// +optional
-	// +kubebuilder:validation:Enum=text;image;audio
-	QueryModality string `json:"queryModality,omitempty" yaml:"queryModality,omitempty"`
+	Density *NumericPredicate `json:"density,omitempty" yaml:"density,omitempty"`
 }
 
 // Decision defines a routing decision based on rule combinations
@@ -295,15 +228,121 @@ type Decision struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=10
 	Plugins []DecisionPlugin `json:"plugins,omitempty" yaml:"plugins,omitempty"`
+
+	// Reliability overrides the timeouts and retries of the provider model
+	// that serves this decision's requests
+	// +optional
+	Reliability *DecisionReliability `json:"reliability,omitempty" yaml:"reliability,omitempty"`
+
+	// Fallback overrides the cross-model fallback policy for this decision's
+	// requests, over the route's and the router's
+	// +optional
+	Fallback *DecisionFallback `json:"fallback,omitempty" yaml:"fallback,omitempty"`
+}
+
+// DecisionReliability is a decision's reliability block, with the router
+// configuration's field names and meaning. Durations are Go durations such
+// as "30s"; "0s" turns a timeout off.
+type DecisionReliability struct {
+	// TotalTimeout bounds the whole call: every attempt and the response
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	TotalTimeout string `json:"total_timeout,omitempty" yaml:"total_timeout,omitempty"`
+
+	// PerTryTimeout bounds each attempt until its response starts
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	PerTryTimeout string `json:"per_try_timeout,omitempty" yaml:"per_try_timeout,omitempty"`
+
+	// IdleTimeout bounds the wait for more of a streamed response
+	// (standalone mode only)
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	IdleTimeout string `json:"idle_timeout,omitempty" yaml:"idle_timeout,omitempty"`
+
+	// FirstByteTimeout bounds the wait for the first response byte
+	// (standalone mode only)
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	FirstByteTimeout string `json:"first_byte_timeout,omitempty" yaml:"first_byte_timeout,omitempty"`
+
+	// RetryCount is the number of retries after the first attempt
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=5
+	RetryCount *int32 `json:"retry_count,omitempty" yaml:"retry_count,omitempty"`
+
+	// RetryOn adds retry conditions, with Envoy's names (5xx, reset, ...)
+	// +optional
+	RetryOn string `json:"retry_on,omitempty" yaml:"retry_on,omitempty"`
+
+	// RetriableStatusCodes adds statuses retried under retriable-status-codes
+	// +optional
+	// +kubebuilder:validation:items:Minimum=100
+	// +kubebuilder:validation:items:Maximum=599
+	RetriableStatusCodes []int32 `json:"retriable_status_codes,omitempty" yaml:"retriable_status_codes,omitempty"`
+
+	// RetryBackOffBase is the base of the randomized exponential wait between
+	// retries (standalone mode only)
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	RetryBackOffBase string `json:"retry_back_off_base,omitempty" yaml:"retry_back_off_base,omitempty"`
+
+	// RetryBackOffMax caps that wait (standalone mode only)
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	RetryBackOffMax string `json:"retry_back_off_max,omitempty" yaml:"retry_back_off_max,omitempty"`
+
+	// RetryAfterMax honors a response's Retry-After up to this bound
+	// (standalone mode only)
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	RetryAfterMax string `json:"retry_after_max,omitempty" yaml:"retry_after_max,omitempty"`
+}
+
+// DecisionFallback is a decision's fallback block, with the router
+// configuration's field names and meaning. A field left out keeps the route's
+// or the router's value.
+type DecisionFallback struct {
+	// Enabled turns cross-model fallback on or off for this decision
+	// +optional
+	Enabled *bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+
+	// MaxAttempts bounds the candidates tried, the first one included
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxAttempts int32 `json:"max_attempts,omitempty" yaml:"max_attempts,omitempty"`
+
+	// TotalTimeout bounds the whole fallback chain
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	TotalTimeout string `json:"total_timeout,omitempty" yaml:"total_timeout,omitempty"`
+
+	// PerAttemptTimeout bounds each candidate's attempt
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	PerAttemptTimeout string `json:"per_attempt_timeout,omitempty" yaml:"per_attempt_timeout,omitempty"`
+
+	// RetryableStatusCodes are the statuses that move on to the next candidate
+	// +optional
+	// +kubebuilder:validation:items:Minimum=100
+	// +kubebuilder:validation:items:Maximum=599
+	RetryableStatusCodes []int32 `json:"retryable_status_codes,omitempty" yaml:"retryable_status_codes,omitempty"`
 }
 
 // SignalCombination defines how to combine multiple signals
 type SignalCombination struct {
-	// Operator defines the logical operator for combining conditions (AND/OR/NOT)
-	// NOT uses NOR semantics: matches only when none of the conditions match.
+	// Operator defines the logical operator for combining conditions (AND/OR/NOT).
+	// NOT is strictly unary: it takes exactly one child condition and negates its result.
+	// Compose NOR/NAND by nesting NOT around OR/AND.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=AND;OR;NOT
 	Operator string `json:"operator" yaml:"operator"`
+
+	// OnUnknown resolves a terminal unknown result after the signal tree is evaluated.
+	// +optional
+	// +kubebuilder:validation:Enum=no_match;match;fail_request
+	OnUnknown string `json:"on_unknown,omitempty" yaml:"on_unknown,omitempty"`
 
 	// Conditions defines the list of signal conditions
 	// +kubebuilder:validation:Required
@@ -314,9 +353,9 @@ type SignalCombination struct {
 
 // SignalCondition defines a single signal condition
 type SignalCondition struct {
-	// Type defines the type of signal (keyword/embedding/domain/fact_check/context/structure/conversation/event)
+	// Type defines the type of signal (keyword/domain/fact_check/context/conversation)
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=keyword;embedding;domain;fact_check;context;structure;conversation;event
+	// +kubebuilder:validation:Enum=keyword;domain;fact_check;context;conversation
 	Type string `json:"type" yaml:"type"`
 
 	// Name is the name of the signal to reference
@@ -350,17 +389,21 @@ type ModelRef struct {
 	// +kubebuilder:validation:MaxLength=500
 	ReasoningDescription string `json:"reasoningDescription,omitempty" yaml:"reasoningDescription,omitempty"`
 
-	// ReasoningEffort defines the reasoning effort level (low/medium/high)
+	// ReasoningMode selects an activation mode supported by the model family.
 	// +optional
-	// +kubebuilder:validation:Enum=low;medium;high
+	// +kubebuilder:validation:Enum=enabled;disabled;adaptive
+	ReasoningMode string `json:"reasoningMode,omitempty" yaml:"reasoningMode,omitempty"`
+
+	// ReasoningEffort selects an effort value supported by the model family.
+	// +optional
 	ReasoningEffort string `json:"reasoningEffort,omitempty" yaml:"reasoningEffort,omitempty"`
 }
 
 // DecisionPlugin defines a plugin configuration for a decision
 type DecisionPlugin struct {
-	// Type is the plugin type (fast_response, hallucination, header_mutation, image_gen, memory, rag, request_params, response_jailbreak, router_replay, semantic-cache, system_prompt, tools)
+	// Type is the plugin type.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=fast_response;hallucination;header_mutation;image_gen;memory;rag;request_params;response_jailbreak;router_replay;semantic-cache;system_prompt;tools
+	// +kubebuilder:validation:Enum=context;fast_response;header_mutation;masking;prompt_cache;request_params;response_cache;response_guard;router_replay;system_prompt;tools
 	Type string `json:"type" yaml:"type"`
 
 	// Configuration is the plugin-specific configuration as a raw JSON object
@@ -400,9 +443,13 @@ type ModelScore struct {
 	// +kubebuilder:validation:MaxLength=500
 	ReasoningDescription string `json:"reasoningDescription,omitempty" yaml:"reasoningDescription,omitempty"`
 
-	// ReasoningEffort defines the reasoning effort level (low/medium/high)
+	// ReasoningMode selects an activation mode supported by the model family.
 	// +optional
-	// +kubebuilder:validation:Enum=low;medium;high
+	// +kubebuilder:validation:Enum=enabled;disabled;adaptive
+	ReasoningMode string `json:"reasoningMode,omitempty" yaml:"reasoningMode,omitempty"`
+
+	// ReasoningEffort selects an effort value supported by the model family.
+	// +optional
 	ReasoningEffort string `json:"reasoningEffort,omitempty" yaml:"reasoningEffort,omitempty"`
 }
 
@@ -428,9 +475,6 @@ type RouteStatistics struct {
 
 	// Keywords indicates the number of keyword signals
 	Keywords int32 `json:"keywords" yaml:"keywords"`
-
-	// Embeddings indicates the number of embedding signals
-	Embeddings int32 `json:"embeddings" yaml:"embeddings"`
 
 	// Domains indicates the number of domain signals
 	Domains int32 `json:"domains" yaml:"domains"`

@@ -1,10 +1,10 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { mockAuthenticatedAppShell } from "./support/auth";
 
 const importedConfig = {
-  version: "v0.3",
+  version: "v0.5",
   providers: {
-    default_model: "remote-model-primary",
+    defaults: { model: "remote-model-primary" },
     models: [
       {
         name: "remote-model-primary",
@@ -30,37 +30,116 @@ const importedConfig = {
       },
     ],
   },
-  routing: {
-    modelCards: [
-      { name: "remote-model-primary", modality: "text" },
-      { name: "remote-model-backup", modality: "text" },
-    ],
-    signals: {
-      domains: [{ name: "remote-domain-a" }, { name: "remote-domain-b" }],
-      keywords: [{ name: "remote-keyword-a" }, { name: "remote-keyword-b" }],
+  recipes: [
+    {
+      name: "default",
+      signals: {
+        domains: [{ name: "remote-domain-a" }, { name: "remote-domain-b" }],
+        keywords: [
+          {
+            name: "remote-keyword-a",
+            operator: "OR",
+            keywords: ["remote-a"],
+            case_sensitive: false,
+          },
+          {
+            name: "remote-keyword-b",
+            operator: "OR",
+            keywords: ["remote-b"],
+            case_sensitive: false,
+          },
+        ],
+      },
+      decisions: [
+        {
+          name: "remote-route-primary",
+          priority: 900,
+          rules: { operator: "AND", conditions: [] },
+          modelRefs: [{ model: "remote-model-primary", use_reasoning: false }],
+        },
+        {
+          name: "remote-route-secondary",
+          priority: 800,
+          rules: { operator: "AND", conditions: [] },
+          modelRefs: [{ model: "remote-model-backup", use_reasoning: false }],
+        },
+        {
+          name: "remote-default",
+          priority: 100,
+          rules: { operator: "AND", conditions: [] },
+          modelRefs: [{ model: "remote-model-primary", use_reasoning: false }],
+        },
+      ],
     },
-    decisions: [
-      {
-        name: "remote-route-primary",
-        priority: 900,
-        rules: { operator: "AND", conditions: [] },
-        modelRefs: [{ model: "remote-model-primary", use_reasoning: false }],
-      },
-      {
-        name: "remote-route-secondary",
-        priority: 800,
-        rules: { operator: "AND", conditions: [] },
-        modelRefs: [{ model: "remote-model-backup", use_reasoning: false }],
-      },
-      {
-        name: "remote-default",
-        priority: 100,
-        rules: { operator: "AND", conditions: [] },
-        modelRefs: [{ model: "remote-model-primary", use_reasoning: false }],
-      },
-    ],
-  },
+  ],
 };
+
+async function mockFirstRunSetup(
+  page: Page,
+  capabilities: Record<string, Record<string, unknown>> = {},
+) {
+  await mockAuthenticatedAppShell(page, {
+    capabilities,
+    setupState: {
+      setupMode: true,
+      listenerPort: 8700,
+      models: 0,
+      decisions: 0,
+      hasModels: false,
+      hasDecisions: false,
+      canActivate: false,
+    },
+    settings: {
+      readonlyMode: false,
+      setupMode: true,
+      platform: "",
+      envoyUrl: "",
+    },
+  });
+  await page.route(/\/api\/setup\/presets$/, async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+}
+
+test.describe("Setup wizard activation access", () => {
+  test("disables Activate and explains why when the caller cannot deploy", async ({
+    page,
+  }) => {
+    await mockFirstRunSetup(page, {
+      setup: {
+        authorized: false,
+        state: "unauthorized",
+        reason: "permission_required",
+        remediation: "Your role lacks the config.deploy permission.",
+      },
+    });
+    await page.route("**/api/setup/validate", async (route) => {
+      const payload = route.request().postDataJSON() as { config: unknown };
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          valid: true,
+          config: payload.config,
+          models: 1,
+          decisions: 1,
+          signals: 0,
+          canActivate: true,
+        }),
+      });
+    });
+
+    await page.goto("/setup");
+    await page.getByRole("button", { name: "Next" }).click();
+    await page.getByRole("button", { name: "Next" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Review and activate" }),
+    ).toBeVisible();
+
+    await expect(page.getByText("Your role lacks the config.deploy permission.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Activate", exact: true })).toBeDisabled();
+  });
+});
 
 test.describe("Setup wizard routing import", () => {
   test("validates the default from-scratch config once and reaches ready", async ({
@@ -69,23 +148,7 @@ test.describe("Setup wizard routing import", () => {
     let validateCallCount = 0;
     let validatePayload: Record<string, unknown> | null = null;
 
-    await mockAuthenticatedAppShell(page, {
-      setupState: {
-        setupMode: true,
-        listenerPort: 8700,
-        models: 0,
-        decisions: 0,
-        hasModels: false,
-        hasDecisions: false,
-        canActivate: false,
-      },
-      settings: {
-        readonlyMode: false,
-        setupMode: true,
-        platform: "",
-        envoyUrl: "",
-      },
-    });
+    await mockFirstRunSetup(page);
 
     await page.route("**/api/setup/validate", async (route) => {
       validateCallCount += 1;
@@ -127,6 +190,9 @@ test.describe("Setup wizard routing import", () => {
       .toEqual({
         config: {
           providers: {
+            defaults: {
+              model: "qwen/qwen3.5-rocm",
+            },
             models: [
               {
                 name: "qwen/qwen3.5-rocm",
@@ -137,32 +203,29 @@ test.describe("Setup wizard routing import", () => {
                     weight: 100,
                     endpoint: "vllm:8000",
                     protocol: "http",
+                    provider: "vllm",
                   },
                 ],
               },
             ],
-            default_model: "qwen/qwen3.5-rocm",
           },
-          routing: {
-            modelCards: [
-              {
-                name: "qwen/qwen3.5-rocm",
-                modality: "text",
-              },
-            ],
-            decisions: [
-              {
-                name: "default-route",
-                description:
-                  "Generated during setup to route all requests to the default model.",
-                priority: 100,
-                rules: { operator: "AND", conditions: [] },
-                modelRefs: [
-                  { model: "qwen/qwen3.5-rocm", use_reasoning: false },
-                ],
-              },
-            ],
-          },
+          recipes: [
+            {
+              name: "default",
+              decisions: [
+                {
+                  name: "default-route",
+                  description:
+                    "Generated during setup to route all requests to the default model.",
+                  priority: 100,
+                  rules: { operator: "AND", conditions: [] },
+                  modelRefs: [
+                    { model: "qwen/qwen3.5-rocm", use_reasoning: false },
+                  ],
+                },
+              ],
+            },
+          ],
         },
       });
     await expect(page.getByText("Ready")).toBeVisible();
@@ -174,28 +237,12 @@ test.describe("Setup wizard routing import", () => {
     page,
   }) => {
     const remoteURL =
-      "https://raw.githubusercontent.com/vllm-project/semantic-router/main/deploy/recipes/balance.yaml";
+      "https://raw.githubusercontent.com/vllm-project/semantic-router/main/config/recipes/balance/config.yaml";
 
     let importPayload: Record<string, unknown> | null = null;
     let validatePayload: Record<string, unknown> | null = null;
 
-    await mockAuthenticatedAppShell(page, {
-      setupState: {
-        setupMode: true,
-        listenerPort: 8700,
-        models: 0,
-        decisions: 0,
-        hasModels: false,
-        hasDecisions: false,
-        canActivate: false,
-      },
-      settings: {
-        readonlyMode: false,
-        setupMode: true,
-        platform: "",
-        envoyUrl: "",
-      },
-    });
+    await mockFirstRunSetup(page);
 
     await page.route("**/api/setup/import-remote", async (route) => {
       importPayload = route.request().postDataJSON() as Record<string, unknown>;
@@ -276,5 +323,271 @@ test.describe("Setup wizard routing import", () => {
       .poll(() => validatePayload)
       .toEqual({ config: importedConfig });
     await expect(page.getByText("remote-default")).toBeVisible();
+  });
+
+  test("keeps reduced-motion setup static without creating a WebGL canvas", async ({
+    page,
+  }) => {
+    await mockFirstRunSetup(page);
+    await page.route(/\/api\/setup\/presets$/, async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+
+    await page.goto("/setup");
+
+    await expect(page.getByTestId("setup-motion-background")).toHaveAttribute(
+      "data-motion",
+      "reduced",
+    );
+    await expect(page.locator("canvas")).toHaveCount(0);
+    await expect(
+      page.getByRole("heading", { name: "Build your first Mixture-of-Models." }),
+    ).toBeVisible();
+  });
+
+  test("validates forward stepper navigation and supports directional keyboard focus", async ({
+    page,
+  }) => {
+    await mockFirstRunSetup(page);
+    await page.route(/\/api\/setup\/presets$/, async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    });
+    await page.route("**/api/setup/validate", async (route) => {
+      const payload = route.request().postDataJSON() as { config: Record<string, unknown> };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          valid: true,
+          config: payload.config,
+          models: 1,
+          decisions: 1,
+          signals: 0,
+          canActivate: true,
+        }),
+      });
+    });
+
+    await page.goto("/setup");
+
+    const modelName = page.getByLabel("Model name");
+    await modelName.fill("");
+    const firstStep = page.getByRole("button", { name: "Step 1: Connect model" });
+    await expect(firstStep).toHaveAttribute("aria-current", "step");
+    await firstStep.focus();
+    await page.keyboard.press("End");
+    const reviewStep = page.getByRole("button", { name: "Step 3: Review & activate" });
+    await expect(reviewStep).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect(firstStep).toHaveAttribute("aria-current", "step");
+    await expect(modelName).toHaveAttribute("aria-invalid", "true");
+    await expect(modelName).toBeFocused();
+
+    await modelName.fill("qwen/qwen3.5-rocm");
+    await firstStep.focus();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await expect(
+      page.getByRole("heading", { name: "Review and activate" }),
+    ).toBeVisible();
+    await expect(reviewStep).toHaveAttribute("aria-current", "step");
+  });
+
+  test("bounds model cards and makes removal confirmable and undoable", async ({ page }) => {
+    await mockFirstRunSetup(page);
+    await page.route(/\/api\/setup\/presets$/, async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    });
+
+    await page.goto("/setup");
+
+    const addModel = page.getByRole("button", { name: "Add model" });
+    for (let index = 0; index < 4; index += 1) {
+      await addModel.click();
+    }
+    await expect(page.getByText("5 models", { exact: true })).toBeVisible();
+    await expect(page.getByText("Page 2 of 2")).toBeVisible();
+
+    await page.getByRole("button", { name: "Remove model 5" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Remove this model?" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Remove model", exact: true }).click();
+
+    await expect(page.getByText("4 models", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+    await page.getByRole("button", { name: "Undo" }).click();
+    await expect(page.getByText("5 models", { exact: true })).toBeVisible();
+
+    await page.getByLabel("Find a model").fill("8004");
+    await expect(page.getByText("1 of 5 models")).toBeVisible();
+  });
+
+  test("shows retry states for preset catalog and remote import failures", async ({ page }) => {
+    await mockFirstRunSetup(page);
+    let presetCalls = 0;
+    await page.route(/\/api\/setup\/presets$/, async (route) => {
+      presetCalls += 1;
+      if (presetCalls <= 2) {
+        await route.fulfill({ status: 503, body: "preset service unavailable" });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            id: "balanced",
+            label: "Balanced Mixture",
+            summary: "Compose a balanced heterogeneous model fleet.",
+            required_models: [{ name: "qwen/qwen3.5-rocm", role: "general" }],
+            recipe_url: "https://example.com/balanced.yaml",
+          },
+        ]),
+      });
+    });
+    let importCalls = 0;
+    await page.route("**/api/setup/import-remote", async (route) => {
+      importCalls += 1;
+      if (importCalls === 1) {
+        await route.fulfill({ status: 502, body: "remote temporarily unavailable" });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          config: importedConfig,
+          models: 2,
+          decisions: 3,
+          signals: 4,
+          canActivate: true,
+          sourceUrl: "https://example.com/config.yaml",
+        }),
+      });
+    });
+
+    await page.goto("/setup");
+    await page.getByRole("button", { name: "Next" }).click();
+
+    await expect(page.getByText("Starter architectures unavailable")).toBeVisible();
+    await page.getByRole("button", { name: "Retry presets" }).click();
+    await expect(page.getByRole("button", { name: /Balanced Mixture/ })).toBeVisible();
+
+    await page.getByRole("button", { name: /From remote/ }).click();
+    await page.getByLabel("Remote config URL").fill("https://example.com/config.yaml");
+    await page.getByRole("button", { name: "Import", exact: true }).click();
+    await expect(page.getByText("remote temporarily unavailable")).toBeVisible();
+    await page.getByRole("button", { name: "Retry import" }).click();
+    await expect(page.getByText("Remote config ready")).toBeVisible();
+  });
+
+  // The frontend half of the #2795 contract.
+  //
+  // Activation ends setup mode by rewriting the router config, and the
+  // dashboard is not restarted. This drives the wizard to activation against a
+  // backend whose /api/setup/state flips at that moment, and checks the shell
+  // leaves /setup and stays off it.
+  //
+  // The API is mocked, so this covers the frontend only. That the real backend
+  // flips within one request is proved by the Go tests.
+  test("leaves the setup wizard once activation clears setup mode", async ({
+    page,
+  }) => {
+    let setupMode = true;
+    let setupStateRequestCount = 0;
+    let activateRequestCount = 0;
+
+    await mockFirstRunSetup(page);
+
+    // mockFirstRunSetup registered a fixed /api/setup/state. Drop it rather
+    // than rely on later-registration-wins, so this handler is the one used.
+    await page.unroute("**/api/setup/state");
+    await page.route("**/api/setup/state", async (route) => {
+      setupStateRequestCount += 1;
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          setupMode,
+          listenerPort: 8700,
+          models: setupMode ? 0 : 1,
+          decisions: setupMode ? 0 : 1,
+          hasModels: !setupMode,
+          hasDecisions: !setupMode,
+          canActivate: !setupMode,
+        }),
+      });
+    });
+
+    await page.route("**/api/setup/validate", async (route) => {
+      const payload = route.request().postDataJSON() as {
+        config: Record<string, unknown>;
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          valid: true,
+          config: payload.config,
+          models: 1,
+          decisions: 1,
+          signals: 0,
+          canActivate: true,
+        }),
+      });
+    });
+
+    await page.route("**/api/setup/activate", async (route) => {
+      activateRequestCount += 1;
+      // What the fix guarantees: stripping setup.mode takes effect at once, so
+      // the next read reports false with no restart in between.
+      setupMode = false;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "success",
+          setupMode: false,
+          message: "Setup activated successfully.",
+        }),
+      });
+    });
+
+    await page.goto("/setup");
+
+    await expect(
+      page.getByRole("heading", { name: "Connect your first model" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Next" }).click();
+
+    await expect(
+      page.getByRole("heading", { name: "Choose how routing should begin" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Next" }).click();
+
+    await expect(
+      page.getByRole("heading", { name: "Review and activate" }),
+    ).toBeVisible();
+
+    const activate = page.getByRole("button", { name: "Activate", exact: true });
+    await expect(activate).toBeEnabled();
+    await activate.click();
+
+    await expect.poll(() => activateRequestCount).toBe(1);
+    // The wizard re-reads setup state after activating, so the shell decides
+    // from the new value, not the one loaded on first render.
+    await expect.poll(() => setupStateRequestCount).toBeGreaterThanOrEqual(2);
+
+    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 12000 });
+
+    // Before the fix the reread still said true and the shell bounced back to
+    // /setup. Give that bounce a chance to happen and assert it does not.
+    await page.waitForTimeout(300);
+    await expect(page).toHaveURL(/\/dashboard$/);
+    await expect(
+      page.getByRole("heading", { name: "Review and activate" }),
+    ).toHaveCount(0);
   });
 });

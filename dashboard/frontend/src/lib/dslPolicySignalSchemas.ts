@@ -1,0 +1,37 @@
+import type { FieldSchema } from './dslSchemas'
+
+export function getPolicySignalFieldSchema(signalType: string): FieldSchema[] | null {
+  switch (signalType) {
+    case 'metadata':
+      return [
+        { key: 'description', label: 'Description', type: 'string' },
+        { key: 'key', label: 'Metadata Key', type: 'string', required: true },
+        {
+          key: 'predicate',
+          label: 'Predicate',
+          type: 'object',
+          required: true,
+          description: 'Set exactly one of equals, in, or exists.',
+          fields: [
+            { key: 'equals', label: 'Equals', type: 'string' },
+            { key: 'in', label: 'In', type: 'string[]' },
+            { key: 'exists', label: 'Exists', type: 'boolean' },
+          ],
+        },
+      ]
+    case 'input_modality':
+      return [
+        { key: 'description', label: 'Description', type: 'string' },
+        {
+          key: 'modality',
+          label: 'Modality',
+          type: 'select',
+          options: ['text', 'image', 'audio', 'video'],
+          required: true,
+          description: 'Input modality whose structural presence this signal matches.',
+        },
+      ]
+    default:
+      return null
+  }
+}

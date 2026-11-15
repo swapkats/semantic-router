@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
+	"gopkg.in/yaml.v3"
+
+	"github.com/vllm-project/semantic-router/dashboard/backend/auth"
 	"github.com/vllm-project/semantic-router/dashboard/backend/configprojection"
 	routerconfig "github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
@@ -28,13 +30,33 @@ type DeployRequest struct {
 	// BaseYAML is the full canonical config imported into the builder, if any.
 	// Routing-only fragments are ignored as merge bases.
 	BaseYAML string `json:"baseYaml,omitempty"`
+	// Mode controls how the DSL-owned config surface is applied. Merge is the
+	// backward-compatible default for partial API fragments. Replace atomically
+	// replaces recipes, entrypoints and model facts while preserving the static
+	// deployment config outside that surface.
+	Mode DeployMode `json:"mode,omitempty"`
 }
+
+// DeployMode defines the update semantics for a compiled routing fragment.
+type DeployMode string
+
+const (
+	DeployModeMerge   DeployMode = "merge"
+	DeployModeReplace DeployMode = "replace"
+)
 
 // DeployResponse is the JSON response for a deploy operation
 type DeployResponse struct {
 	Status  string `json:"status"`
 	Version string `json:"version"`
 	Message string `json:"message,omitempty"`
+}
+
+// deployedResponse answers a deploy with the Router's warnings about the
+// deployed config.
+type deployedResponse struct {
+	DeployResponse
+	Warnings []routerconfig.ConfigWarning `json:"warnings,omitempty"`
 }
 
 // ConfigVersion represents a backup version entry
@@ -54,10 +76,20 @@ type DeployPreviewResponse struct {
 // DeployPreviewHandler returns the current config and the merged preview
 // so the frontend can show a side-by-side diff before confirming deploy.
 // POST /api/router/config/deploy/preview
-func DeployPreviewHandler(configPath string) http.HandlerFunc {
+func DeployPreviewHandler(configPath string, readonlyMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if readonlyMode {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "readonly_mode",
+				"message": "Dashboard is in read-only mode. Deploy is disabled.",
+			})
 			return
 		}
 
@@ -82,7 +114,7 @@ func DeployPreviewHandler(configPath string) http.HandlerFunc {
 			return
 		}
 
-		currentData, err := os.ReadFile(configPath)
+		currentData, err := readPersistedDashboardConfig(configPath)
 		currentForDiffBytes := currentData
 		if err != nil {
 			currentForDiffBytes = []byte("# No existing config\n")
@@ -99,6 +131,17 @@ func DeployPreviewHandler(configPath string) http.HandlerFunc {
 			return
 		}
 
+		if !callerCanViewConfigSecrets(r) {
+			currentForDiffBytes, err = redactConfigYAML(currentForDiffBytes)
+			if err == nil {
+				previewBytes, err = redactConfigYAML(previewBytes)
+			}
+			if err != nil {
+				http.Error(w, "Failed to prepare configuration preview", http.StatusInternalServerError)
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "private, no-store")
 		currentForDiff := canonicalizeYAMLForDiff(currentForDiffBytes)
 		previewForDiff := canonicalizeYAMLForDiff(previewBytes)
 
@@ -145,7 +188,7 @@ func DeployHandler(configPath string, readonlyMode bool, configDir string) http.
 
 		log.Printf("[Deploy] Received: YAML=%d bytes, DSL=%d bytes", len(req.YAML), len(req.DSL))
 
-		deployDirectWrite(w, configPath, configDir, req)
+		deployDirectWrite(w, r, configPath, configDir, req)
 	}
 }
 
@@ -181,7 +224,7 @@ func RollbackHandler(configPath string, readonlyMode bool, configDir string) htt
 			return
 		}
 
-		rollbackDirectWrite(w, configPath, configDir, rollbackReq.Version)
+		rollbackDirectWrite(w, r, configPath, configDir, rollbackReq.Version)
 	}
 }
 
@@ -189,7 +232,7 @@ func RollbackHandler(configPath string, readonlyMode bool, configDir string) htt
 // GET /api/router/config/versions
 func ConfigVersionsHandler(configPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -200,33 +243,35 @@ func ConfigVersionsHandler(configPath string) http.HandlerFunc {
 
 // ==================== Deploy: write canonical config.yaml ====================
 
-func deployDirectWrite(w http.ResponseWriter, configPath string, configDir string, req DeployRequest) {
-	// Acquire deploy lock (only one deploy at a time)
-	if !deployMu.TryLock() {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "deploy_in_progress",
-			"message": "Another deploy operation is in progress. Please try again.",
-		})
+func deployDirectWrite(w http.ResponseWriter, r *http.Request, configPath string, configDir string, req DeployRequest) {
+	release, err := beginOrdinaryRuntimeConfigMutation(configDir)
+	if err != nil {
+		writeRuntimeConfigMutationError(w, err)
 		return
 	}
-	defer deployMu.Unlock()
+	defer release()
 
 	fragmentBytes := []byte(req.YAML)
-	if _, err := decodeYAMLTaggedBytes[routingFragmentDocument](fragmentBytes); err != nil {
+	if _, decodeErr := decodeYAMLTaggedBytes[routingFragmentDocument](fragmentBytes); decodeErr != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":   "yaml_parse_error",
-			"message": fmt.Sprintf("Invalid YAML syntax: %v", err),
+			"message": fmt.Sprintf("Invalid YAML syntax: %v", decodeErr),
 		})
 		return
 	}
 
-	existingData, err := os.ReadFile(configPath)
+	existingData, err := readLiveConfig(configPath)
 	if err != nil {
-		existingData = nil
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "config_read_failed",
+			"message": "Deploy aborted: the current config could not be read, so it cannot be merged or backed up.",
+		})
+		log.Printf("[Deploy] aborted, current config unreadable: %v", err)
+		return
 	}
 
 	// Step 2: Deep merge the routing fragment into the deploy base.
@@ -241,7 +286,8 @@ func deployDirectWrite(w http.ResponseWriter, configPath string, configDir strin
 		return
 	}
 
-	if _, err := routerconfig.ParseYAMLBytes(yamlBytes); err != nil {
+	warnings, err := validateMergedDeploy(yamlBytes)
+	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -251,28 +297,66 @@ func deployDirectWrite(w http.ResponseWriter, configPath string, configDir strin
 		return
 	}
 
+	if auth.RejectRevokedMutation(w, r) {
+		return
+	}
+	if _, err := checkConfigMapMutationFresh(configPath); err != nil {
+		writeConfigPersistenceError(w, err)
+		return
+	}
+
 	// Step 3: Create backup of current config
-	version := createConfigBackup(configDir, existingData)
+	version, backupErr := createConfigBackup(configDir, existingData)
+	if backupErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "config_backup_failed",
+			"message": "Deploy aborted: the config backup could not be written with owner-only permissions.",
+		})
+		log.Printf("[Deploy] aborted, config backup failed: %v", backupErr)
+		return
+	}
 
 	// Step 4: Archive DSL source (for audit trail)
 	archiveDeployDSL(configDir, req.DSL)
 
 	// Step 5: Atomic write to config.yaml
+	if auth.RejectRevokedMutation(w, r) {
+		return
+	}
 	if err := writeConfigAtomically(configPath, yamlBytes); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to write config: %v", err), http.StatusInternalServerError)
+		writeConfigPersistenceError(w, err)
+		return
+	}
+	if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
 		return
 	}
 
 	log.Printf("[Deploy] Config written to %s: version=%s, size=%d bytes", configPath, version, len(yamlBytes))
 
 	// Step 6: Propagate the new config to the managed runtime before returning.
-	if err := applyWrittenConfig(configPath, configDir, existingData, true); err != nil {
-		http.Error(w, formatRuntimeApplyError("Failed to apply deployed config to runtime", err), http.StatusInternalServerError)
+	restartMessage, applyErr := applyWrittenConfig(configPath, configDir, existingData, true)
+	if applyErr != nil {
+		http.Error(w, formatRuntimeApplyError("Failed to apply deployed config to runtime", applyErr), http.StatusInternalServerError)
+		return
+	}
+	if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
 		return
 	}
 
 	// Step 7: Clean up old backups (keep only maxBackups most recent)
 	cleanupBackups(configBackupDir(configDir))
+	if configActivationDeferred() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(deployedResponse{DeployResponse: DeployResponse{
+			Status:  "persisted",
+			Version: version,
+			Message: "Configuration saved to the Kubernetes ConfigMap. Roll out Router and Envoy to activate it.",
+		}, Warnings: warnings})
+		return
+	}
 
 	refreshConfigProjection(configprojection.RefreshInput{
 		Version:     newActivationVersion(),
@@ -281,12 +365,32 @@ func deployDirectWrite(w http.ResponseWriter, configPath string, configDir strin
 		DSLSnapshot: req.DSL,
 	})
 
+	if restartMessage != "" {
+		writeRestartRequiredResponse(w, version, restartMessage, warnings)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(DeployResponse{
+	_ = json.NewEncoder(w).Encode(deployedResponse{DeployResponse: DeployResponse{
 		Status:  "success",
 		Version: version,
 		Message: "Config deployed successfully. Router and Envoy have been updated.",
-	})
+	}, Warnings: warnings})
+}
+
+// validateMergedDeploy checks a merged deploy document as the Router loads
+// it with its own environment, which the Dashboard may not share, and returns
+// the Router's warnings about it.
+func validateMergedDeploy(data []byte) ([]routerconfig.ConfigWarning, error) {
+	if err := routerconfig.ValidateYAMLBytesDeferringEnv(data); err != nil {
+		return nil, err
+	}
+	// Warnings are advisory: a typed parse may refuse a ${VAR} reference
+	// that the deferred check accepted.
+	cfg, err := routerconfig.ParseYAMLBytesDeferringEnv(data)
+	if err != nil {
+		return []routerconfig.ConfigWarning{}, nil
+	}
+	return savedConfigWarnings(cfg), nil
 }
 
 func mergeDeployPayload(currentData []byte, req DeployRequest) ([]byte, error) {
@@ -298,90 +402,160 @@ func mergeDeployPayload(currentData []byte, req DeployRequest) ([]byte, error) {
 	if len(baseData) == 0 {
 		return fragmentBytes, nil
 	}
+	if req.Mode != "" && req.Mode != DeployModeMerge && req.Mode != DeployModeReplace {
+		return nil, fmt.Errorf("unsupported deploy mode %q", req.Mode)
+	}
 
-	baseConfig, err := decodeYAMLTaggedBytes[routerconfig.CanonicalConfig](baseData)
+	baseDoc, err := parseYAMLDocument(baseData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse deploy base config: %w", err)
+	}
+	baseRoot, err := documentMappingNode(baseDoc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse deploy base config: %w", err)
 	}
 
+	fragmentDoc, err := parseYAMLDocument(fragmentBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse compiled routing fragment: %w", err)
+	}
+	fragmentRoot, err := documentMappingNode(fragmentDoc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse compiled routing fragment: %w", err)
+	}
 	fragmentConfig, err := decodeYAMLTaggedBytes[routingFragmentDocument](fragmentBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse compiled routing fragment: %w", err)
 	}
 
-	baseConfig.Routing = mergeCanonicalRouting(baseConfig.Routing, fragmentConfig.Routing)
-	mergeFragmentGlobal(&baseConfig, fragmentConfig.Global)
-	mergedYAML, err := marshalYAMLBytes(baseConfig)
+	if mergeErr := mergeDSLOwnedNodes(baseRoot, fragmentRoot, req.Mode); mergeErr != nil {
+		return nil, mergeErr
+	}
+	if mergeErr := mergeFragmentGlobalNode(baseRoot, fragmentConfig.Global); mergeErr != nil {
+		return nil, mergeErr
+	}
+
+	mergedYAML, err := marshalYAMLDocument(baseDoc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal merged config: %w", err)
 	}
-	return mergedYAML, nil
+	return restoreConfigSecrets(currentData, mergedYAML)
 }
 
-func mergeCanonicalRouting(base, patch routerconfig.CanonicalRouting) routerconfig.CanonicalRouting {
-	merged := base
-	if len(patch.ModelCards) > 0 {
-		merged.ModelCards = patch.ModelCards
+// mergeDSLOwnedNodes applies only the configuration surface owned by the DSL:
+// recipes, entrypoints and the model facts on providers.models. Recipes and
+// entrypoints have identity and ordering semantics, so a supplied list is
+// replaced as one unit; in merge mode an omitted list remains untouched and a
+// supplied recipe keeps the fields of the base recipe of its name it omits.
+func mergeDSLOwnedNodes(baseRoot, fragmentRoot *yaml.Node, mode DeployMode) error {
+	preserveBaseDecisionFields(baseRoot, fragmentRoot)
+	if mode == DeployModeReplace && mappingValueNode(fragmentRoot, "recipes") == nil {
+		return fmt.Errorf("compiled routing fragment must contain recipes")
 	}
-	merged.Signals = mergeCanonicalSignals(base.Signals, patch.Signals)
-	if len(patch.Decisions) > 0 {
-		merged.Decisions = patch.Decisions
+	if mode != DeployModeReplace {
+		if err := mergeBaseRecipes(baseRoot, fragmentRoot); err != nil {
+			return err
+		}
 	}
-	return merged
+	for _, section := range []string{"recipes", "entrypoints"} {
+		if value := mappingValueNode(fragmentRoot, section); value != nil {
+			setMappingValueNode(baseRoot, section, value)
+		} else if mode == DeployModeReplace {
+			deleteMappingValueNode(baseRoot, section)
+		}
+	}
+	return mergeFragmentModelFacts(baseRoot, fragmentRoot)
 }
 
-func mergeCanonicalSignals(base, patch routerconfig.CanonicalSignals) routerconfig.CanonicalSignals {
-	merged := base
-	if len(patch.Keywords) > 0 {
-		merged.Keywords = patch.Keywords
+func mergeBaseRecipes(baseRoot, fragmentRoot *yaml.Node) error {
+	base := sequenceItemsByName(mappingValueNode(baseRoot, "recipes"))
+	for _, recipe := range sequenceItems(mappingValueNode(fragmentRoot, "recipes")) {
+		baseRecipe, ok := base[itemName(recipe)]
+		if !ok {
+			continue
+		}
+		merged := cloneYAMLNode(baseRecipe)
+		if err := mergeMappingNodes(merged, recipe); err != nil {
+			return fmt.Errorf("failed to merge recipe %s: %w", itemName(recipe), err)
+		}
+		*recipe = *merged
 	}
-	if len(patch.Embeddings) > 0 {
-		merged.Embeddings = patch.Embeddings
-	}
-	if len(patch.Domains) > 0 {
-		merged.Domains = patch.Domains
-	}
-	if len(patch.FactCheck) > 0 {
-		merged.FactCheck = patch.FactCheck
-	}
-	if len(patch.UserFeedbacks) > 0 {
-		merged.UserFeedbacks = patch.UserFeedbacks
-	}
-	if len(patch.Preferences) > 0 {
-		merged.Preferences = patch.Preferences
-	}
-	if len(patch.Language) > 0 {
-		merged.Language = patch.Language
-	}
-	if len(patch.Context) > 0 {
-		merged.Context = patch.Context
-	}
-	if len(patch.Complexity) > 0 {
-		merged.Complexity = patch.Complexity
-	}
-	if len(patch.Modality) > 0 {
-		merged.Modality = patch.Modality
-	}
-	if len(patch.RoleBindings) > 0 {
-		merged.RoleBindings = patch.RoleBindings
-	}
-	if len(patch.Jailbreak) > 0 {
-		merged.Jailbreak = patch.Jailbreak
-	}
-	if len(patch.PII) > 0 {
-		merged.PII = patch.PII
-	}
-	return merged
+	return nil
 }
 
-func mergeFragmentGlobal(base *routerconfig.CanonicalConfig, frag *globalFragment) {
-	if frag == nil || frag.Services == nil || frag.Services.RateLimit == nil {
-		return
+// mergeFragmentModelFacts makes the fragment's providers.models facts the
+// facts of the deployed models, as dsl.MergeRoutingIntoBase does: a base model
+// keeps its transport, and a model only the fragment names joins as a fact-only
+// entry.
+func mergeFragmentModelFacts(baseRoot, fragmentRoot *yaml.Node) error {
+	declared := sequenceItems(mappingValueNode(mappingValueNode(fragmentRoot, "providers"), "models"))
+	if len(declared) == 0 {
+		return nil
 	}
-	if base.Global == nil {
-		base.Global = &routerconfig.CanonicalGlobal{}
+	providers, err := ensureMappingNode(baseRoot, "providers")
+	if err != nil {
+		return err
 	}
-	base.Global.Services.RateLimit = *frag.Services.RateLimit
+	models := mappingValueNode(providers, "models")
+	if models == nil {
+		setMappingValueNode(providers, "models", &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"})
+		models = mappingValueNode(providers, "models")
+	}
+	if models.Kind != yaml.SequenceNode {
+		return fmt.Errorf("config providers.models must be a YAML sequence")
+	}
+	base := sequenceItemsByName(models)
+	for _, model := range sequenceItems(models) {
+		for _, field := range routerconfig.ModelFactFields() {
+			deleteMappingValueNode(model, field)
+		}
+	}
+	for _, model := range declared {
+		target, ok := base[itemName(model)]
+		if !ok {
+			models.Content = append(models.Content, model)
+			continue
+		}
+		for _, field := range routerconfig.ModelFactFields() {
+			if value := mappingValueNode(model, field); value != nil {
+				setMappingValueNode(target, field, value)
+			}
+		}
+	}
+	return nil
+}
+
+func mergeFragmentGlobalNode(baseRoot *yaml.Node, fragment *globalFragment) error {
+	if fragment == nil || fragment.Services == nil || fragment.Services.RateLimit == nil {
+		return nil
+	}
+
+	global, err := ensureMappingNode(baseRoot, "global")
+	if err != nil {
+		return err
+	}
+	services, err := ensureMappingNode(global, "services")
+	if err != nil {
+		return err
+	}
+	rateLimit := &yaml.Node{}
+	if err := rateLimit.Encode(fragment.Services.RateLimit); err != nil {
+		return fmt.Errorf("failed to encode global.services.ratelimit: %w", err)
+	}
+	setMappingValueNode(services, "ratelimit", rateLimit)
+	return nil
+}
+
+func ensureMappingNode(parent *yaml.Node, key string) (*yaml.Node, error) {
+	value := mappingValueNode(parent, key)
+	if value == nil {
+		setMappingValueNode(parent, key, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+		value = mappingValueNode(parent, key)
+	}
+	if value.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("config %s block must be a YAML mapping", key)
+	}
+	return value, nil
 }
 
 func resolveDeployBaseYAML(currentData []byte, providedBase string) ([]byte, error) {
@@ -412,7 +586,7 @@ func looksLikeFullCanonicalDeployBase(raw []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if mappingValueNode(root, "routing") == nil {
+	if mappingValueNode(root, "recipes") == nil {
 		return false, nil
 	}
 
@@ -424,18 +598,13 @@ func looksLikeFullCanonicalDeployBase(raw []byte) (bool, error) {
 	return false, nil
 }
 
-func rollbackDirectWrite(w http.ResponseWriter, configPath string, configDir string, version string) {
-	// Acquire deploy lock
-	if !deployMu.TryLock() {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "deploy_in_progress",
-			"message": "Another deploy operation is in progress.",
-		})
+func rollbackDirectWrite(w http.ResponseWriter, r *http.Request, configPath string, configDir string, version string) {
+	release, err := beginOrdinaryRuntimeConfigMutation(configDir)
+	if err != nil {
+		writeRuntimeConfigMutationError(w, err)
 		return
 	}
-	defer deployMu.Unlock()
+	defer release()
 
 	// Find backup file
 	backupData, err := readConfigBackup(configDir, version)
@@ -460,19 +629,57 @@ func rollbackDirectWrite(w http.ResponseWriter, configPath string, configDir str
 		return
 	}
 
+	if auth.RejectRevokedMutation(w, r) {
+		return
+	}
+	if _, err := checkConfigMapMutationFresh(configPath); err != nil {
+		writeConfigPersistenceError(w, err)
+		return
+	}
+
 	// Back up current config before rollback
-	existingData := snapshotCurrentConfigBeforeRollback(configPath, configDir)
+	existingData, snapshotErr := snapshotCurrentConfigBeforeRollback(configPath, configDir)
+	if snapshotErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "config_backup_failed",
+			"message": "Rollback aborted: the pre-rollback snapshot could not be written with owner-only permissions.",
+		})
+		log.Printf("[Rollback] aborted, pre-rollback snapshot failed: %v", snapshotErr)
+		return
+	}
 
 	// Atomic write to config.yaml
+	if auth.RejectRevokedMutation(w, r) {
+		return
+	}
 	if err := writeConfigAtomically(configPath, backupData); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to write config: %v", err), http.StatusInternalServerError)
+		writeConfigPersistenceError(w, err)
+		return
+	}
+	if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
 		return
 	}
 
 	log.Printf("[Rollback] Config rolled back to version %s, written to %s", version, configPath)
 
-	if err := applyWrittenConfig(configPath, configDir, existingData, true); err != nil {
-		http.Error(w, formatRuntimeApplyError("Failed to apply rolled back config to runtime", err), http.StatusInternalServerError)
+	restartMessage, applyErr := applyWrittenConfig(configPath, configDir, existingData, true)
+	if applyErr != nil {
+		http.Error(w, formatRuntimeApplyError("Failed to apply rolled back config to runtime", applyErr), http.StatusInternalServerError)
+		return
+	}
+	if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
+		return
+	}
+	if configActivationDeferred() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(DeployResponse{
+			Status:  "persisted",
+			Version: version,
+			Message: "Rollback saved to the Kubernetes ConfigMap. Roll out Router and Envoy to activate it.",
+		})
 		return
 	}
 
@@ -483,6 +690,10 @@ func rollbackDirectWrite(w http.ResponseWriter, configPath string, configDir str
 		DSLSnapshot: readArchivedDSL(configDir),
 	})
 
+	if restartMessage != "" {
+		writeRestartRequiredResponse(w, version, restartMessage, nil)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(DeployResponse{
 		Status:  "success",
@@ -503,7 +714,7 @@ func canonicalizeYAMLForDiff(raw []byte) string {
 	}
 
 	if looksLikeFullBase, err := looksLikeFullCanonicalDeployBase(raw); err == nil && looksLikeFullBase {
-		if configData, decodeErr := decodeYAMLTaggedBytes[routerconfig.CanonicalConfig](raw); decodeErr == nil {
+		if configData, decodeErr := decodeConfigDocument[routerconfig.CanonicalConfig](raw); decodeErr == nil {
 			if canonical, marshalErr := marshalYAMLBytes(configData); marshalErr == nil {
 				return string(canonical)
 			}

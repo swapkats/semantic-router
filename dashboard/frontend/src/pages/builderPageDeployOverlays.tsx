@@ -1,35 +1,31 @@
-import React, { useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { DiffEditor } from "@monaco-editor/react";
-import type { MonacoDiffEditor } from "@monaco-editor/react";
+import React, { useId, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { DiffEditor } from '@monaco-editor/react'
+import type { MonacoDiffEditor } from '@monaco-editor/react'
 
-import type { DeployResult, DeployStep } from "@/types/dsl";
+import type { DeployResult, DeployStep } from '@/types/dsl'
+import useAccessibleDialog from '@/hooks/useAccessibleDialog'
+import ConfigSaveWarnings from '../components/ConfigSaveWarnings'
+import ProductLoadingState from '../components/ProductLoadingState'
 
-import styles from "./BuilderPage.module.css";
+import styles from './BuilderPage.module.css'
 
-const DEPLOY_STEP_ORDER: DeployStep[] = [
-  "validating",
-  "backing_up",
-  "writing",
-  "reloading",
-  "done",
-];
+const DEPLOY_STEP_ORDER: DeployStep[] = ['validating', 'backing_up', 'writing', 'reloading', 'done']
 
 const DeployStepItem: React.FC<{
-  step: DeployStep;
-  current: DeployStep | null;
-  label: string;
+  step: DeployStep
+  current: DeployStep | null
+  label: string
 }> = ({ step, current, label }) => {
-  const currentIdx = current ? DEPLOY_STEP_ORDER.indexOf(current) : -1;
-  const stepIdx = DEPLOY_STEP_ORDER.indexOf(step);
-  const isDone =
-    current === "done" || (currentIdx > stepIdx && current !== "error");
-  const isActive = current === step;
-  const isError = current === "error" && isActive;
+  const currentIdx = current ? DEPLOY_STEP_ORDER.indexOf(current) : -1
+  const stepIdx = DEPLOY_STEP_ORDER.indexOf(step)
+  const isDone = current === 'done' || (currentIdx > stepIdx && current !== 'error')
+  const isActive = current === step
+  const isError = current === 'error' && isActive
 
   return (
     <div
-      className={`${styles.deployStepItem} ${isDone ? styles.deployStepDone : ""} ${isActive ? styles.deployStepActive : ""} ${isError ? styles.deployStepError : ""}`}
+      className={`${styles.deployStepItem} ${isDone ? styles.deployStepDone : ''} ${isActive ? styles.deployStepActive : ''} ${isError ? styles.deployStepError : ''}`}
     >
       <span className={styles.deployStepIcon}>
         {isDone ? (
@@ -41,11 +37,7 @@ const DeployStepItem: React.FC<{
             stroke="currentColor"
             strokeWidth="2"
           >
-            <path
-              d="M3 8.5l3 3 7-7"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
+            <path d="M3 8.5l3 3 7-7" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         ) : isActive && !isError ? (
           <span className={styles.deployStepSpinner} />
@@ -66,17 +58,17 @@ const DeployStepItem: React.FC<{
       </span>
       <span className={styles.deployStepLabel}>{label}</span>
     </div>
-  );
-};
+  )
+}
 
 interface BuilderDeployConfirmModalProps {
-  open: boolean;
-  loading: boolean;
-  error: string | null;
-  currentYaml: string;
-  mergedYaml: string;
-  onClose: () => void;
-  onConfirm: () => void;
+  open: boolean
+  loading: boolean
+  error: string | null
+  currentYaml: string
+  mergedYaml: string
+  onClose: () => void
+  onConfirm: () => void
 }
 
 const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
@@ -88,16 +80,29 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
   onClose,
   onConfirm,
 }) => {
-  const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
-  const [diffChangeCount, setDiffChangeCount] = useState(0);
+  const dialogId = useId()
+  const titleId = `${dialogId}-title`
+  const descriptionId = `${dialogId}-description`
+  const diffEditorRef = useRef<MonacoDiffEditor | null>(null)
+  const [diffChangeCount, setDiffChangeCount] = useState(0)
+  const dialogRef = useAccessibleDialog<HTMLDivElement>({
+    isOpen: open,
+    onClose,
+  })
 
-  if (!open) return null;
+  if (!open) return null
 
   return createPortal(
-    <div className={styles.modalOverlay} onClick={onClose}>
+    <div className={styles.modalOverlay} role="presentation" onMouseDown={onClose}>
       <div
+        ref={dialogRef}
         className={styles.deployDiffModal}
-        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
       >
         <div className={styles.deployModalHeader}>
           <svg
@@ -112,14 +117,16 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
             <line x1="12" y1="9" x2="12" y2="13" />
             <line x1="12" y1="17" x2="12.01" y2="17" />
           </svg>
-          <span>Deploy to Router — Config Diff</span>
+          <h2 id={titleId} className={styles.deployModalTitle}>
+            Deploy to Router — Config Diff
+          </h2>
           <div style={{ flex: 1 }} />
           <span className={styles.deployDiffLabels}>
             <span className={styles.deployDiffLabelOld}>Current</span>
             <span
               style={{
-                margin: "0 0.25rem",
-                color: "var(--color-text-muted)",
+                margin: '0 0.25rem',
+                color: 'var(--color-text-muted)',
               }}
             >
               &rarr;
@@ -130,31 +137,34 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
         {!loading && !error && (
           <div className={styles.deployDiffNav}>
             <button
+              type="button"
               className={styles.deployDiffNavBtn}
               title="Previous Change (↑)"
+              aria-label="Go to previous config change"
               onClick={() => {
-                const editor = diffEditorRef.current;
-                if (!editor) return;
-                const navigation = editor.getLineChanges();
-                if (!navigation || navigation.length === 0) return;
-                const modifiedEditor = editor.getModifiedEditor();
-                const currentLine =
-                  modifiedEditor.getPosition()?.lineNumber ?? 1;
+                const editor = diffEditorRef.current
+                if (!editor) return
+                const navigation = editor.getLineChanges()
+                if (!navigation || navigation.length === 0) return
+                const modifiedEditor = editor.getModifiedEditor()
+                const currentLine = modifiedEditor.getPosition()?.lineNumber ?? 1
                 for (let index = navigation.length - 1; index >= 0; index -= 1) {
                   const startLine =
                     navigation[index].modifiedStartLineNumber ||
-                    navigation[index].originalStartLineNumber;
+                    navigation[index].originalStartLineNumber
                   if (startLine < currentLine) {
-                    modifiedEditor.revealLineInCenter(startLine);
-                    modifiedEditor.setPosition({ lineNumber: startLine, column: 1 });
-                    return;
+                    modifiedEditor.revealLineInCenter(startLine)
+                    modifiedEditor.setPosition({
+                      lineNumber: startLine,
+                      column: 1,
+                    })
+                    return
                   }
                 }
-                const last = navigation[navigation.length - 1];
-                const lastLine =
-                  last.modifiedStartLineNumber || last.originalStartLineNumber;
-                modifiedEditor.revealLineInCenter(lastLine);
-                modifiedEditor.setPosition({ lineNumber: lastLine, column: 1 });
+                const last = navigation[navigation.length - 1]
+                const lastLine = last.modifiedStartLineNumber || last.originalStartLineNumber
+                modifiedEditor.revealLineInCenter(lastLine)
+                modifiedEditor.setPosition({ lineNumber: lastLine, column: 1 })
               }}
             >
               <svg
@@ -165,39 +175,41 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
                 stroke="currentColor"
                 strokeWidth="2"
               >
-                <path
-                  d="M4 10l4-4 4 4"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+                <path d="M4 10l4-4 4 4" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
             <button
+              type="button"
               className={styles.deployDiffNavBtn}
               title="Next Change (↓)"
+              aria-label="Go to next config change"
               onClick={() => {
-                const editor = diffEditorRef.current;
-                if (!editor) return;
-                const navigation = editor.getLineChanges();
-                if (!navigation || navigation.length === 0) return;
-                const modifiedEditor = editor.getModifiedEditor();
-                const currentLine =
-                  modifiedEditor.getPosition()?.lineNumber ?? 1;
+                const editor = diffEditorRef.current
+                if (!editor) return
+                const navigation = editor.getLineChanges()
+                if (!navigation || navigation.length === 0) return
+                const modifiedEditor = editor.getModifiedEditor()
+                const currentLine = modifiedEditor.getPosition()?.lineNumber ?? 1
                 for (let index = 0; index < navigation.length; index += 1) {
                   const startLine =
                     navigation[index].modifiedStartLineNumber ||
-                    navigation[index].originalStartLineNumber;
+                    navigation[index].originalStartLineNumber
                   if (startLine > currentLine) {
-                    modifiedEditor.revealLineInCenter(startLine);
-                    modifiedEditor.setPosition({ lineNumber: startLine, column: 1 });
-                    return;
+                    modifiedEditor.revealLineInCenter(startLine)
+                    modifiedEditor.setPosition({
+                      lineNumber: startLine,
+                      column: 1,
+                    })
+                    return
                   }
                 }
-                const first = navigation[0];
-                const firstLine =
-                  first.modifiedStartLineNumber || first.originalStartLineNumber;
-                modifiedEditor.revealLineInCenter(firstLine);
-                modifiedEditor.setPosition({ lineNumber: firstLine, column: 1 });
+                const first = navigation[0]
+                const firstLine = first.modifiedStartLineNumber || first.originalStartLineNumber
+                modifiedEditor.revealLineInCenter(firstLine)
+                modifiedEditor.setPosition({
+                  lineNumber: firstLine,
+                  column: 1,
+                })
               }}
             >
               <svg
@@ -208,32 +220,23 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
                 stroke="currentColor"
                 strokeWidth="2"
               >
-                <path
-                  d="M4 6l4 4 4-4"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+                <path d="M4 6l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
             <span className={styles.deployDiffNavInfo}>
               {diffChangeCount === 0
-                ? "No changes"
-                : `${diffChangeCount} change${diffChangeCount > 1 ? "s" : ""}`}
+                ? 'No changes'
+                : `${diffChangeCount} change${diffChangeCount > 1 ? 's' : ''}`}
             </span>
           </div>
         )}
         <div className={styles.deployDiffBody}>
           {loading && (
             <div className={styles.deployDiffLoading}>
-              <div className={styles.spinner} />
-              Loading config diff...
+              <ProductLoadingState label="Loading preview" compact />
             </div>
           )}
-          {error && (
-            <div className={styles.deployDiffError}>
-              Failed to load preview: {error}
-            </div>
-          )}
+          {error && <div className={styles.deployDiffError}>Failed to load preview: {error}</div>}
           {!loading && !error && (
             <DiffEditor
               original={currentYaml}
@@ -241,18 +244,18 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
               language="yaml"
               theme="vs-dark"
               onMount={(editor) => {
-                diffEditorRef.current = editor;
+                diffEditorRef.current = editor
                 const updateCount = () => {
-                  const changes = editor.getLineChanges();
-                  setDiffChangeCount(changes?.length ?? 0);
-                };
-                const timer = setTimeout(updateCount, 500);
+                  const changes = editor.getLineChanges()
+                  setDiffChangeCount(changes?.length ?? 0)
+                }
+                const timer = setTimeout(updateCount, 500)
                 try {
-                  editor.onDidUpdateDiff(updateCount);
+                  editor.onDidUpdateDiff(updateCount)
                 } catch {
                   /* older Monaco */
                 }
-                return () => clearTimeout(timer);
+                return () => clearTimeout(timer)
               }}
               options={{
                 readOnly: true,
@@ -260,8 +263,8 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
                 minimap: { enabled: true },
                 scrollBeyondLastLine: false,
                 fontSize: 12,
-                lineNumbers: "on",
-                wordWrap: "on",
+                lineNumbers: 'on',
+                wordWrap: 'on',
                 renderOverviewRuler: true,
                 renderIndicators: true,
                 contextmenu: false,
@@ -275,19 +278,26 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
         </div>
         <div className={styles.deployModalFooter}>
           <p
+            id={descriptionId}
             style={{
-              fontSize: "var(--text-xs)",
-              color: "var(--color-text-muted)",
+              fontSize: 'var(--text-xs)',
+              color: 'var(--color-text-muted)',
               margin: 0,
               flex: 1,
             }}
           >
             A backup of the current config will be created before deployment.
           </p>
-          <button className={styles.toolbarBtn} onClick={onClose}>
+          <button
+            type="button"
+            className={styles.toolbarBtn}
+            onClick={onClose}
+            data-dialog-initial-focus
+          >
             Cancel
           </button>
           <button
+            type="button"
             className={styles.toolbarBtnDeploy}
             onClick={onConfirm}
             disabled={loading || !!error}
@@ -300,15 +310,8 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
               stroke="currentColor"
               strokeWidth="1.5"
             >
-              <path
-                d="M8 2v8M5 7l3 3 3-3"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <path
-                d="M2 12v1a1 1 0 001 1h10a1 1 0 001-1v-1"
-                strokeLinecap="round"
-              />
+              <path d="M8 2v8M5 7l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M2 12v1a1 1 0 001 1h10a1 1 0 001-1v-1" strokeLinecap="round" />
             </svg>
             Deploy Now
           </button>
@@ -316,14 +319,14 @@ const BuilderDeployConfirmModal: React.FC<BuilderDeployConfirmModalProps> = ({
       </div>
     </div>,
     document.body,
-  );
-};
+  )
+}
 
 interface BuilderDeployToastProps {
-  deploying: boolean;
-  deployStep: DeployStep | null;
-  deployResult: DeployResult | null;
-  onDismiss: () => void;
+  deploying: boolean
+  deployStep: DeployStep | null
+  deployResult: DeployResult | null
+  onDismiss: () => void
 }
 
 const BuilderDeployToast: React.FC<BuilderDeployToastProps> = ({
@@ -332,46 +335,35 @@ const BuilderDeployToast: React.FC<BuilderDeployToastProps> = ({
   deployResult,
   onDismiss,
 }) => {
-  if (!deploying && !deployResult) return null;
+  if (!deploying && !deployResult) return null
 
   return createPortal(
-    <div className={styles.deployToast}>
+    <div
+      className={styles.deployToast}
+      role={deployResult?.status === 'error' ? 'alert' : 'status'}
+      aria-live={deployResult?.status === 'error' ? 'assertive' : 'polite'}
+      aria-atomic="true"
+    >
       {deploying && (
         <div className={styles.deployProgress}>
           <div className={styles.deployStepList}>
-            <DeployStepItem
-              step="validating"
-              current={deployStep}
-              label="Validating config"
-            />
-            <DeployStepItem
-              step="backing_up"
-              current={deployStep}
-              label="Creating backup"
-            />
-            <DeployStepItem
-              step="writing"
-              current={deployStep}
-              label="Writing config"
-            />
-            <DeployStepItem
-              step="reloading"
-              current={deployStep}
-              label="Reloading runtime"
-            />
+            <DeployStepItem step="validating" current={deployStep} label="Validating config" />
+            <DeployStepItem step="backing_up" current={deployStep} label="Creating backup" />
+            <DeployStepItem step="writing" current={deployStep} label="Writing config" />
+            <DeployStepItem step="reloading" current={deployStep} label="Reloading runtime" />
           </div>
         </div>
       )}
       {deployResult && !deploying && (
         <div
           className={
-            deployResult.status === "success"
+            deployResult.status === 'success'
               ? styles.deployResultSuccess
               : styles.deployResultError
           }
         >
           <div className={styles.deployResultIcon}>
-            {deployResult.status === "success" ? (
+            {deployResult.status === 'success' ? (
               <svg
                 width="16"
                 height="16"
@@ -380,11 +372,7 @@ const BuilderDeployToast: React.FC<BuilderDeployToastProps> = ({
                 stroke="currentColor"
                 strokeWidth="2"
               >
-                <path
-                  d="M3 8.5l3 3 7-7"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+                <path d="M3 8.5l3 3 7-7" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             ) : (
               <svg
@@ -400,7 +388,12 @@ const BuilderDeployToast: React.FC<BuilderDeployToastProps> = ({
             )}
           </div>
           <span className={styles.deployResultMsg}>{deployResult.message}</span>
-          <button className={styles.deployResultDismiss} onClick={onDismiss}>
+          <button
+            type="button"
+            className={styles.deployResultDismiss}
+            onClick={onDismiss}
+            aria-label="Dismiss deployment status"
+          >
             <svg
               width="12"
               height="12"
@@ -414,14 +407,15 @@ const BuilderDeployToast: React.FC<BuilderDeployToastProps> = ({
           </button>
         </div>
       )}
+      {deployResult && !deploying && <ConfigSaveWarnings warnings={deployResult.warnings ?? []} />}
     </div>,
     document.body,
-  );
-};
+  )
+}
 
 const BuilderDragOverlay: React.FC<{ active: boolean }> = ({ active }) => {
-  if (!active) return null;
-  return createPortal(<div className={styles.dragOverlay} />, document.body);
-};
+  if (!active) return null
+  return createPortal(<div className={styles.dragOverlay} aria-hidden="true" />, document.body)
+}
 
-export { BuilderDeployConfirmModal, BuilderDeployToast, BuilderDragOverlay };
+export { BuilderDeployConfirmModal, BuilderDeployToast, BuilderDragOverlay }

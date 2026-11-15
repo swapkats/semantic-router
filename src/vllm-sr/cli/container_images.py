@@ -1,21 +1,22 @@
 """Container image resolution helpers for vLLM Semantic Router."""
 
+import logging
 import os
 import sys
+from contextlib import contextmanager
 
 from cli.consts import (
     DEFAULT_IMAGE_PULL_POLICY,
     IMAGE_PULL_POLICY_ALWAYS,
     IMAGE_PULL_POLICY_IF_NOT_PRESENT,
     IMAGE_PULL_POLICY_NEVER,
-    PLATFORM_AMD,
+    PLATFORM_CUDA,
+    PLATFORM_ROCM,
+    VLLM_SR_CONTAINER_IMAGE_CUDA,
     VLLM_SR_CONTAINER_IMAGE_DEFAULT,
     VLLM_SR_CONTAINER_IMAGE_ROCM,
     VLLM_SR_DASHBOARD_CONTAINER_IMAGE_DEFAULT,
     VLLM_SR_ENVOY_CONTAINER_IMAGE_DEFAULT,
-    VLLM_SR_ROUTER_CONTAINER_IMAGE_DEFAULT,
-    VLLM_SR_ROUTER_CONTAINER_IMAGE_ROCM,
-    VLLM_SR_SIM_CONTAINER_IMAGE_DEFAULT,
 )
 from cli.container_runtime import (
     container_image_exists,
@@ -32,6 +33,10 @@ RUNTIME_SERVICE_IMAGE_ENV_VARS = {
     "dashboard": "VLLM_SR_DASHBOARD_IMAGE",
 }
 
+# `always` pulls an image once per command: serve pulls its Router image before
+# it checks a new config, and the start that follows must not pull it again.
+_PULLED_IMAGES: set[str] = set()
+
 
 def _normalize_platform(platform):
     """Normalize platform input for comparisons."""
@@ -40,31 +45,28 @@ def _normalize_platform(platform):
     return str(platform).strip().lower()
 
 
-def _is_rocm_image(image_name):
-    """Return True when the image name appears to be a ROCm image variant."""
-    if not image_name:
-        return False
-    return "rocm" in image_name.lower()
+# Per-platform GPU image variants: platform -> (image-name token, official
+# variant image, human label). Used to upgrade a non-GPU official image to the
+# matching GPU image when --platform selects a GPU platform.
+_GPU_IMAGE_VARIANTS = {
+    PLATFORM_ROCM: ("rocm", VLLM_SR_CONTAINER_IMAGE_ROCM, "ROCm"),
+    PLATFORM_CUDA: ("cuda", VLLM_SR_CONTAINER_IMAGE_CUDA, "CUDA"),
+}
 
 
-def _derive_rocm_variant(image_name):
-    """Return a ROCm variant for official vllm-sr image references."""
+def _derive_gpu_variant(image_name, variant_image):
+    """Return a GPU variant for official vllm-sr image references."""
     if not image_name:
         return ""
 
     image_name = image_name.strip()
-    supported_pairs = (
-        (VLLM_SR_CONTAINER_IMAGE_DEFAULT, VLLM_SR_CONTAINER_IMAGE_ROCM),
-        (VLLM_SR_ROUTER_CONTAINER_IMAGE_DEFAULT, VLLM_SR_ROUTER_CONTAINER_IMAGE_ROCM),
-    )
-    for default_image, rocm_image in supported_pairs:
-        default_repo = default_image.rsplit(":", 1)[0]
-        rocm_repo = rocm_image.rsplit(":", 1)[0]
-        if image_name == default_repo:
-            return f"{rocm_repo}:latest"
-        if image_name.startswith(f"{default_repo}:"):
-            tag = image_name.split(":")[-1]
-            return f"{rocm_repo}:{tag}"
+    default_repo = VLLM_SR_CONTAINER_IMAGE_DEFAULT.rsplit(":", 1)[0]
+    variant_repo = variant_image.rsplit(":", 1)[0]
+    if image_name == default_repo:
+        return f"{variant_repo}:latest"
+    if image_name.startswith(f"{default_repo}:"):
+        tag = image_name.split(":")[-1]
+        return f"{variant_repo}:{tag}"
     return ""
 
 
@@ -90,9 +92,10 @@ def _derive_official_variant(image_name, default_variant_image):
     image_name = image_name.strip()
     default_repo = VLLM_SR_CONTAINER_IMAGE_DEFAULT.rsplit(":", 1)[0]
     rocm_repo = VLLM_SR_CONTAINER_IMAGE_ROCM.rsplit(":", 1)[0]
+    cuda_repo = VLLM_SR_CONTAINER_IMAGE_CUDA.rsplit(":", 1)[0]
     variant_repo = default_variant_image.rsplit(":", 1)[0]
 
-    for candidate_repo in (default_repo, rocm_repo):
+    for candidate_repo in (default_repo, rocm_repo, cuda_repo):
         if image_name == candidate_repo:
             return f"{variant_repo}:latest"
         prefix = f"{candidate_repo}:"
@@ -103,12 +106,16 @@ def _derive_official_variant(image_name, default_variant_image):
 
 
 def _is_official_vllm_sr_image(image_name):
-    """Return True when the image is an official vllm-sr CPU or ROCm reference."""
+    """Return True when the image is an official vllm-sr CPU, ROCm, or CUDA reference."""
     if not image_name:
         return False
 
     image_name = image_name.strip()
-    for candidate in (VLLM_SR_CONTAINER_IMAGE_DEFAULT, VLLM_SR_CONTAINER_IMAGE_ROCM):
+    for candidate in (
+        VLLM_SR_CONTAINER_IMAGE_DEFAULT,
+        VLLM_SR_CONTAINER_IMAGE_ROCM,
+        VLLM_SR_CONTAINER_IMAGE_CUDA,
+    ):
         candidate_repo = candidate.rsplit(":", 1)[0]
         if image_name == candidate_repo or image_name.startswith(f"{candidate_repo}:"):
             return True
@@ -129,7 +136,7 @@ def _select_image_source(image, normalized_platform):
     if env_image:
         log.info(f"Using image from VLLM_SR_IMAGE: {env_image}")
         return env_image
-    if normalized_platform == PLATFORM_AMD:
+    if normalized_platform == PLATFORM_ROCM:
         amd_image = os.getenv("VLLM_SR_IMAGE_AMD", VLLM_SR_CONTAINER_IMAGE_ROCM).strip()
         selected_image = amd_image or VLLM_SR_CONTAINER_IMAGE_ROCM
         log.info(
@@ -137,32 +144,48 @@ def _select_image_source(image, normalized_platform):
             f"{selected_image}"
         )
         return selected_image
+    if normalized_platform == PLATFORM_CUDA:
+        nvidia_image = os.getenv(
+            "VLLM_SR_IMAGE_NVIDIA", VLLM_SR_CONTAINER_IMAGE_CUDA
+        ).strip()
+        selected_image = nvidia_image or VLLM_SR_CONTAINER_IMAGE_CUDA
+        log.info(
+            f"Platform '{normalized_platform}' detected, using NVIDIA CUDA default image: "
+            f"{selected_image}"
+        )
+        return selected_image
     log.info(f"Using default image: {VLLM_SR_CONTAINER_IMAGE_DEFAULT}")
     return VLLM_SR_CONTAINER_IMAGE_DEFAULT
 
 
-def _maybe_upgrade_to_rocm_image(selected_image, normalized_platform, source_name):
-    if normalized_platform != PLATFORM_AMD or _is_rocm_image(selected_image):
+def _maybe_upgrade_to_gpu_image(selected_image, normalized_platform, source_name):
+    variant = _GPU_IMAGE_VARIANTS.get(normalized_platform)
+    if variant is None:
         return selected_image
 
-    rocm_variant = _derive_rocm_variant(selected_image)
-    if rocm_variant:
+    image_token, variant_image, label = variant
+    if image_token in (selected_image or "").lower():
+        return selected_image
+
+    gpu_variant = _derive_gpu_variant(selected_image, variant_image)
+    if gpu_variant:
         log.warning(
-            f"Platform 'amd' selected with non-ROCm official {source_name}. "
-            f"Switching to ROCm image: {rocm_variant}"
+            f"Platform '{normalized_platform}' selected with non-{label} official "
+            f"{source_name}. Switching to {label} image: {gpu_variant}"
         )
-        return rocm_variant
+        return gpu_variant
 
     log.warning(
-        f"Platform 'amd' selected but {source_name} does not look like a ROCm image. "
-        "GPU acceleration may not be enabled. Prefer a '*-rocm' image."
+        f"Platform '{normalized_platform}' selected but {source_name} does not look "
+        f"like a {label} image. GPU acceleration may not be enabled. "
+        f"Prefer a '*-{image_token}' image."
     )
     return selected_image
 
 
 def _resolve_selected_image(image, normalized_platform):
     if image:
-        return _maybe_upgrade_to_rocm_image(
+        return _maybe_upgrade_to_gpu_image(
             _select_image_source(image, normalized_platform),
             normalized_platform,
             "vllm-sr image",
@@ -170,7 +193,7 @@ def _resolve_selected_image(image, normalized_platform):
 
     env_image = os.getenv("VLLM_SR_IMAGE")
     if env_image:
-        return _maybe_upgrade_to_rocm_image(
+        return _maybe_upgrade_to_gpu_image(
             _select_image_source(None, normalized_platform),
             normalized_platform,
             "vllm-sr image in VLLM_SR_IMAGE",
@@ -234,7 +257,7 @@ def _resolve_runtime_service_image(
                 )
 
     if service_name == "router":
-        return _maybe_upgrade_to_rocm_image(
+        return _maybe_upgrade_to_gpu_image(
             selected_image,
             normalized_platform,
             source_name,
@@ -281,6 +304,9 @@ def _resolve_nonrouter_explicit_base_image(service_name, base_image):
 def _ensure_image_available(selected_image, pull_policy):
     image_exists = container_image_exists(selected_image)
     if pull_policy == IMAGE_PULL_POLICY_ALWAYS:
+        if image_exists and selected_image in _PULLED_IMAGES:
+            log.info(f"Image already pulled: {selected_image}")
+            return
         _pull_or_exit(selected_image)
         return
     if pull_policy == IMAGE_PULL_POLICY_IF_NOT_PRESENT:
@@ -301,6 +327,7 @@ def _ensure_image_available(selected_image, pull_policy):
 
 def _pull_or_exit(selected_image, show_not_found=False):
     if container_pull_image(selected_image):
+        _PULLED_IMAGES.add(selected_image)
         return
     log.error(f"Failed to pull image: {selected_image}")
     if show_not_found:
@@ -343,6 +370,7 @@ def get_runtime_images(
     pull_policy=None,
     platform=None,
     include_dashboard=True,
+    include_envoy=True,
 ):
     """Resolve role-specific runtime images with backward-compatible fallback."""
     if pull_policy is None:
@@ -359,14 +387,15 @@ def get_runtime_images(
             base_image=base_image,
             normalized_platform=normalized_platform,
         ),
-        "envoy": _resolve_runtime_service_image(
+    }
+    if include_envoy:
+        selected_images["envoy"] = _resolve_runtime_service_image(
             "envoy",
             explicit_image=envoy_image,
             base_image_is_explicit=base_image_is_explicit,
             base_image=base_image,
             normalized_platform=normalized_platform,
-        ),
-    }
+        )
     if include_dashboard:
         selected_images["dashboard"] = _resolve_runtime_service_image(
             "dashboard",
@@ -382,22 +411,45 @@ def get_runtime_images(
     return selected_images
 
 
-def get_fleet_sim_container_image(image=None, pull_policy=None):
-    """Resolve the simulator image and ensure it is available locally."""
-    if pull_policy is None:
-        pull_policy = DEFAULT_IMAGE_PULL_POLICY
+def resolve_router_image(image=None, router_image=None, platform=None):
+    """The Router image get_runtime_images selects for these options, unpulled.
 
-    if image:
-        selected_image = image
-        log.info(f"Using specified simulator image: {selected_image}")
-    else:
-        selected_image = os.getenv(
-            "VLLM_SR_SIM_IMAGE", VLLM_SR_SIM_CONTAINER_IMAGE_DEFAULT
-        ).strip()
-        log.info(f"Using simulator image: {selected_image}")
+    The stack's start logs which images it chose, so this choice is not logged.
+    """
+    with _unlogged():
+        normalized_platform = _resolve_platform_hint(platform)
+        return _resolve_runtime_service_image(
+            "router",
+            explicit_image=router_image,
+            base_image_is_explicit=bool((image or "").strip()),
+            base_image=_resolve_selected_image(image, normalized_platform),
+            normalized_platform=normalized_platform,
+        )
 
-    _ensure_image_available(selected_image, pull_policy)
+
+def pulled_this_run(image):
+    """Whether this command pulled *image* from its registry."""
+    return image in _PULLED_IMAGES
+
+
+def get_router_image(image=None, router_image=None, pull_policy=None, platform=None):
+    """The Router image get_runtime_images selects, present as the policy says."""
+    selected_image = resolve_router_image(image, router_image, platform)
+    with _unlogged():
+        _ensure_image_available(
+            selected_image, pull_policy or DEFAULT_IMAGE_PULL_POLICY
+        )
     return selected_image
+
+
+@contextmanager
+def _unlogged():
+    level = log.level
+    log.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        log.setLevel(level)
 
 
 def _show_image_not_found_error(image_name):
@@ -420,7 +472,6 @@ def _show_image_not_found_error(image_name):
         "     vllm-sr serve --config config.yaml --dashboard-image your-dashboard:tag"
     )
     log.error("     vllm-sr serve --config config.yaml --envoy-image your-envoy:tag")
-    log.error("     vllm-sr serve --config config.yaml --sim-image your-sim:tag")
     log.error("")
     log.error("  3. Change pull policy to always:")
     log.error("     vllm-sr serve config.yaml --image-pull-policy always")

@@ -32,6 +32,7 @@ func TestDecompileToASTPreservesKeywordRuleFields(t *testing.T) {
 					BM25Threshold:  0.5,
 					NgramThreshold: 0.25,
 					NgramArity:     3,
+					IncludeHistory: true,
 				}},
 			},
 		},
@@ -49,6 +50,7 @@ func TestDecompileToASTPreservesKeywordRuleFields(t *testing.T) {
 	requireFloatField(t, sig, "bm25_threshold", 0.5)
 	requireFloatField(t, sig, "ngram_threshold", 0.25)
 	requireIntField(t, sig, "ngram_arity", 3)
+	requireBoolField(t, sig, "include_history", true)
 }
 
 // TestDecompileToASTPreservesContextRuleFields locks in the AST emit
@@ -150,7 +152,7 @@ func TestDecompileToASTOmitsZeroValuedKeywordRuleFields(t *testing.T) {
 
 	for _, omitted := range []string{
 		"case_sensitive", "method", "fuzzy_match", "fuzzy_threshold",
-		"bm25_threshold", "ngram_threshold", "ngram_arity",
+		"bm25_threshold", "ngram_threshold", "ngram_arity", "include_history",
 	} {
 		if _, ok := sig.Fields[omitted]; ok {
 			t.Errorf("expected %q to be omitted from AST when zero-valued, but it was present", omitted)
@@ -241,5 +243,28 @@ func requireFloatField(t *testing.T, sig *SignalDecl, name string, want float64)
 	}
 	if math.Abs(fv.V-want) > 0.000001 {
 		t.Errorf("field %q: want %v, got %v", name, want, fv.V)
+	}
+}
+
+// TestDecompileToASTOmitsMaxTokensForOpenEndedContextRule locks in that an
+// open-ended band round-trips without inventing a max_tokens field.
+func TestDecompileToASTOmitsMaxTokensForOpenEndedContextRule(t *testing.T) {
+	cfg := &config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				ContextRules: []config.ContextRule{{
+					Name:      "overflow_ctx",
+					MinTokens: "64K",
+				}},
+			},
+		},
+	}
+
+	prog := DecompileToAST(cfg)
+
+	sig := findSignal(t, prog, "context", "overflow_ctx")
+	requireStringField(t, sig, "min_tokens", "64K")
+	if _, ok := sig.Fields["max_tokens"]; ok {
+		t.Fatalf("expected open-ended context rule to omit max_tokens, got %v", sig.Fields["max_tokens"])
 	}
 }

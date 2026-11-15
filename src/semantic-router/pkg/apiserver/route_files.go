@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 /*
 Copyright 2025 vLLM Semantic Router.
@@ -21,20 +21,26 @@ package apiserver
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/vectorstore"
 )
 
 const (
-	maxUploadSize        = 50 * 1024 * 1024 // 50MB
-	multipartMemoryLimit = 8 * 1024 * 1024
+	megabyte             int64 = 1024 * 1024
+	maxUploadSize              = 50 * megabyte
+	multipartMemoryLimit       = 8 * 1024 * 1024
 )
 
-// allowedExtensions defines the file types that can be uploaded.
+// allowedExtensions defines the document types that can be uploaded for
+// vector-store ingestion.
 var allowedExtensions = map[string]bool{
 	".txt":  true,
 	".md":   true,
@@ -42,6 +48,59 @@ var allowedExtensions = map[string]bool{
 	".csv":  true,
 	".html": true,
 	".htm":  true,
+}
+
+// imageExtensions defines the image types accepted for purpose "vision". They
+// exist so Response API input_image parts can reference an uploaded image by
+// file_id; the router inlines the image for the selected backend.
+var imageExtensions = map[string]bool{
+	".png":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".gif":  true,
+	".webp": true,
+}
+
+// purposeVision is the upload purpose for images used as model input, matching
+// the OpenAI Files API value.
+const purposeVision = "vision"
+
+// uploadExtensionAllowed reports whether a file extension may be uploaded for
+// the given purpose: images for vision, documents for everything else.
+func uploadExtensionAllowed(ext, purpose string, documentExtensions map[string]bool) bool {
+	if purpose == purposeVision {
+		return imageExtensions[ext]
+	}
+	return documentExtensions[ext]
+}
+
+func allowedExtensionList(purpose string, documentExtensions map[string]bool) string {
+	if purpose == purposeVision {
+		return ".png, .jpg, .jpeg, .gif, .webp"
+	}
+	return strings.Join(slices.Sorted(maps.Keys(documentExtensions)), ", ")
+}
+
+func uploadMaxBytes(maxFileSizeMB int) int64 {
+	if maxFileSizeMB <= 0 || int64(maxFileSizeMB) > math.MaxInt64/megabyte {
+		return maxUploadSize
+	}
+	return int64(maxFileSizeMB) * megabyte
+}
+
+func (s *ClassificationAPIServer) uploadLimits() (int64, map[string]bool) {
+	cfg := s.currentConfig()
+	if cfg == nil || cfg.VectorStore == nil {
+		return maxUploadSize, allowedExtensions
+	}
+	documentExtensions := allowedExtensions
+	if len(cfg.VectorStore.SupportedFormats) > 0 {
+		documentExtensions = make(map[string]bool, len(cfg.VectorStore.SupportedFormats))
+		for _, format := range cfg.VectorStore.SupportedFormats {
+			documentExtensions[config.VectorStoreFormatExtension(format)] = true
+		}
+	}
+	return uploadMaxBytes(cfg.VectorStore.MaxFileSizeMB), documentExtensions
 }
 
 // SetFileStore sets the global file store for the API server.
@@ -56,8 +115,9 @@ func (s *ClassificationAPIServer) handleUploadFile(w http.ResponseWriter, r *htt
 		return
 	}
 
+	maxBytes, documentExtensions := s.uploadLimits()
 	// Limit upload size.
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 
 	if err := r.ParseMultipartForm(multipartMemoryLimit); err != nil {
 		var maxBytesErr *http.MaxBytesError
@@ -66,7 +126,7 @@ func (s *ClassificationAPIServer) handleUploadFile(w http.ResponseWriter, r *htt
 			return
 		}
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT",
-			fmt.Sprintf("failed to parse multipart form (max size: %dMB): %s", maxUploadSize/(1024*1024), err.Error()))
+			fmt.Sprintf("failed to parse multipart form (max size: %dMB): %s", maxBytes/megabyte, err.Error()))
 		return
 	}
 	if r.MultipartForm != nil {
@@ -98,11 +158,11 @@ func (s *ClassificationAPIServer) handleUploadFile(w http.ResponseWriter, r *htt
 		purpose = "assistants"
 	}
 
-	// Validate extension.
+	// Validate extension against the purpose.
 	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if !allowedExtensions[ext] {
+	if !uploadExtensionAllowed(ext, purpose, documentExtensions) {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_FILE_TYPE",
-			fmt.Sprintf("unsupported file type: %s (allowed: .txt, .md, .json, .csv, .html)", ext))
+			fmt.Sprintf("unsupported file type for purpose %q: %s (allowed: %s)", purpose, ext, allowedExtensionList(purpose, documentExtensions)))
 		return
 	}
 
@@ -136,9 +196,9 @@ func (s *ClassificationAPIServer) handleListFiles(w http.ResponseWriter, r *http
 		records = filtered
 	}
 
-	response := map[string]interface{}{
-		"object": "list",
-		"data":   records,
+	response := objectListResponse[*vectorstore.FileRecord]{
+		Object: "list",
+		Data:   records,
 	}
 	s.writeJSONResponse(w, http.StatusOK, response)
 }
@@ -150,7 +210,7 @@ func (s *ClassificationAPIServer) handleGetFile(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	id := extractPathParam(r.URL.Path, "/v1/files/")
+	id := extractPathParam(r.URL.Path, apiStorageFilesPath+"/")
 	if id == "" {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "file ID is required")
 		return
@@ -172,21 +232,32 @@ func (s *ClassificationAPIServer) handleDeleteFile(w http.ResponseWriter, r *htt
 		return
 	}
 
-	id := extractPathParam(r.URL.Path, "/v1/files/")
+	id := extractPathParam(r.URL.Path, apiStorageFilesPath+"/")
 	if id == "" {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "file ID is required")
 		return
 	}
 
-	if err := fileStore.Delete(id); err != nil {
+	if _, err := fileStore.Get(id); err != nil {
 		s.writeErrorResponse(w, http.StatusNotFound, "NOT_FOUND", err.Error())
 		return
 	}
+	var err error
+	if pipeline := s.currentVectorStorePipeline(); pipeline != nil {
+		err = pipeline.DeleteFile(r.Context(), id)
+	} else {
+		err = fileStore.Delete(id)
+	}
+	if err != nil {
+		logging.Errorf("Deleting file %s failed: %v", id, err)
+		s.writeErrorResponse(w, http.StatusInternalServerError, "DELETE_FAILED", "failed to delete file")
+		return
+	}
 
-	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-		"id":      id,
-		"object":  "file",
-		"deleted": true,
+	s.writeJSONResponse(w, http.StatusOK, objectDeletedResponse{
+		ID:      id,
+		Object:  "file",
+		Deleted: true,
 	})
 }
 
@@ -197,8 +268,8 @@ func (s *ClassificationAPIServer) handleGetFileContent(w http.ResponseWriter, r 
 		return
 	}
 
-	// Extract file ID from /v1/files/{id}/content
-	path := strings.TrimPrefix(r.URL.Path, "/v1/files/")
+	// Extract file ID from /api/v1/storage/files/{id}/content
+	path := strings.TrimPrefix(r.URL.Path, apiStorageFilesPath+"/")
 	id := strings.TrimSuffix(path, "/content")
 	if id == "" || id == path {
 		s.writeErrorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "file ID is required")

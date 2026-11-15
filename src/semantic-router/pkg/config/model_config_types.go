@@ -1,283 +1,26 @@
 package config
 
-// Classifier represents the configuration for text classification.
-type Classifier struct {
-	CategoryModel    `yaml:"category_model"`
-	MCPCategoryModel `yaml:"mcp_category_model,omitempty"`
-	PIIModel         `yaml:"pii_model"`
-	PreferenceModel  PreferenceModelConfig `yaml:"preference_model,omitempty"`
+import (
+	modelcatalog "github.com/vllm-project/semantic-router/src/semantic-router/pkg/catalog"
+)
+
+// GenerationReasoning turns a chat model's reasoning on or off for its
+// answers. Family references the shared reasoning-family catalog, which
+// says how a request turns reasoning on; a deployment defines no family of
+// its own.
+type GenerationReasoning struct {
+	Family          string `yaml:"family" jsonschema:"required"`
+	UseReasoning    *bool  `yaml:"use_reasoning" jsonschema:"required"`
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"`
 }
 
-type BertModel struct {
-	ModelID   string  `yaml:"model_id"`
-	Threshold float32 `yaml:"threshold"`
-	UseCPU    bool    `yaml:"use_cpu"`
-}
-
-type CategoryModel struct {
-	ModelID             string  `yaml:"model_id"`
-	Threshold           float32 `yaml:"threshold"`
-	UseCPU              bool    `yaml:"use_cpu"`
-	UseModernBERT       bool    `yaml:"use_modernbert"`
-	UseMmBERT32K        bool    `yaml:"use_mmbert_32k"`
-	CategoryMappingPath string  `yaml:"category_mapping_path"`
-	FallbackCategory    string  `yaml:"fallback_category,omitempty"`
-}
-
-type PIIModel struct {
-	ModelID        string  `yaml:"model_id"`
-	Threshold      float32 `yaml:"threshold"`
-	UseCPU         bool    `yaml:"use_cpu"`
-	UseMmBERT32K   bool    `yaml:"use_mmbert_32k"`
-	PIIMappingPath string  `yaml:"pii_mapping_path"`
-}
-
-type EmbeddingModels struct {
-	Qwen3ModelPath      string                  `yaml:"qwen3_model_path"`
-	GemmaModelPath      string                  `yaml:"gemma_model_path"`
-	MmBertModelPath     string                  `yaml:"mmbert_model_path"`
-	MultiModalModelPath string                  `yaml:"multimodal_model_path,omitempty"`
-	BertModelPath       string                  `yaml:"bert_model_path"`
-	UseCPU              bool                    `yaml:"use_cpu"`
-	EmbeddingConfig     HNSWConfig              `yaml:"embedding_config,omitempty"`
-	Endpoint            EmbeddingEndpointConfig `yaml:"endpoint,omitempty"`
-}
-
-func (e EmbeddingModels) MinSimilarityThreshold() float32 {
-	return e.EmbeddingConfig.WithDefaults().MinScoreThreshold
-}
-
-// HNSWConfig contains settings for optimizing embedding-backed classification.
-type HNSWConfig struct {
-	Backend            string                 `yaml:"backend,omitempty"`
-	ModelType          string                 `yaml:"model_type,omitempty"`
-	PreloadEmbeddings  bool                   `yaml:"preload_embeddings"`
-	TargetDimension    int                    `yaml:"target_dimension,omitempty"`
-	TargetLayer        int                    `yaml:"target_layer,omitempty"`
-	EnableSoftMatching *bool                  `yaml:"enable_soft_matching,omitempty"`
-	TopK               *int                   `yaml:"top_k,omitempty"`
-	MinScoreThreshold  float32                `yaml:"min_score_threshold,omitempty"`
-	PrototypeScoring   PrototypeScoringConfig `yaml:"prototype_scoring,omitempty"`
-}
-
-func (c HNSWConfig) WithDefaults() HNSWConfig {
-	result := c
-	if result.Backend == "" {
-		result.Backend = EmbeddingBackendCandle
-	}
-	if result.ModelType == "" {
-		if normalizeEmbeddingBackend(result.Backend) == EmbeddingBackendOpenAICompatible {
-			result.ModelType = EmbeddingModelTypeRemote
-		} else {
-			result.ModelType = EmbeddingModelTypeQwen3
-		}
-	}
-	if result.TargetDimension <= 0 {
-		result.TargetDimension = 768
-	}
-	if result.EnableSoftMatching == nil {
-		defaultEnabled := true
-		result.EnableSoftMatching = &defaultEnabled
-	}
-	if result.TopK == nil {
-		defaultTopK := 1
-		result.TopK = &defaultTopK
-	} else if *result.TopK < 0 {
-		defaultTopK := 1
-		result.TopK = &defaultTopK
-	}
-	if result.MinScoreThreshold <= 0 {
-		result.MinScoreThreshold = 0.5
-	}
-	result.PrototypeScoring = result.PrototypeScoring.WithDefaults()
-	return result
-}
-
-type MCPCategoryModel struct {
-	Enabled        bool              `yaml:"enabled"`
-	TransportType  string            `yaml:"transport_type"`
-	Command        string            `yaml:"command,omitempty"`
-	Args           []string          `yaml:"args,omitempty"`
-	Env            map[string]string `yaml:"env,omitempty"`
-	URL            string            `yaml:"url,omitempty"`
-	ToolName       string            `yaml:"tool_name,omitempty"`
-	Threshold      float32           `yaml:"threshold"`
-	TimeoutSeconds int               `yaml:"timeout_seconds,omitempty"`
-}
-
-// PromptCompressionConfig controls NLP-based prompt compression before signal extraction.
-type PromptCompressionConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	Profile        string   `yaml:"profile,omitempty"`
-	MaxTokens      int      `yaml:"max_tokens"`
-	MinLength      int      `yaml:"min_length,omitempty"`
-	SkipSignals    []string `yaml:"skip_signals,omitempty"`
-	TextRankWeight float64  `yaml:"textrank_weight,omitempty"`
-	PositionWeight float64  `yaml:"position_weight,omitempty"`
-	TFIDFWeight    float64  `yaml:"tfidf_weight,omitempty"`
-	NoveltyWeight  float64  `yaml:"novelty_weight,omitempty"`
-	PositionDepth  float64  `yaml:"position_depth,omitempty"`
-	PreserveFirstN int      `yaml:"preserve_first_n,omitempty"`
-	PreserveLastN  int      `yaml:"preserve_last_n,omitempty"`
-}
-
-func (pc PromptCompressionConfig) SkipSignalsSet() map[string]bool {
-	signals := pc.SkipSignals
-	if len(signals) == 0 {
-		signals = []string{SignalTypeJailbreak, SignalTypePII}
-	}
-	m := make(map[string]bool, len(signals))
-	for _, s := range signals {
-		m[s] = true
-	}
-	return m
-}
-
-type PromptGuardConfig struct {
-	Enabled              bool    `yaml:"enabled"`
-	ModelID              string  `yaml:"model_id"`
-	Threshold            float32 `yaml:"threshold"`
-	UseCPU               bool    `yaml:"use_cpu"`
-	UseModernBERT        bool    `yaml:"use_modernbert"`
-	UseMmBERT32K         bool    `yaml:"use_mmbert_32k"`
-	JailbreakMappingPath string  `yaml:"jailbreak_mapping_path"`
-	UseVLLM              bool    `yaml:"use_vllm,omitempty"`
-}
-
-type FeedbackDetectorConfig struct {
-	Enabled             bool    `yaml:"enabled"`
-	ModelID             string  `yaml:"model_id"`
-	Threshold           float32 `yaml:"threshold"`
-	UseCPU              bool    `yaml:"use_cpu"`
-	UseModernBERT       bool    `yaml:"use_modernbert"`
-	UseMmBERT32K        bool    `yaml:"use_mmbert_32k"`
-	FeedbackMappingPath string  `yaml:"feedback_mapping_path"`
-}
-
-type PreferenceModelConfig struct {
-	UseContrastive   *bool                  `yaml:"use_contrastive,omitempty"`
-	EmbeddingModel   string                 `yaml:"embedding_model,omitempty"`
-	PrototypeScoring PrototypeScoringConfig `yaml:"prototype_scoring,omitempty"`
-}
-
-func (c PreferenceModelConfig) WithDefaults() PreferenceModelConfig {
-	result := c
-	if result.UseContrastive == nil {
-		defaultEnabled := true
-		result.UseContrastive = &defaultEnabled
-	}
-	result.PrototypeScoring = result.PrototypeScoring.WithDefaults()
-	return result
-}
-
-func (c PreferenceModelConfig) ContrastiveEnabled() bool {
-	return *c.WithDefaults().UseContrastive
-}
-
-type ComplexityModelConfig struct {
-	PrototypeScoring PrototypeScoringConfig `yaml:"prototype_scoring,omitempty"`
-}
-
-func (c ComplexityModelConfig) WithDefaults() ComplexityModelConfig {
-	result := c
-	result.PrototypeScoring = result.PrototypeScoring.WithDefaults()
-	return result
-}
-
-type ExternalModelConfig struct {
-	Provider       string                 `yaml:"llm_provider"`
-	ModelRole      string                 `yaml:"model_role"`
-	ModelEndpoint  ClassifierVLLMEndpoint `yaml:"llm_endpoint,omitempty"`
-	ModelName      string                 `yaml:"llm_model_name,omitempty"`
-	TimeoutSeconds int                    `yaml:"llm_timeout_seconds,omitempty"`
-	ParserType     string                 `yaml:"parser_type,omitempty"`
-	Threshold      float32                `yaml:"threshold,omitempty"`
-	AccessKey      string                 `yaml:"access_key,omitempty" json:"-"`
-	MaxTokens      int                    `yaml:"max_tokens,omitempty"`
-	Temperature    float64                `yaml:"temperature,omitempty"`
-}
-
-type ToolFilteringWeights struct {
-	Embed    *float32 `yaml:"embed,omitempty"`
-	Lexical  *float32 `yaml:"lexical,omitempty"`
-	Tag      *float32 `yaml:"tag,omitempty"`
-	Name     *float32 `yaml:"name,omitempty"`
-	Category *float32 `yaml:"category,omitempty"`
-}
-
-type AdvancedToolFilteringConfig struct {
-	Enabled                     bool                              `yaml:"enabled"`
-	RetrievalStrategy           string                            `yaml:"retrieval_strategy,omitempty"`
-	CandidatePoolSize           *int                              `yaml:"candidate_pool_size,omitempty"`
-	MinLexicalOverlap           *int                              `yaml:"min_lexical_overlap,omitempty"`
-	MinCombinedScore            *float32                          `yaml:"min_combined_score,omitempty"`
-	Weights                     ToolFilteringWeights              `yaml:"weights,omitempty"`
-	UseCategoryFilter           *bool                             `yaml:"use_category_filter,omitempty"`
-	CategoryConfidenceThreshold *float32                          `yaml:"category_confidence_threshold,omitempty"`
-	AllowTools                  []string                          `yaml:"allow_tools,omitempty"`
-	BlockTools                  []string                          `yaml:"block_tools,omitempty"`
-	HybridHistory               *HybridHistoryToolRetrievalConfig `yaml:"hybrid_history,omitempty"`
-}
-
-// HybridHistoryToolRetrievalConfig tunes hybrid_history retrieval (semantic + short history + priors + repetition).
-type HybridHistoryToolRetrievalConfig struct {
-	HistoryHorizon             *int     `yaml:"history_horizon,omitempty"`
-	MinHistorySteps            *int     `yaml:"min_history_steps,omitempty"`
-	HistoryConfidenceThreshold *float32 `yaml:"history_confidence_threshold,omitempty"`
-	WeightSemantic             *float32 `yaml:"weight_semantic,omitempty"`
-	WeightHistoryTransition    *float32 `yaml:"weight_history_transition,omitempty"`
-	WeightDecisionPrior        *float32 `yaml:"weight_decision_prior,omitempty"`
-	RepetitionPenaltyStrength  *float32 `yaml:"repetition_penalty_strength,omitempty"`
-}
-
-type ToolsConfig struct {
-	Enabled             bool                         `yaml:"enabled"`
-	TopK                int                          `yaml:"top_k"`
-	SimilarityThreshold *float32                     `yaml:"similarity_threshold,omitempty"`
-	ToolsDBPath         string                       `yaml:"tools_db_path"`
-	FallbackToEmpty     bool                         `yaml:"fallback_to_empty"`
-	AdvancedFiltering   *AdvancedToolFilteringConfig `yaml:"advanced_filtering,omitempty"`
-}
-
-type HallucinationMitigationConfig struct {
-	Enabled                 bool                     `yaml:"enabled"`
-	FactCheckModel          FactCheckModelConfig     `yaml:"fact_check_model"`
-	HallucinationModel      HallucinationModelConfig `yaml:"hallucination_model"`
-	NLIModel                NLIModelConfig           `yaml:"nli_model"`
-	OnHallucinationDetected string                   `yaml:"on_hallucination_detected,omitempty"`
-}
-
-type FactCheckModelConfig struct {
-	ModelID      string  `yaml:"model_id"`
-	Threshold    float32 `yaml:"threshold"`
-	UseCPU       bool    `yaml:"use_cpu"`
-	UseMmBERT32K bool    `yaml:"use_mmbert_32k"`
-}
-
-type HallucinationModelConfig struct {
-	ModelID                string  `yaml:"model_id"`
-	Threshold              float32 `yaml:"threshold"`
-	UseCPU                 bool    `yaml:"use_cpu"`
-	MinSpanLength          int     `yaml:"min_span_length,omitempty"`
-	MinSpanConfidence      float32 `yaml:"min_span_confidence,omitempty"`
-	ContextWindowSize      int     `yaml:"context_window_size,omitempty"`
-	EnableNLIFiltering     bool    `yaml:"enable_nli_filtering,omitempty"`
-	NLIEntailmentThreshold float32 `yaml:"nli_entailment_threshold,omitempty"`
-}
-
-type NLIModelConfig struct {
-	ModelID   string  `yaml:"model_id"`
-	Threshold float32 `yaml:"threshold"`
-	UseCPU    bool    `yaml:"use_cpu"`
-}
-
-type ClassifierVLLMEndpoint struct {
-	Address         string `yaml:"address"`
-	Port            int    `yaml:"port"`
-	Protocol        string `yaml:"protocol,omitempty"`
-	Name            string `yaml:"name,omitempty"`
-	UseChatTemplate bool   `yaml:"use_chat_template,omitempty"`
-	PromptTemplate  string `yaml:"prompt_template,omitempty"`
+// AdmissionConfig bounds concurrent inference for one Router Model
+// deployment. Absent config means no gate and preserves current behavior.
+type AdmissionConfig struct {
+	MaxConcurrency int    `yaml:"max_concurrency"`
+	MaxQueue       int    `yaml:"max_queue,omitempty"`
+	QueueTimeoutMs int    `yaml:"queue_timeout_ms,omitempty"`
+	OnOverflow     string `yaml:"on_overflow,omitempty"`
 }
 
 type VLLMEndpoint struct {
@@ -293,38 +36,158 @@ type VLLMEndpoint struct {
 }
 
 type ProviderProfile struct {
-	Type         string            `yaml:"type"`
-	BaseURL      string            `yaml:"base_url,omitempty"`
-	AuthHeader   string            `yaml:"auth_header,omitempty"`
-	AuthPrefix   string            `yaml:"auth_prefix,omitempty"`
-	ExtraHeaders map[string]string `yaml:"extra_headers,omitempty"`
-	APIVersion   string            `yaml:"api_version,omitempty"`
-	ChatPath     string            `yaml:"chat_path,omitempty"`
+	Type               string                          `yaml:"type"`
+	Protocol           string                          `yaml:"protocol,omitempty"`
+	ReasoningTransport modelcatalog.ReasoningTransport `yaml:"reasoning_transport,omitempty"`
+	// ReasoningModes and ReasoningEfforts are catalog-materialized provider API
+	// constraints. They are intentionally absent from the public config surface.
+	ReasoningModes   []string `yaml:"-"`
+	ReasoningEfforts []string `yaml:"-"`
+	BaseURL          string   `yaml:"base_url,omitempty"`
+	AuthHeader       string   `yaml:"auth_header,omitempty"`
+	AuthPrefix       string   `yaml:"auth_prefix,omitempty"`
+	// AuthPrefixSet distinguishes an omitted override from an explicit empty
+	// prefix after canonical config has been materialized.
+	AuthPrefixSet bool              `yaml:"-"`
+	ExtraHeaders  map[string]string `yaml:"extra_headers,omitempty"`
+	APIVersion    string            `yaml:"api_version,omitempty"`
+	ChatPath      string            `yaml:"chat_path,omitempty"`
+	// AuthCredential is the backend's credential mode (auth.credential):
+	// delegated selects the requesting user's delegated credential as this
+	// backend's credential, caller the provider login the client sent; static
+	// keys and per-user provider keys are not consulted for either.
+	AuthCredential string `yaml:"auth_credential,omitempty"`
+	// TLS is how an https backend is verified, its tls block with the default
+	// CA applied; nil keeps the system roots and the endpoint's host. Envoy's
+	// cluster and the Router's own calls use the same settings.
+	TLS *DeploymentTLS `yaml:"tls,omitempty"`
+}
+
+// Delegated reports whether the backend takes the requesting user's
+// delegated credential instead of a key.
+func (p *ProviderProfile) Delegated() bool {
+	return p != nil && p.AuthCredential == CredentialDelegated
+}
+
+// Caller reports whether the backend takes the client's own provider login
+// instead of a key.
+func (p *ProviderProfile) Caller() bool {
+	return p != nil && p.AuthCredential == CredentialCaller
 }
 
 type ModelPricing struct {
-	Currency         string  `yaml:"currency,omitempty"`
-	PromptPer1M      float64 `yaml:"prompt_per_1m,omitempty"`
-	CompletionPer1M  float64 `yaml:"completion_per_1m,omitempty"`
-	CachedInputPer1M float64 `yaml:"cached_input_per_1m,omitempty"`
+	Currency          string   `yaml:"currency,omitempty"`
+	PromptPer1M       float64  `yaml:"prompt_per_1m,omitempty"`
+	CompletionPer1M   float64  `yaml:"completion_per_1m,omitempty"`
+	CachedInputPer1M  float64  `yaml:"cached_input_per_1m,omitempty"`
+	CacheWritePer1M   *float64 `yaml:"cache_write_per_1m,omitempty"`
+	CacheWrite1hPer1M *float64 `yaml:"cache_write_1h_per_1m,omitempty"`
 }
 
 type ModelParams struct {
-	PreferredEndpoints []string          `yaml:"preferred_endpoints,omitempty"`
-	Pricing            ModelPricing      `yaml:"pricing,omitempty"`
-	ReasoningFamily    string            `yaml:"reasoning_family,omitempty"`
-	LoRAs              []LoRAAdapter     `yaml:"loras,omitempty"`
-	AccessKey          string            `yaml:"access_key,omitempty" json:"-"`
-	ParamSize          string            `yaml:"param_size,omitempty"`
-	ContextWindowSize  int               `yaml:"context_window_size,omitempty"`
-	APIFormat          string            `yaml:"api_format,omitempty"`
-	Description        string            `yaml:"description,omitempty"`
-	Capabilities       []string          `yaml:"capabilities,omitempty"`
-	Tags               []string          `yaml:"tags,omitempty"`
-	QualityScore       float64           `yaml:"quality_score,omitempty"`
-	ExternalModelIDs   map[string]string `yaml:"external_model_ids,omitempty"`
-	Modality           string            `yaml:"modality,omitempty"`
-	ImageGenBackend    string            `yaml:"image_gen_backend,omitempty"`
+	Deployment string `yaml:"deployment,omitempty"`
+	// Schema is the version of its API the model's backends speak, as the
+	// model names it; UpstreamSchema gives the API's default without one.
+	Schema             string              `yaml:"schema,omitempty"`
+	PreferredEndpoints []string            `yaml:"preferred_endpoints,omitempty"`
+	Pricing            ModelPricing        `yaml:"pricing,omitempty"`
+	Reliability        ProviderReliability `yaml:"reliability,omitempty"`
+	ReasoningFamily    string              `yaml:"reasoning_family,omitempty"`
+	// AuthoredModel preserves the typed user declaration across materialization.
+	// Effective catalog defaults must not leak into exported user YAML, and an
+	// api_key_env reference must not be replaced by its expanded secret value.
+	AuthoredModel        *CanonicalProviderModel                        `yaml:"-" json:"-"`
+	LoRAs                []LoRAAdapter                                  `yaml:"loras,omitempty"`
+	AccessKey            string                                         `yaml:"access_key,omitempty" json:"-"`
+	AccessKeys           map[string]string                              `yaml:"-" json:"-"`
+	Catalog              string                                         `yaml:"catalog,omitempty"`
+	ParamSize            string                                         `yaml:"param_size,omitempty"`
+	ContextWindowSize    int                                            `yaml:"context_window_size,omitempty"`
+	MaxOutputTokens      int                                            `yaml:"max_output_tokens,omitempty"`
+	APIFormat            string                                         `yaml:"api_format,omitempty"`
+	Description          string                                         `yaml:"description,omitempty"`
+	Capabilities         []string                                       `yaml:"capabilities,omitempty"`
+	Tags                 []string                                       `yaml:"tags,omitempty"`
+	IndexResults         map[string]modelcatalog.IndexResult            `yaml:"-" json:"-"`
+	IndexResultsByEffort map[string]map[string]modelcatalog.IndexResult `yaml:"-" json:"-"`
+	QualityIndex         string                                         `yaml:"-" json:"-"`
+	ExternalModelIDs     map[string]string                              `yaml:"external_model_ids,omitempty"`
+	Modalities           modelcatalog.Modalities                        `yaml:"modalities,omitempty"`
+	// UnsupportedCapabilities are the request capabilities the model's
+	// backends reject; the Router leaves their fields out for this model.
+	UnsupportedCapabilities []string `yaml:"unsupported_capabilities,omitempty"`
+	// Tokenizer counts the model's prompts for the context window check;
+	// empty counts them with the tokenizer of HubRepo, else with the proxy
+	// tokenizer.
+	Tokenizer string `yaml:"tokenizer,omitempty"`
+	// HubRepo is the Hugging Face repo the model comes from: the
+	// open-weights source of its catalog card, else the id a self-hosted
+	// engine serves it under. Empty when it has neither.
+	HubRepo string `yaml:"-" json:"-"`
+}
+
+// EffectiveTokenizer is the tokenizer that counts the model's prompts for
+// the context window check: Tokenizer, else HubRepo; empty leaves them to
+// the proxy tokenizer.
+func (params ModelParams) EffectiveTokenizer() string {
+	if params.Tokenizer != "" {
+		return params.Tokenizer
+	}
+	return params.HubRepo
+}
+
+// EvidenceScore resolves a versioned static model index. Missing, failed, and
+// not-applicable results return ok=false and are never coerced to zero.
+func (params ModelParams) EvidenceScore(index string) (float64, bool) {
+	result, ok := params.EvidenceResult(index)
+	if !ok {
+		return 0, false
+	}
+	return *result.Score, true
+}
+
+// EvidenceResult resolves one available preferred-effort index result and
+// returns a defensive copy so callers can inspect coverage safely.
+func (params ModelParams) EvidenceResult(index string) (modelcatalog.IndexResult, bool) {
+	if index == "" {
+		index = params.QualityIndex
+	}
+	result, ok := params.IndexResults[index]
+	if !ok || result.Status != "available" || result.Score == nil {
+		return modelcatalog.IndexResult{}, false
+	}
+	return cloneCatalogIndexResult(result), true
+}
+
+// EvidenceScoreAt resolves evidence for the exact configured reasoning effort
+// when one is present on the candidate. An empty effort uses the model's
+// catalog-preferred result. Scores are never borrowed across efforts.
+func (params ModelParams) EvidenceScoreAt(index, reasoningEffort string) (float64, bool) {
+	result, ok := params.EvidenceResultAt(index, reasoningEffort)
+	if !ok {
+		return 0, false
+	}
+	return *result.Score, true
+}
+
+// EvidenceResultAt resolves an available index result for the exact configured
+// reasoning effort. Results are never borrowed from another effort.
+func (params ModelParams) EvidenceResultAt(index, reasoningEffort string) (modelcatalog.IndexResult, bool) {
+	if reasoningEffort == "" {
+		return params.EvidenceResult(index)
+	}
+	if index == "" {
+		index = params.QualityIndex
+	}
+	results, ok := params.IndexResultsByEffort[reasoningEffort]
+	if !ok {
+		return modelcatalog.IndexResult{}, false
+	}
+	result, ok := results[index]
+	if !ok || result.Status != "available" || result.Score == nil {
+		return modelcatalog.IndexResult{}, false
+	}
+	return cloneCatalogIndexResult(result), true
 }
 
 type LoRAAdapter struct {
@@ -333,13 +196,15 @@ type LoRAAdapter struct {
 }
 
 type ReasoningFamilyConfig struct {
-	Type      string `yaml:"type"`
-	Parameter string `yaml:"parameter"`
-}
-
-type PIIPolicy struct {
-	AllowByDefault bool     `yaml:"allow_by_default"`
-	PIITypes       []string `yaml:"pii_types_allowed,omitempty"`
+	Type                string            `yaml:"type"`
+	Parameter           string            `yaml:"parameter"`
+	ActivationParameter string            `yaml:"activation_parameter,omitempty"`
+	EffortFlags         map[string]string `yaml:"effort_flags,omitempty"`
+	Levels              []string          `yaml:"levels,omitempty"`
+	Default             string            `yaml:"default,omitempty"`
+	Modes               []string          `yaml:"modes,omitempty"`
+	DefaultMode         string            `yaml:"default_mode,omitempty"`
+	Disabled            string            `yaml:"disabled,omitempty"`
 }
 
 const (
@@ -361,13 +226,3 @@ const (
 	PIITypeUSSSN           = "US_SSN"
 	PIITypeZipCode         = "ZIP_CODE"
 )
-
-// FindExternalModelByRole searches for an external model configuration by its role.
-func (cfg *RouterConfig) FindExternalModelByRole(role string) *ExternalModelConfig {
-	for i := range cfg.ExternalModels {
-		if cfg.ExternalModels[i].ModelRole == role {
-			return &cfg.ExternalModels[i]
-		}
-	}
-	return nil
-}

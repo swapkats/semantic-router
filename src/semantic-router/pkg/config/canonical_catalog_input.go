@@ -1,0 +1,371 @@
+package config
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	modelcatalog "github.com/vllm-project/semantic-router/src/semantic-router/pkg/catalog"
+)
+
+// canonicalCatalogInput adapts the v0.5 hierarchy to the catalog's
+// normalized resource graph. This is the only place where public config joins
+// aliases, cards, provider definitions, and operator evaluations.
+func canonicalCatalogInput(canonical *CanonicalConfig) (modelcatalog.CompileInput, error) {
+	builder, err := newCatalogInputBuilder(canonical)
+	if err != nil {
+		return modelcatalog.CompileInput{}, err
+	}
+	for modelIndex, model := range canonical.Providers.Models {
+		if err := validateRouterOwnedPhysicalBackend(
+			builder.builtIn,
+			model,
+			len(canonical.Listeners) > 0,
+			modelIndex,
+		); err != nil {
+			return builder.input, err
+		}
+		if err := builder.addModel(model, modelIndex); err != nil {
+			return builder.input, err
+		}
+	}
+	if err := builder.addEvaluationRecords(canonical.Evaluation); err != nil {
+		return builder.input, err
+	}
+	return builder.input, nil
+}
+
+type catalogInputBuilder struct {
+	input             modelcatalog.CompileInput
+	builtIn           *modelcatalog.Registry
+	defaultTLS        *ProviderDefaultsTLS
+	benchmarks        map[string]modelcatalog.BenchmarkDefinition
+	cards             map[string]RoutingModel
+	boundCards        map[string]struct{}
+	configuredCards   map[string]struct{}
+	materializedCards map[string]struct{}
+}
+
+func newCatalogInputBuilder(canonical *CanonicalConfig) (*catalogInputBuilder, error) {
+	input := modelcatalog.CompileInput{Defaults: modelcatalog.Defaults{
+		Model:           canonical.Providers.Defaults.DefaultModel,
+		ReasoningEffort: canonical.Providers.Defaults.DefaultReasoningEffort,
+	}}
+	builtIn, err := modelcatalog.BuiltIn()
+	if err != nil {
+		return nil, fmt.Errorf("load built-in model catalog: %w", err)
+	}
+	benchmarks, err := canonicalEvaluationDefinitions(canonical.Evaluation, builtIn, &input.Evaluations)
+	if err != nil {
+		return nil, err
+	}
+	cards, err := canonicalModelCardIndex(canonical.Providers.Models)
+	if err != nil {
+		return nil, err
+	}
+	return &catalogInputBuilder{
+		input: input, builtIn: builtIn, defaultTLS: canonical.Providers.Defaults.TLS, benchmarks: benchmarks, cards: cards,
+		boundCards:        make(map[string]struct{}, len(canonical.Providers.Models)),
+		configuredCards:   make(map[string]struct{}, len(canonical.Providers.Models)),
+		materializedCards: make(map[string]struct{}, len(canonical.Providers.Models)),
+	}, nil
+}
+
+func (builder *catalogInputBuilder) addModel(model CanonicalProviderModel, modelIndex int) error {
+	if strings.TrimSpace(model.Catalog) != "" && model.Reasoning != nil {
+		return fmt.Errorf("providers.models[%d].reasoning is only valid for a custom model without catalog", modelIndex)
+	}
+	if model.APIFormat != "" && catalogProtocolForAPIFormat(model.APIFormat) == "" {
+		return fmt.Errorf(
+			"providers.models[%d].api_format %q is unsupported; use chat_completions, responses, messages, images or systemone (openai and anthropic are aliases of chat_completions and messages)",
+			modelIndex, model.APIFormat,
+		)
+	}
+	if err := validateUpstreamSchema(model, modelIndex); err != nil {
+		return err
+	}
+	cardID := effectiveCanonicalCardID(model)
+	alias := catalogModelAlias(model, cardID)
+	for backendIndex, backend := range model.BackendRefs {
+		instance, binding := catalogProviderBinding(builder.builtIn, model, backend, backendIndex)
+		instance.TLS = effectiveBackendTLS(backend.TLS, builder.defaultTLS, backendEndpointURL(builder.builtIn, backend))
+		builder.input.Providers = append(builder.input.Providers, instance)
+		alias.Providers = append(alias.Providers, binding)
+	}
+	builder.input.Models = append(builder.input.Models, alias)
+	builder.boundCards[cardID] = struct{}{}
+	builder.configuredCards[cardID] = struct{}{}
+	card, shouldMaterialize := builder.cardForModel(model, cardID)
+	if !shouldMaterialize {
+		return nil
+	}
+	builder.markLoRAAliasesBound(card)
+	return builder.materializeCard(card, model)
+}
+
+func catalogModelAlias(model CanonicalProviderModel, cardID string) modelcatalog.ModelAlias {
+	return modelcatalog.ModelAlias{
+		Name: model.Name, Catalog: cardID,
+		BindingDefaults: modelcatalog.ModelProviderBinding{
+			ModelID: model.ProviderModelID, Protocol: catalogProtocolForAPIFormat(model.APIFormat),
+			Pricing: catalogPricing(model.Pricing), Reliability: catalogReliability(model.Reliability),
+			ExternalModelIDs: copyStringMap(model.ExternalModelIDs),
+		},
+	}
+}
+
+func catalogProviderBinding(
+	builtIn *modelcatalog.Registry,
+	model CanonicalProviderModel,
+	backend CanonicalBackendRef,
+	backendIndex int,
+) (modelcatalog.ProviderInstance, modelcatalog.ModelProviderBinding) {
+	instanceName := canonicalEndpointName(model.Name, backend, backendIndex)
+	providerID := strings.TrimSpace(backend.Provider)
+	if providerID == "" {
+		providerID = "vllm"
+	}
+	instance := modelcatalog.ProviderInstance{
+		Name: instanceName, Catalog: providerID, BaseURL: canonicalBackendURL(backend),
+		Credentials: modelcatalog.CredentialsRef{APIKey: backend.APIKey},
+		Headers:     copyStringMap(backend.Headers), APIVersion: backend.APIVersion, ChatPath: backend.ChatPath,
+	}
+	if auth := backend.Auth; auth != nil {
+		instance.Credentials.APIKeyEnv, instance.AuthHeader, instance.AuthCredential = auth.APIKeyEnv, auth.Header, auth.Credential
+		if auth.Prefix != nil {
+			instance.AuthPrefix, instance.AuthPrefixSet = *auth.Prefix, true
+		}
+	}
+	if backend.Weight != 0 {
+		endpointURL := instance.BaseURL
+		if endpointURL == "" {
+			if definition, ok := builtIn.Provider(providerID); ok {
+				endpointURL = definition.DefaultBaseURL
+			}
+		}
+		instance.BaseURL = ""
+		instance.Endpoints = []modelcatalog.Endpoint{{
+			Name: "primary", URL: endpointURL, Weight: backend.Weight,
+		}}
+	}
+	binding := modelcatalog.ModelProviderBinding{
+		Name: instanceName, ModelID: catalogProviderModelID(model, providerID),
+		Protocol: catalogProtocolForAPIFormat(model.APIFormat), Pricing: catalogPricing(model.Pricing),
+		Reliability: catalogReliability(model.Reliability), ExternalModelIDs: copyStringMap(model.ExternalModelIDs),
+	}
+	return instance, binding
+}
+
+func catalogProviderModelID(model CanonicalProviderModel, providerID string) string {
+	if external := model.ExternalModelIDs[providerID]; external != "" {
+		return external
+	}
+	if model.ProviderModelID != "" {
+		return model.ProviderModelID
+	}
+	if model.Catalog == "" {
+		return model.Name
+	}
+	return ""
+}
+
+func (builder *catalogInputBuilder) cardForModel(
+	model CanonicalProviderModel,
+	cardID string,
+) (RoutingModel, bool) {
+	card, hasCard := builder.cards[cardID]
+	if strings.TrimSpace(model.Catalog) == "" {
+		// An operator-owned model remains custom even when its request-facing
+		// name happens to match a built-in catalog identity. Materialize the
+		// sparse custom card so it cannot inherit built-in metadata or evidence.
+		if !hasCard {
+			card.Name = cardID
+		}
+		return card, true
+	}
+	_, isBuiltIn := builder.builtIn.Model(cardID)
+	if !hasCard && !isBuiltIn {
+		return RoutingModel{Name: cardID}, true
+	}
+	if model.Reasoning != nil && card.Name == "" {
+		card.Name = cardID
+	}
+	return card, hasCard || model.Reasoning != nil
+}
+
+func (builder *catalogInputBuilder) markLoRAAliasesBound(card RoutingModel) {
+	// A LoRA request alias can have a metadata-only card and inherits the base
+	// model's provider binding instead of declaring another provider model.
+	for _, lora := range card.LoRAs {
+		if name := strings.TrimSpace(lora.Name); name != "" {
+			builder.boundCards[name] = struct{}{}
+		}
+	}
+}
+
+func (builder *catalogInputBuilder) materializeCard(
+	card RoutingModel,
+	model CanonicalProviderModel,
+) error {
+	if _, alreadyMaterialized := builder.materializedCards[card.Name]; alreadyMaterialized {
+		return nil
+	}
+	overlay := catalogCardOverlay(card, model)
+	builder.input.ModelCards = append(builder.input.ModelCards, overlay)
+	builder.materializedCards[card.Name] = struct{}{}
+	return nil
+}
+
+func (builder *catalogInputBuilder) addEvaluationRecords(evaluation *CanonicalEvaluation) error {
+	if evaluation == nil || len(evaluation.Records) == 0 {
+		return nil
+	}
+	records, err := catalogIndexableEvaluationRecords(
+		evaluation.Records,
+		builder.benchmarks,
+		builder.configuredCards,
+	)
+	if err != nil {
+		return err
+	}
+	builder.input.Evaluations.Records = append(builder.input.Evaluations.Records, records...)
+	return nil
+}
+
+func canonicalBackendURL(backend CanonicalBackendRef) string {
+	endpoint := strings.TrimSpace(backend.Endpoint)
+	if endpoint == "" || strings.Contains(endpoint, "://") {
+		return endpoint
+	}
+	return defaultProtocol(backend.Protocol) + "://" + endpoint
+}
+
+func catalogProtocolForAPIFormat(apiFormat string) string {
+	switch CanonicalAPIFormat(apiFormat) {
+	case APIFormatSystemOne:
+		return "vllm-sr/systemone@1"
+	case APIFormatResponses:
+		return "openai/responses@1"
+	case APIFormatMessages:
+		return "anthropic/messages@1"
+	case APIFormatChatCompletions:
+		return "openai/chat-completions@1"
+	case APIFormatImages:
+		return "openai/images@1"
+	default:
+		return ""
+	}
+}
+
+func catalogPricing(value ModelPricing) modelcatalog.Pricing {
+	return modelcatalog.Pricing{
+		Currency: value.Currency, PromptPer1M: value.PromptPer1M,
+		CompletionPer1M: value.CompletionPer1M, CachedInputPer1M: value.CachedInputPer1M,
+		CacheWritePer1M:   value.CacheWritePer1M,
+		CacheWrite1hPer1M: value.CacheWrite1hPer1M,
+	}
+}
+
+// catalogReliability converts directly: the two types declare the same
+// fields, so adding one to only one of them fails to compile.
+func catalogReliability(value ProviderReliability) modelcatalog.Reliability {
+	converted := modelcatalog.Reliability(value)
+	converted.RetriableStatusCodes = slices.Clone(value.RetriableStatusCodes)
+	return converted
+}
+
+func catalogCardOverlay(
+	card RoutingModel,
+	model CanonicalProviderModel,
+) modelcatalog.ModelCardOverlay {
+	catalogBacked := strings.TrimSpace(model.Catalog) != ""
+	overlay := modelcatalog.ModelCardOverlay{Name: card.Name, BuiltIn: &catalogBacked}
+	applyCatalogCardStrings(card, &overlay)
+	applyCatalogCardLimits(card, &overlay)
+	applyCatalogCardLists(card, &overlay)
+	applyCatalogCardReasoning(model, &overlay)
+	return overlay
+}
+
+func applyCatalogCardStrings(card RoutingModel, overlay *modelcatalog.ModelCardOverlay) {
+	setStringPointer(card.DisplayName, &overlay.DisplayName)
+	setStringPointer(card.Description, &overlay.Description)
+	setStringPointer(card.Publisher, &overlay.Publisher)
+	setStringPointer(card.Family, &overlay.Family)
+	setStringPointer(card.ParamSize, &overlay.ParameterSize)
+	setStringPointer(card.Revision, &overlay.Revision)
+	setStringPointer(card.ReleasedAt, &overlay.ReleasedAt)
+	setStringPointer(card.KnowledgeCutoff, &overlay.KnowledgeCutoff)
+	setStringPointer(card.Lifecycle, &overlay.Lifecycle)
+}
+
+func applyCatalogCardLimits(card RoutingModel, overlay *modelcatalog.ModelCardOverlay) {
+	if card.ContextWindowSize > 0 {
+		value := card.ContextWindowSize
+		overlay.ContextWindowSize = &value
+	}
+	if card.MaxOutputTokens > 0 {
+		value := card.MaxOutputTokens
+		overlay.MaxOutputTokens = &value
+	}
+}
+
+func applyCatalogCardLists(card RoutingModel, overlay *modelcatalog.ModelCardOverlay) {
+	if card.Presentation != nil {
+		value := *card.Presentation
+		overlay.Presentation = &value
+	}
+	if card.Distribution != nil {
+		value := *card.Distribution
+		overlay.Distribution = &value
+	}
+	if card.Capabilities != nil {
+		value := append([]string(nil), card.Capabilities...)
+		overlay.Capabilities = &value
+	}
+	if card.Modalities != nil {
+		value := *card.Modalities
+		overlay.Modalities = &value
+	}
+	if card.Tags != nil {
+		value := append([]string(nil), card.Tags...)
+		overlay.Tags = &value
+	}
+	applyCatalogCardLoRAs(card.LoRAs, overlay)
+}
+
+func applyCatalogCardLoRAs(loras []LoRAAdapter, overlay *modelcatalog.ModelCardOverlay) {
+	if loras != nil {
+		value := make([]modelcatalog.LoRAAdapter, 0, len(loras))
+		for _, lora := range loras {
+			value = append(value, modelcatalog.LoRAAdapter{Name: lora.Name, Description: lora.Description})
+		}
+		overlay.LoRAs = &value
+	}
+}
+
+func applyCatalogCardReasoning(model CanonicalProviderModel, overlay *modelcatalog.ModelCardOverlay) {
+	if model.Reasoning != nil {
+		if model.Reasoning.Family != "" {
+			value := model.Reasoning.Family
+			overlay.ReasoningFamily = &value
+		} else {
+			overlay.Reasoning = &modelcatalog.ReasoningFamilyDefinition{
+				Type: model.Reasoning.Type, Parameter: model.Reasoning.Parameter,
+				ActivationParameter: model.Reasoning.ActivationParameter,
+				EffortFlags:         copyStringMap(model.Reasoning.EffortFlags),
+				Levels:              append([]string(nil), model.Reasoning.Levels...), Default: model.Reasoning.Default,
+				Modes: append([]string(nil), model.Reasoning.Modes...), DefaultMode: model.Reasoning.DefaultMode,
+				Disabled: model.Reasoning.Disabled,
+			}
+		}
+	}
+}
+
+func setStringPointer(value string, target **string) {
+	if value == "" {
+		return
+	}
+	copy := value
+	*target = &copy
+}

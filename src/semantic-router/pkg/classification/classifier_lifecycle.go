@@ -2,6 +2,7 @@ package classification
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
@@ -12,41 +13,58 @@ import (
 // BuildClassifier creates a classifier without executing runtime initialization.
 // The router assembly path uses this explicit build-then-init split so lifecycle
 // ownership stays visible outside constructor call chains.
-func BuildClassifier(
-	cfg *config.RouterConfig,
-	categoryMapping *CategoryMapping,
-	piiMapping *PIIMapping,
-	jailbreakMapping *JailbreakMapping,
-) (*Classifier, error) {
-	jailbreakInitializer, jailbreakInference, err := buildJailbreakDependencies(cfg)
-	if err != nil {
-		return nil, err
-	}
-	piiInitializer, piiInference := buildPIIDependencies(cfg)
-	builder := newClassifierOptionBuilder(cfg, []option{
-		withJailbreak(jailbreakMapping, jailbreakInitializer, jailbreakInference),
-		withPII(piiMapping, piiInitializer, piiInference),
-	})
-	options, err := builder.build(categoryMapping)
-	if err != nil {
-		return nil, err
-	}
-	return newClassifierWithOptions(cfg, options...)
+func BuildClassifier(cfg *config.RouterConfig) (*Classifier, error) {
+	return buildClassifier(cfg)
 }
 
-// NewClassifier preserves the legacy convenience behavior for existing callers
-// by building the classifier and then explicitly initializing runtime state.
-func NewClassifier(
-	cfg *config.RouterConfig,
-	categoryMapping *CategoryMapping,
-	piiMapping *PIIMapping,
-	jailbreakMapping *JailbreakMapping,
-) (*Classifier, error) {
-	classifier, err := BuildClassifier(cfg, categoryMapping, piiMapping, jailbreakMapping)
+func buildClassifier(cfg *config.RouterConfig, runtimeOptions ...RecipeRuntimeOptions) (*Classifier, error) {
+	if cfg != nil && cfg.RoutingScope == "" {
+		cfg = cfg.ConfigForRecipe(cfg.DefaultRecipe())
+	}
+	var runtimeOption RecipeRuntimeOptions
+	if len(runtimeOptions) > 0 {
+		runtimeOption = runtimeOptions[0]
+	}
+	models, err := newClassifierModelRuntime(cfg, runtimeOption)
+	if err != nil {
+		return nil, err
+	}
+	cfg = models.cfg
+	builder := newClassifierOptionBuilder(cfg, nil)
+	transferred := false
+	defer func() {
+		if !transferred {
+			builder.closePending()
+		}
+	}()
+	builder.models = models
+	if cfg.RoutingScope == "" || cfg.IsDefaultRecipe(cfg.RoutingScope) {
+		builder.embeddingSet = runtimeOption.Embeddings
+	}
+	options, err := builder.build()
+	if err != nil {
+		return nil, err
+	}
+	classifier, err := newClassifierWithOptions(cfg, options...)
+	if err != nil {
+		return nil, err
+	}
+	classifier.models = models
+	classifier.embeddingSet = builder.embeddingSet
+	classifier.ownsEmbeddingSet = builder.ownsEmbeddingSet
+	transferred = true
+	return classifier, nil
+}
+
+// NewClassifier builds the classifier and then initializes its runtime state;
+// a classifier that fails to initialize is closed.
+func NewClassifier(cfg *config.RouterConfig, runtimeOptions ...RecipeRuntimeOptions) (*Classifier, error) {
+	classifier, err := buildClassifier(cfg, runtimeOptions...)
 	if err != nil {
 		return nil, err
 	}
 	if err := classifier.InitializeRuntime(); err != nil {
+		_ = classifier.Close()
 		return nil, err
 	}
 	return classifier, nil
@@ -62,7 +80,10 @@ func (c *Classifier) InitializeRuntime() error {
 	}
 
 	c.logHeuristicClassifierInitialization()
-	tasks := c.runtimeTasks()
+	return c.executeRuntimeTasks(c.runtimeTasks())
+}
+
+func (c *Classifier) executeRuntimeTasks(tasks []modelruntime.Task) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -75,6 +96,11 @@ func (c *Classifier) InitializeRuntime() error {
 		OnEvent:        logRuntimeInitializationEvent,
 	})
 	if err != nil {
+		if closeErr := c.Close(); closeErr != nil {
+			logging.ComponentWarnEvent("classifier", "runtime_initialization_rollback_failed", map[string]interface{}{
+				"error": closeErr.Error(),
+			})
+		}
 		return err
 	}
 
@@ -84,8 +110,35 @@ func (c *Classifier) InitializeRuntime() error {
 	return nil
 }
 
+// Close releases the classifier's runtime resources.
+func (c *Classifier) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() { c.closeErr = c.closeResources() })
+	return c.closeErr
+}
+
+func (c *Classifier) closeResources() error {
+	var closeErrors []error
+	closeResource := func(name string, resource interface{}) {
+		closer, ok := resource.(interface{ Close() error })
+		if !ok || closer == nil {
+			return
+		}
+		if err := closer.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", name, err))
+		}
+	}
+
+	if c.ownsEmbeddingSet {
+		closeResource("embeddings", c.embeddingSet)
+	}
+	return errors.Join(closeErrors...)
+}
+
 func (c *Classifier) runtimeTasks() []modelruntime.Task {
-	tasks := make([]modelruntime.Task, 0, 9)
+	tasks := make([]modelruntime.Task, 0, 5)
 	appendTask := func(name string, bestEffort bool, enabled bool, init func() error) {
 		if !enabled {
 			return
@@ -99,31 +152,10 @@ func (c *Classifier) runtimeTasks() []modelruntime.Task {
 		})
 	}
 
-	appendTask("classifier.category", false, c.usesRoutingSignalType(config.SignalTypeDomain) && (c.IsCategoryEnabled() || c.IsMCPCategoryEnabled()), c.initializeConfiguredCategoryRuntime)
-	appendTask("classifier.jailbreak", false, c.usesRoutingSignalType(config.SignalTypeJailbreak) && c.IsJailbreakEnabled(), c.initializeJailbreakClassifier)
-	appendTask("classifier.pii", false, c.usesRoutingSignalType(config.SignalTypePII) && c.IsPIIEnabled(), c.initializePIIClassifier)
-	appendTask("classifier.keyword_embedding", false, c.IsKeywordEmbeddingClassifierEnabled(), c.initializeKeywordEmbeddingClassifier)
-	appendTask("classifier.fact_check", true, c.IsFactCheckEnabled(), c.initializeFactCheckClassifier)
-	appendTask("classifier.hallucination", true, c.IsHallucinationDetectionEnabled(), c.initializeHallucinationDetector)
-	appendTask("classifier.feedback", true, c.IsFeedbackDetectorEnabled(), c.initializeFeedbackDetector)
-	appendTask("classifier.preference", true, c.IsPreferenceClassifierEnabled(), c.initializePreferenceClassifier)
+	appendTask("classifier.systemone", false, len(c.preparedSystemOneRules()) > 0, c.prepareSystemOneSignals)
 	appendTask("classifier.language", true, len(c.Config.LanguageRules) > 0, c.initializeLanguageClassifier)
 
 	return tasks
-}
-
-func (c *Classifier) usesRoutingSignalType(signalType string) bool {
-	return c != nil && c.Config != nil && c.Config.UsesSignalTypeInRouting(signalType)
-}
-
-func (c *Classifier) initializeConfiguredCategoryRuntime() error {
-	if c.IsCategoryEnabled() {
-		return c.initializeCategoryClassifier()
-	}
-	if c.IsMCPCategoryEnabled() {
-		return c.initializeMCPCategoryClassifier()
-	}
-	return nil
 }
 
 func logRuntimeInitializationEvent(event modelruntime.Event) {

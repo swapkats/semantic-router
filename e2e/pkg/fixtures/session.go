@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/vllm-project/semantic-router/e2e/pkg/helpers"
 	pkgtestcases "github.com/vllm-project/semantic-router/e2e/pkg/testcases"
-	"k8s.io/client-go/kubernetes"
 )
 
 // ServiceSession owns a port-forwarded local endpoint for an in-cluster service.
@@ -96,6 +97,39 @@ func OpenRouterAPISession(ctx context.Context, client *kubernetes.Clientset, opt
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start router API port forwarding: %w", err)
+	}
+
+	time.Sleep(2 * time.Second)
+	return newSession(localPort, stop), nil
+}
+
+// OpenServiceEndpointSession establishes a port-forward to an arbitrary
+// in-cluster service endpoint. Testcases that need to observe a dependency
+// directly, rather than drive the profile service, use this.
+func OpenServiceEndpointSession(
+	ctx context.Context,
+	client *kubernetes.Clientset,
+	opts pkgtestcases.TestCaseOptions,
+	namespace string,
+	service string,
+	servicePort string,
+) (*ServiceSession, error) {
+	localPort, err := getAvailablePort()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get available port: %w", err)
+	}
+
+	stop, err := helpers.StartPortForward(
+		ctx,
+		client,
+		opts.RestConfig,
+		namespace,
+		service,
+		fmt.Sprintf("%s:%s", localPort, servicePort),
+		opts.Verbose,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start port forwarding to %s/%s: %w", namespace, service, err)
 	}
 
 	time.Sleep(2 * time.Second)

@@ -2,10 +2,19 @@ package extproc
 
 import (
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 )
 
 // handleResponseHeaders processes the response headers.
-func (r *OpenAIRouter) handleResponseHeaders(v *ext_proc.ProcessingRequest_ResponseHeaders, ctx *RequestContext) (*ext_proc.ProcessingResponse, error) {
+func (r *OpenAIRouter) handleResponseHeaders(v *ext_proc.ProcessingRequest_ResponseHeaders, ctx *RequestContext) (response *ext_proc.ProcessingResponse, err error) {
+	defer func() { removeProviderRouterHeaders(response, v) }()
+	// Preserve the provider's actual HTTP status even on the skip-processing
+	// path, without invoking routing, plugins or additional metrics there.
+	if ctx != nil && v != nil {
+		ctx.UpstreamStatusCode = getStatusFromHeaders(v.ResponseHeaders.GetHeaders())
+		ctx.UpstreamResponseGzip = isGzipContentEncoding(v.ResponseHeaders.GetHeaders())
+	}
 	if skipResp := r.handleSkipProcessingResponseHeaders(v, ctx); skipResp != nil {
 		return skipResp, nil
 	}
@@ -19,11 +28,55 @@ func (r *OpenAIRouter) handleResponseHeaders(v *ext_proc.ProcessingRequest_Respo
 		// path can avoid caching non-2xx error bodies (cache poisoning).
 		ctx.UpstreamStatusCode = outcome.statusCode
 	}
-	finishUpstreamResponseSpan(ctx, outcome)
-	maybeRecordResponseHeaderTTFT(ctx)
+	annotateUpstreamResponseSpan(ctx, outcome)
+	if outcome.isSuccessful {
+		// A failed response is not the model's time to first token.
+		maybeRecordResponseHeaderTTFT(ctx)
+	}
 	r.updateRouterReplayStatus(ctx, outcome.statusCode, ctx != nil && ctx.IsStreamingResponse)
 	r.observeRouterLearningProviderStatus(ctx, outcome.statusCode)
 
-	headerMutation := buildResponseHeaderMutation(ctx, outcome.isSuccessful)
-	return buildResponseHeadersContinueResponse(headerMutation, ctx != nil && ctx.IsStreamingResponse), nil
+	if outcome.isSuccessful {
+		r.recordPrimarySuccess(ctx)
+	} else if r.shouldAttemptFallback(ctx) {
+		if fallbackResp := r.maybeExecuteFallback(nil, ctx); fallbackResp != nil {
+			return fallbackResp, nil
+		}
+	}
+	// Once response headers are continued to Envoy, Envoy's response_header_mode: SEND
+	// sends the headers downstream to the client, committing the response.
+	// ResponseHeadersContinued must be true to prevent subsequent body-stage
+	// processing from attempting fallback and emitting an invalid ImmediateResponse.
+	if ctx != nil {
+		ctx.ResponseHeadersContinued = true
+		r.recordBenchmarkInferenceCall(ctx, outcome.isSuccessful)
+	}
+
+	headerMutation := buildResponseHeaderMutation(ctx)
+	headerMutation = mergeHeaderMutations(headerMutation, r.runResponseExtensions(ctx, outcome.statusCode))
+	headerMutation = mergeHeaderMutations(headerMutation, buildResponseStreamingMutation(ctx, outcome))
+	// Response headers are sent before the body is decoded. A same-format Chat
+	// provider may require canonical re-encoding after its decorations are
+	// dropped, so do not commit the provider's original byte count.
+	if outcome.isSuccessful && ctx != nil && !ctx.IsStreamingResponse &&
+		ctx.SourceFormat == llmprotocol.OpenAIChatV1 && ctx.TargetFormat == llmprotocol.OpenAIChatV1 {
+		headerMutation = mergeHeaderMutations(headerMutation,
+			&ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}})
+	}
+	response = buildResponseHeadersContinueResponse(headerMutation, outcome.bodyStreamed)
+	holdStreamForResponseGuard(ctx, response)
+	return response, nil
+}
+
+// removeProviderRouterHeaders removes the Router's namespace from a
+// provider's response on every path, skipped requests included, before the
+// Router's own headers are set.
+func removeProviderRouterHeaders(response *ext_proc.ProcessingResponse, v *ext_proc.ProcessingRequest_ResponseHeaders) {
+	common := response.GetResponseHeaders().GetResponse()
+	if common == nil || v == nil {
+		return
+	}
+	if names := providerRouterHeaders(v.ResponseHeaders.GetHeaders()); len(names) > 0 {
+		common.HeaderMutation = mergeHeaderMutations(&ext_proc.HeaderMutation{RemoveHeaders: names}, common.HeaderMutation)
+	}
 }

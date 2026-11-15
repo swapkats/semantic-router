@@ -3,13 +3,14 @@ package auth
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 )
 
 func bootstrapCanRegisterHandler(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -24,7 +25,8 @@ func bootstrapCanRegisterHandler(svc *Service) http.HandlerFunc {
 
 		canRegister, err := svc.CanBootstrap(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("failed to check bootstrap status: %v", err)
+			http.Error(w, "failed to check bootstrap status", http.StatusInternalServerError)
 			return
 		}
 
@@ -68,7 +70,8 @@ func bootstrapRegisterHandler(svc *Service) http.HandlerFunc {
 		// correctness gate for concurrent requests.
 		canBootstrap, err := svc.CanBootstrap(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("failed to check bootstrap status: %v", err)
+			http.Error(w, "failed to check bootstrap status", http.StatusInternalServerError)
 			return
 		}
 		if !canBootstrap {
@@ -78,7 +81,7 @@ func bootstrapRegisterHandler(svc *Service) http.HandlerFunc {
 
 		hash, err := hashBootstrapPassword(svc, req.Password)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writePasswordHashError(w, err)
 			return
 		}
 
@@ -90,23 +93,26 @@ func bootstrapRegisterHandler(svc *Service) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			log.Printf("bootstrap registration failed: %v", err)
+			http.Error(w, "bootstrap registration failed", http.StatusInternalServerError)
 			return
 		}
 
 		token, err := svc.issueTokenForContext(r.Context(), user)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("failed to issue session token: %v", err)
+			http.Error(w, "failed to create session", http.StatusInternalServerError)
 			return
 		}
 
 		perms, err := svc.store.GetEffectivePermissions(r.Context(), user.Role, user.ID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("failed to load permissions: %v", err)
+			http.Error(w, "failed to create session", http.StatusInternalServerError)
 			return
 		}
 
-		setAuthSessionCookie(w, r, token, svc.ttlDuration)
+		setSessionCookies(w, r, svc, token)
 		writeAudit(r, svc, "user.bootstrap", "/api/auth/bootstrap/register", "")
 		respondJSON(w, LoginResponse{Token: token, User: cloneSessionUser(user, perms)})
 	}
@@ -127,24 +133,30 @@ func loginHandler(svc *Service) http.HandlerFunc {
 
 		token, user, err := svc.Login(r.Context(), strings.TrimSpace(req.Email), req.Password)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
+			if errors.Is(err, ErrInvalidCredentials) || errors.Is(err, ErrUserNotActive) {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			log.Printf("login store error: %v", err)
+			http.Error(w, "authentication failed", http.StatusUnauthorized)
 			return
 		}
 
 		perms, err := svc.store.GetEffectivePermissions(r.Context(), user.Role, user.ID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("failed to load permissions: %v", err)
+			http.Error(w, "failed to create session", http.StatusInternalServerError)
 			return
 		}
 
-		setAuthSessionCookie(w, r, token, svc.ttlDuration)
+		setSessionCookies(w, r, svc, token)
 		respondJSON(w, LoginResponse{Token: token, User: cloneSessionUser(user, perms)})
 	}
 }
 
 func meHandler(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}

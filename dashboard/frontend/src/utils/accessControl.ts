@@ -4,42 +4,126 @@ export interface PermissionUser {
 }
 
 const WRITE_CAPABLE_ROLES = new Set(['admin', 'write'])
+const READ_CAPABLE_ROLES = new Set(['admin', 'write', 'read'])
+const CONFIG_READ_PERMISSION = 'config.read'
+const CONFIG_DEPLOY_PERMISSION = 'config.deploy'
 const CONFIG_WRITE_PERMISSION = 'config.write'
-const ML_PIPELINE_MANAGE_PERMISSION = 'mlpipeline.manage'
+const EVALUATION_READ_PERMISSION = 'evaluation.read'
+const EVALUATION_RUN_PERMISSION = 'evaluation.run'
+const EVALUATION_WRITE_PERMISSION = 'evaluation.write'
+const FEEDBACK_SUBMIT_PERMISSION = 'feedback.submit'
+const LOGS_READ_PERMISSION = 'logs.read'
+const MCP_READ_PERMISSION = 'mcp.read'
+const MCP_MANAGE_PERMISSION = 'mcp.manage'
+const REPLAY_READ_PERMISSION = 'replay.read'
+const TOPOLOGY_READ_PERMISSION = 'topology.read'
+const USERS_VIEW_PERMISSION = 'users.view'
+const USERS_MANAGE_PERMISSION = 'users.manage'
 
 function hasPermission(user: PermissionUser | null | undefined, permission: string): boolean {
-  if (!user) {
-    return false
-  }
-
-  if (Array.isArray(user.permissions) && user.permissions.length > 0) {
-    return user.permissions.includes(permission)
-  }
-
-  return false
+  return Array.isArray(user?.permissions) && user.permissions.includes(permission)
 }
 
-function hasWriteCapableRole(user: PermissionUser | null | undefined): boolean {
-  if (!user) {
-    return false
+function canAccessWithPermission(
+  user: PermissionUser | null | undefined,
+  permission: string,
+  fallbackRoles: ReadonlySet<string> = WRITE_CAPABLE_ROLES,
+): boolean {
+  if (Array.isArray(user?.permissions)) {
+    return hasPermission(user, permission)
   }
 
+  if (!user) return false
   const normalizedRole = typeof user.role === 'string' ? user.role.trim().toLowerCase() : ''
-  return WRITE_CAPABLE_ROLES.has(normalizedRole)
+  return fallbackRoles.has(normalizedRole)
 }
 
 export function canAccessReplayFlowDetails(user?: PermissionUser | null): boolean {
-  if (hasPermission(user, CONFIG_WRITE_PERMISSION)) {
-    return true
-  }
-
-  return hasWriteCapableRole(user)
+  // replay.read grants structural record access. The dashboard backend only leaves
+  // request/response bodies and tool payloads unredacted for config writers.
+  return canAccessWithPermission(user, CONFIG_WRITE_PERMISSION)
 }
 
-export function canAccessMLSetup(user?: PermissionUser | null): boolean {
-  if (hasPermission(user, ML_PIPELINE_MANAGE_PERMISSION)) {
-    return true
+export function canWriteConfig(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, CONFIG_WRITE_PERMISSION)
+}
+
+export function canDeployConfig(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, CONFIG_DEPLOY_PERMISSION)
+}
+
+export function canWriteEvaluation(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, EVALUATION_WRITE_PERMISSION)
+}
+
+export function canRunEvaluation(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, EVALUATION_RUN_PERMISSION)
+}
+
+export function canSubmitFeedback(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, FEEDBACK_SUBMIT_PERMISSION, READ_CAPABLE_ROLES)
+}
+
+export function canManageMCP(user?: PermissionUser | null): boolean {
+  return canAccessWithPermission(user, MCP_MANAGE_PERMISSION)
+}
+
+export function canAccessDashboardPath(
+  user: PermissionUser | null | undefined,
+  pathname: string,
+): boolean {
+  const normalizedPath = pathname.trim().toLowerCase()
+
+  if (normalizedPath.startsWith('/users')) return canViewUsers(user)
+  if (normalizedPath.startsWith('/topology')) {
+    return canAccessWithPermission(user, TOPOLOGY_READ_PERMISSION, READ_CAPABLE_ROLES)
+  }
+  if (normalizedPath.startsWith('/status')) {
+    return canAccessWithPermission(user, TOPOLOGY_READ_PERMISSION, READ_CAPABLE_ROLES)
+  }
+  if (
+    normalizedPath.startsWith('/logs') ||
+    normalizedPath.startsWith('/monitoring') ||
+    normalizedPath.startsWith('/tracing')
+  ) {
+    return canAccessWithPermission(user, LOGS_READ_PERMISSION)
+  }
+  if (normalizedPath.startsWith('/insights')) {
+    return canAccessWithPermission(user, REPLAY_READ_PERMISSION, READ_CAPABLE_ROLES)
+  }
+  if (normalizedPath.startsWith('/evaluation')) {
+    return canAccessWithPermission(user, EVALUATION_READ_PERMISSION, READ_CAPABLE_ROLES)
+  }
+  if (normalizedPath.startsWith('/config/mcp')) {
+    return canAccessWithPermission(user, MCP_READ_PERMISSION, READ_CAPABLE_ROLES)
+  }
+  if (
+    normalizedPath === '/api/router/docs' ||
+    normalizedPath.startsWith('/builder') ||
+    normalizedPath.startsWith('/models') ||
+    normalizedPath.startsWith('/decision-model') ||
+    normalizedPath.startsWith('/config')
+  ) {
+    return canAccessWithPermission(user, CONFIG_READ_PERMISSION, READ_CAPABLE_ROLES)
   }
 
-  return hasWriteCapableRole(user)
+  return true
+}
+
+export function canViewUsers(user?: PermissionUser | null): boolean {
+  if (Array.isArray(user?.permissions)) {
+    return (
+      hasPermission(user, USERS_VIEW_PERMISSION) || hasPermission(user, USERS_MANAGE_PERMISSION)
+    )
+  }
+
+  return user?.role?.trim().toLowerCase() === 'admin'
+}
+
+export function canManageUsers(user?: PermissionUser | null): boolean {
+  if (Array.isArray(user?.permissions)) {
+    return hasPermission(user, USERS_MANAGE_PERMISSION)
+  }
+
+  return user?.role?.trim().toLowerCase() === 'admin'
 }

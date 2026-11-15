@@ -1,45 +1,40 @@
 config:
-  version: v0.3
+  version: v0.5
   listeners: []
   providers:
     defaults:
-      default_model: base-model
-      reasoning_families:
-        deepseek:
-          type: chat_template_kwargs
-          parameter: thinking
-        qwen3:
-          type: chat_template_kwargs
-          parameter: enable_thinking
-        gpt-oss:
-          type: reasoning_effort
-          parameter: reasoning_effort
-        gpt:
-          type: reasoning_effort
-          parameter: reasoning_effort
-      default_reasoning_effort: high
+      model: base-model
+      reasoning_effort: high
     models:
       - name: base-model
-        reasoning_family: qwen3
+        reasoning:
+          family: qwen3
         backend_refs:
           - name: local-vllm
+            provider: vllm
             endpoint: vllm-llama3-8b-instruct.default.svc.cluster.local:8000
             weight: 1
-  routing:
-    modelCards:
-      - name: base-model
-    signals: {}
+  recipes:
+    - name: default
+      signals: {}
+      decisions:
+        - name: bootstrap-default
+          description: Valid startup route replaced by the dynamic CRD profile.
+          priority: 1
+          rules:
+            operator: AND
+            conditions: []
+          modelRefs:
+            - model: base-model
+              use_reasoning: false
   global:
-    model_catalog:
-      kbs: []
+    model_catalog: {}
     router:
       config_source: kubernetes
     services:
       api:
         batch_classification:
           max_batch_size: 100
-          concurrency_threshold: 5
-          max_concurrency: 8
           metrics:
             enabled: true
             detailed_goroutine_tracking: true
@@ -69,25 +64,11 @@ config:
               - 100
               - 200
     stores:
-      semantic_cache:
-        enabled: true
+      response_cache:
         backend_type: memory
-        similarity_threshold: 0.8
         max_entries: 1000
         ttl_seconds: 3600
         eviction_policy: fifo
-        embedding_model: mmbert
-      memory:
-        embedding_model: mmbert
-      vector_store:
-        embedding_model: mmbert
-    integrations:
-      tools:
-        enabled: true
-        top_k: 3
-        similarity_threshold: 0.2
-        tools_db_path: config/tools_db.json
-        fallback_to_empty: true
 resources:
   limits:
     memory: 10Gi

@@ -63,7 +63,10 @@ func TestRouterLearningAdaptationOnlyCanSwitchWhenProtectionDisabled(t *testing.
 		AllScores:     map[string]float64{"cheap": 1},
 	}
 
-	_, result, selected, applied := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	_, result, selected, applied, learningErr := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
 
 	if !applied || selected == nil || selected.Model != "frontier" || result.SelectedModel != "frontier" {
 		t.Fatalf("expected adaptation-only switch to frontier, result=%#v selected=%#v applied=%v", result, selected, applied)
@@ -78,6 +81,61 @@ func TestRouterLearningAdaptationOnlyCanSwitchWhenProtectionDisabled(t *testing.
 	sampling, ok := policy.ToMap()["sampling"].(map[string]interface{})
 	if !ok || sampling["used"] != true || sampling["seed"] != int64(424242) {
 		t.Fatalf("expected protection-disabled adaptation to sample, got %#v", policy.ToMap())
+	}
+}
+
+func TestRouterLearningAdaptationGivesUnobservedCandidateColdStartExposure(t *testing.T) {
+	originalSeedSource := routerLearningSamplingSeedSource
+	routerLearningSamplingSeedSource = func() int64 { return 7 }
+	t.Cleanup(func() { routerLearningSamplingSeedSource = originalSeedSource })
+
+	router := &OpenAIRouter{Config: routerLearningAdaptationTestConfig()}
+	router.routerLearningRuntimeState().recordModelExperience(
+		"adaptive",
+		2,
+		"cheap",
+		routerLearningOutcomeGoodFit,
+		1,
+	)
+	ctx := &RequestContext{
+		VSRSelectedDecision: &config.Decision{Name: "adaptive", Tier: 2},
+	}
+	selCtx := &selection.SelectionContext{
+		DecisionName: "adaptive",
+		CandidateModels: []config.ModelRef{
+			{Model: "cheap"},
+			{Model: "frontier"},
+		},
+	}
+	baseResult := &selection.SelectionResult{
+		SelectedModel: "cheap",
+		Score:         1,
+		Method:        selection.MethodStatic,
+		AllScores:     map[string]float64{"cheap": 1},
+	}
+
+	_, result, selected, applied, learningErr := router.applyRouterLearning(
+		selCtx,
+		baseResult,
+		&selCtx.CandidateModels[0],
+		ctx,
+	)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
+
+	if !applied || selected == nil || selected.Model != "frontier" ||
+		result.SelectedModel != "frontier" {
+		t.Fatalf(
+			"expected unobserved frontier cold-start exposure, result=%#v selected=%#v applied=%v",
+			result,
+			selected,
+			applied,
+		)
+	}
+	policy, ok := ctx.VSRLearningPolicies.Policy(routerLearningMethodAdaptation)
+	if !ok || policy.Reason != "cold_start" {
+		t.Fatalf("expected cold_start adaptation reason, got %#v", ctx.VSRLearningPolicies)
 	}
 }
 
@@ -116,7 +174,10 @@ func TestRouterLearningUnknownAdaptationStrategyKeepsBaseModel(t *testing.T) {
 		AllScores:     map[string]float64{"cheap": 1},
 	}
 
-	_, result, selected, applied := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	_, result, selected, applied, learningErr := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
 
 	if applied || selected == nil || selected.Model != "cheap" || result.SelectedModel != "cheap" {
 		t.Fatalf("expected unknown strategy to keep base model, result=%#v selected=%#v applied=%v", result, selected, applied)
@@ -130,7 +191,7 @@ func TestRouterLearningUnknownAdaptationStrategyKeepsBaseModel(t *testing.T) {
 	}
 }
 
-func TestRouterLearningProtectionOnlyCanGuardWhenAdaptationDisabled(t *testing.T) {
+func TestRouterLearningProtectionOnlyCannotEscapeDecisionCandidates(t *testing.T) {
 	sessiontelemetry.ResetRouterSessionMemoryForTesting()
 	t.Cleanup(sessiontelemetry.ResetRouterSessionMemoryForTesting)
 
@@ -148,21 +209,23 @@ func TestRouterLearningProtectionOnlyCanGuardWhenAdaptationDisabled(t *testing.T
 	ctx.VSRSelectedDecision = &config.Decision{Name: "simple-followup"}
 	ctx.VSRConversationFacts = classification.ConversationFacts{LastMessageToolResult: true}
 
-	selected, _ := router.selectModelFromCandidates(&selection.SelectionContext{
+	selected, _, err := router.selectModelFromCandidates(&selection.SelectionContext{
 		SessionID:       "session-a",
 		DecisionName:    "simple-followup",
 		CandidateModels: []config.ModelRef{{Model: "cheap"}},
 	}, nil, ctx)
 
-	if selected == nil || selected.Model != "frontier" {
-		t.Fatalf("expected protection-only guard to keep frontier, got %#v", selected)
+	// Decision drift releases the tool-loop lock, so protection-only routing
+	// stays inside the drifted decision's own candidate set. Adaptation stays
+	// disabled, and the release must be attributed to the protection policy.
+	if err != nil || selected == nil || selected.Model != "cheap" {
+		t.Fatalf("protection-only routing left the drifted decision candidates: selected=%+v err=%v", selected, err)
 	}
 	if _, ok := ctx.VSRLearningPolicies.Policy(routerLearningMethodAdaptation); ok {
 		t.Fatalf("expected no adaptation policy when adaptation is disabled, got %#v", ctx.VSRLearningPolicies)
 	}
-	policy, ok := ctx.VSRLearningPolicies.Policy(routerLearningMethodProtection)
-	if !ok || policy.Action != routerLearningActionHoldCurrent {
-		t.Fatalf("expected protection hold_current policy, got %#v", ctx.VSRLearningPolicies)
+	if _, ok := ctx.VSRLearningPolicies.Policy(routerLearningMethodProtection); !ok {
+		t.Fatalf("expected the candidate-boundary release under the protection policy: %#v", ctx.VSRLearningPolicies)
 	}
 }
 
@@ -208,7 +271,10 @@ func TestRouterLearningProtectionObserveDoesNotSuppressAdaptationSampling(t *tes
 		AllScores:     map[string]float64{"cheap": 1},
 	}
 
-	_, result, selected, applied := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	_, result, selected, applied, learningErr := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
 
 	if !applied || selected == nil || selected.Model != "frontier" || result.SelectedModel != "frontier" {
 		t.Fatalf("expected adaptation to switch while protection observes, result=%#v selected=%#v applied=%v", result, selected, applied)
@@ -266,7 +332,10 @@ func TestRouterLearningProtectionBypassDoesNotSuppressAdaptationSampling(t *test
 		AllScores:     map[string]float64{"cheap": 1},
 	}
 
-	_, result, selected, applied := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	_, result, selected, applied, learningErr := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
 
 	if !applied || selected == nil || selected.Model != "frontier" || result.SelectedModel != "frontier" {
 		t.Fatalf("expected adaptation to switch while protection is bypassed, result=%#v selected=%#v applied=%v", result, selected, applied)
@@ -315,7 +384,10 @@ func TestRouterLearningProtectionMissingIdentityDoesNotSuppressAdaptationSamplin
 		AllScores:     map[string]float64{"cheap": 1},
 	}
 
-	_, result, selected, applied := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	_, result, selected, applied, learningErr := router.applyRouterLearning(selCtx, baseResult, &selCtx.CandidateModels[0], ctx)
+	if learningErr != nil {
+		t.Fatal(learningErr)
+	}
 
 	if !applied || selected == nil || selected.Model != "frontier" || result.SelectedModel != "frontier" {
 		t.Fatalf("expected adaptation to switch when protection identity is missing, result=%#v selected=%#v applied=%v", result, selected, applied)

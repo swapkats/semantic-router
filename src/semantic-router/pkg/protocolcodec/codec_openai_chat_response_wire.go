@@ -1,0 +1,361 @@
+package protocolcodec
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+)
+
+type chatResponseWire struct {
+	ID      string `json:"id"`
+	Object  string `json:"object,omitempty"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	// OpenRouter names the upstream that served the request. It is metadata,
+	// not part of the model's answer.
+	Provider          *string              `json:"provider,omitempty"`
+	Choices           []chatChoiceWire     `json:"choices"`
+	Usage             *chatUsageWire       `json:"usage,omitempty"`
+	Metadata          map[string]string    `json:"metadata,omitempty"`
+	Moderation        json.RawMessage      `json:"moderation,omitempty"`
+	Error             *chatErrorWire       `json:"error,omitempty"`
+	ServiceTier       *chatServiceTierWire `json:"service_tier,omitempty"`
+	SystemFingerprint *string              `json:"system_fingerprint,omitempty"`
+	PromptTokenIDs    []int64              `json:"prompt_token_ids,omitempty"`
+	// vLLM's serving metadata: prompt logprobs and text, routed experts, the
+	// KV and encoder-cache transfer handshakes and per-request metrics. Each
+	// is opaque and not model output, whatever its value; a same-format reply
+	// forwards it unchanged.
+	PromptLogprobs      json.RawMessage `json:"prompt_logprobs,omitempty"`
+	PromptText          json.RawMessage `json:"prompt_text,omitempty"`
+	PromptRoutedExperts json.RawMessage `json:"prompt_routed_experts,omitempty"`
+	KVTransferParams    json.RawMessage `json:"kv_transfer_params,omitempty"`
+	ECTransferParams    json.RawMessage `json:"ec_transfer_params,omitempty"`
+	Metrics             json.RawMessage `json:"metrics,omitempty"`
+	DoRemoteDecode      *bool           `json:"do_remote_decode,omitempty"`
+	DoRemotePrefill     *bool           `json:"do_remote_prefill,omitempty"`
+	RemoteBlockIDs      []int64         `json:"remote_block_ids,omitempty"`
+	RemoteEngineID      *string         `json:"remote_engine_id,omitempty"`
+	RemoteHost          *string         `json:"remote_host,omitempty"`
+	RemotePort          *int64          `json:"remote_port,omitempty"`
+	// Groq attaches its request id here; it is provider metadata, not output.
+	XGroq json.RawMessage `json:"x_groq,omitempty"`
+	// Groq reports per-model usage for compound requests and null otherwise.
+	UsageBreakdown json.RawMessage `json:"usage_breakdown,omitempty"`
+	// Cerebras reports serving timing metadata on every response. It is
+	// provider timing metadata, not output content.
+	TimeInfo json.RawMessage `json:"time_info,omitempty"`
+	// Perplexity Sonar responses carry model source citations and search
+	// results at the top level. Neither has a neutral slot here, so both are
+	// dropped with a diagnostic instead of failing the strict decode.
+	Citations     json.RawMessage `json:"citations,omitempty"`
+	SearchResults json.RawMessage `json:"search_results,omitempty"`
+}
+
+// hasTimeInfo reports Cerebras's top-level serving timing metadata.
+func (wire chatResponseWire) hasTimeInfo() bool {
+	return len(wire.TimeInfo) > 0 && !bytes.Equal(bytes.TrimSpace(wire.TimeInfo), []byte("null"))
+}
+
+// hasUsageBreakdown reports Groq's per-model usage, which has no neutral slot.
+func (wire chatResponseWire) hasUsageBreakdown() bool {
+	return jsonFieldPresent(wire.UsageBreakdown)
+}
+
+// jsonFieldPresent reports a raw JSON field that carries a value rather than
+// being absent or null.
+func jsonFieldPresent(raw json.RawMessage) bool {
+	return len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// hasCitations reports Perplexity's top-level source citations.
+func (wire chatResponseWire) hasCitations() bool {
+	return jsonFieldPresent(wire.Citations)
+}
+
+// hasSearchResults reports Perplexity's top-level search results.
+func (wire chatResponseWire) hasSearchResults() bool {
+	return jsonFieldPresent(wire.SearchResults)
+}
+
+const vllmServingMetadataReason = "vLLM serving metadata is not model output; a same-format replay forwards it unchanged"
+
+// vllmMetadataPresent reports a serving metadata member that carries a value.
+// Absent, null and empty members are the defaults vLLM and vLLM-Omni send.
+func vllmMetadataPresent(raw json.RawMessage) bool {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", "{}", "[]":
+		return false
+	}
+	return true
+}
+
+// vllmServingMetadata reports which vLLM serving metadata members carry a
+// value, for the dropped-field diagnostics.
+func (wire chatResponseWire) vllmServingMetadata() map[string]bool {
+	fields := map[string]bool{
+		"prompt_logprobs":       vllmMetadataPresent(wire.PromptLogprobs),
+		"prompt_text":           vllmMetadataPresent(wire.PromptText),
+		"prompt_routed_experts": vllmMetadataPresent(wire.PromptRoutedExperts),
+		"kv_transfer_params":    vllmMetadataPresent(wire.KVTransferParams),
+		"ec_transfer_params":    vllmMetadataPresent(wire.ECTransferParams),
+		"metrics":               vllmMetadataPresent(wire.Metrics),
+	}
+	for _, choice := range wire.Choices {
+		fields["choices.routed_experts"] = fields["choices.routed_experts"] || vllmMetadataPresent(choice.RoutedExperts)
+		fields["choices.weight_versions"] = fields["choices.weight_versions"] || vllmMetadataPresent(choice.WeightVersions)
+	}
+	return fields
+}
+
+// hasLegacyKVTransferMetadata recognizes the flat KV-transfer response
+// metadata emitted by older vLLM-compatible servers. Newer servers place the
+// handshake under kv_transfer_params, but both shapes remain in deployed
+// provider fleets. The fields stay typed so strict decoding remains intact.
+func (wire chatResponseWire) hasLegacyKVTransferMetadata() bool {
+	return wire.DoRemoteDecode != nil || wire.DoRemotePrefill != nil || wire.RemoteBlockIDs != nil ||
+		wire.RemoteEngineID != nil || wire.RemoteHost != nil || wire.RemotePort != nil
+}
+
+type chatChoiceWire struct {
+	Index              int               `json:"index"`
+	Message            chatMessageWire   `json:"message"`
+	FinishReason       *string           `json:"finish_reason"`
+	NativeFinishReason *string           `json:"native_finish_reason,omitempty"`
+	Logprobs           *chatLogprobsWire `json:"logprobs,omitempty"`
+	// LiteLLM wraps upstream fields that do not fit the OpenAI schema in
+	// provider_specific_fields on each choice. The content is opaque provider
+	// metadata and is not replayed to the client.
+	ProviderSpecificFields json.RawMessage     `json:"provider_specific_fields,omitempty"`
+	StopReason             *chatStopReasonWire `json:"stop_reason,omitempty"`
+	TokenIDs               []int64             `json:"token_ids,omitempty"`
+	// vLLM's per-token expert routing and the weight versions that sampled
+	// the output: opaque serving metadata, like the top-level members above.
+	RoutedExperts  json.RawMessage `json:"routed_experts,omitempty"`
+	WeightVersions json.RawMessage `json:"weight_versions,omitempty"`
+}
+
+type chatServiceTierWire string
+
+func (tier *chatServiceTierWire) UnmarshalJSON(raw []byte) error {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	switch value {
+	// on_demand and performance are Groq's tiers on its OpenAI-compatible API.
+	case "auto", "default", "flex", "priority", "scale", "on_demand", "performance":
+		*tier = chatServiceTierWire(value)
+		return nil
+	default:
+		return fmt.Errorf("unsupported chat service tier")
+	}
+}
+
+type chatStopReasonWire struct {
+	Text    *string
+	Integer *int64
+}
+
+func (reason *chatStopReasonWire) UnmarshalJSON(raw []byte) error {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if len(text) == 0 {
+			return fmt.Errorf("chat stop reason string is invalid")
+		}
+		reason.Text = &text
+		return nil
+	}
+	var integer int64
+	if err := json.Unmarshal(raw, &integer); err == nil {
+		reason.Integer = &integer
+		return nil
+	}
+	return fmt.Errorf("chat stop reason must be a string or integer")
+}
+
+// Chat logprobs are private model-execution evidence. The neutral response
+// codec recognizes their closed wire shape so strict provider decoding does
+// not reject a valid response; Looper's confidence evaluator consumes the
+// evidence separately from publishable response content and accounting.
+type chatLogprobsWire struct {
+	Content []chatTokenLogprobWire `json:"content"`
+	Refusal []chatTokenLogprobWire `json:"refusal,omitempty"`
+}
+
+type chatTokenLogprobWire struct {
+	Token       string                    `json:"token"`
+	Logprob     float64                   `json:"logprob"`
+	Bytes       []int64                   `json:"bytes,omitempty"`
+	TopLogprobs []chatTopTokenLogprobWire `json:"top_logprobs"`
+}
+
+type chatTopTokenLogprobWire struct {
+	Token   string  `json:"token"`
+	Logprob float64 `json:"logprob"`
+	Bytes   []int64 `json:"bytes,omitempty"`
+}
+
+// Mistral puts the served tier inside usage, separately from OpenAI's
+// top-level service_tier. Keep this provider extension typed and closed.
+type chatUsageServiceTierWire string
+
+func (tier *chatUsageServiceTierWire) UnmarshalJSON(raw []byte) error {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	switch value {
+	case "standard", "priority":
+		*tier = chatUsageServiceTierWire(value)
+		return nil
+	default:
+		return fmt.Errorf("unsupported chat usage service tier")
+	}
+}
+
+type chatUsageWire struct {
+	ServiceTier             *chatUsageServiceTierWire        `json:"service_tier,omitempty"`
+	PromptTokens            int64                            `json:"prompt_tokens"`
+	CompletionTokens        int64                            `json:"completion_tokens"`
+	TotalTokens             int64                            `json:"total_tokens"`
+	ComputeUnits            json.RawMessage                  `json:"compute_units,omitempty"`
+	PromptTokensDetails     *chatPromptTokensDetailsWire     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *chatCompletionTokensDetailsWire `json:"completion_tokens_details,omitempty"`
+	// Provider accounting extensions: xAI reports its own billing and search
+	// usage, Groq reports queue and generation timings in seconds.
+	CostInUSDTicks *int64   `json:"cost_in_usd_ticks,omitempty"`
+	NumSourcesUsed *int64   `json:"num_sources_used,omitempty"`
+	QueueTime      *float64 `json:"queue_time,omitempty"`
+	PromptTime     *float64 `json:"prompt_time,omitempty"`
+	CompletionTime *float64 `json:"completion_time,omitempty"`
+	TotalTime      *float64 `json:"total_time,omitempty"`
+	// OpenRouter reports its own pricing and server-tool accounting beside
+	// canonical token usage. Keep these fields typed at the provider boundary.
+	Cost          *float64                         `json:"cost,omitempty"`
+	IsBYOK        *bool                            `json:"is_byok,omitempty"`
+	CostDetails   *chatOpenRouterCostDetailsWire   `json:"cost_details,omitempty"`
+	ServerToolUse *chatOpenRouterServerToolUseWire `json:"server_tool_use,omitempty"`
+	// DeepSeek caching extensions report cache hits and misses directly on the
+	// usage object.
+	PromptCacheHitTokens  *int64 `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int64 `json:"prompt_cache_miss_tokens,omitempty"`
+}
+
+type chatOpenRouterCostDetailsWire struct {
+	UpstreamInferenceCost            *float64 `json:"upstream_inference_cost,omitempty"`
+	UpstreamInferencePromptCost      *float64 `json:"upstream_inference_prompt_cost,omitempty"`
+	UpstreamInferenceCompletionsCost *float64 `json:"upstream_inference_completions_cost,omitempty"`
+	ServerToolCost                   *float64 `json:"server_tool_cost,omitempty"`
+}
+
+type chatOpenRouterServerToolUseWire struct {
+	WebSearchRequests *int64 `json:"web_search_requests,omitempty"`
+}
+
+type chatPromptTokensDetailsWire struct {
+	CachedTokens        *int64           `json:"cached_tokens,omitempty"`
+	CacheWriteTokens    *int64           `json:"cache_write_tokens,omitempty"`
+	CreatedCacheTokens  *int64           `json:"created_cache_tokens,omitempty"`
+	CacheCreationTokens *int64           `json:"cache_creation_tokens,omitempty"`
+	MultimodalTokens    map[string]int64 `json:"multimodal_tokens,omitempty"`
+	AudioTokens         int64            `json:"audio_tokens,omitempty"`
+	TextTokens          int64            `json:"text_tokens,omitempty"`
+	ImageTokens         int64            `json:"image_tokens,omitempty"`
+	VideoTokens         *int64           `json:"video_tokens,omitempty"`
+}
+
+type chatCompletionTokensDetailsWire struct {
+	AcceptedPredictionTokens int64  `json:"accepted_prediction_tokens,omitempty"`
+	AudioTokens              int64  `json:"audio_tokens,omitempty"`
+	ReasoningTokens          int64  `json:"reasoning_tokens"`
+	TextTokens               int64  `json:"text_tokens,omitempty"`
+	ImageTokens              *int64 `json:"image_tokens,omitempty"`
+	RejectedPredictionTokens int64  `json:"rejected_prediction_tokens,omitempty"`
+}
+
+type chatErrorWire struct {
+	Message string          `json:"message"`
+	Type    string          `json:"type,omitempty"`
+	Param   string          `json:"param,omitempty"`
+	Code    openAIErrorCode `json:"code,omitempty"`
+}
+
+func validateChatExecutionMetadata(systemFingerprint *string) error {
+	if systemFingerprint != nil && (len(*systemFingerprint) == 0 || len(*systemFingerprint) > 256) {
+		return llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"invalid_upstream_execution_metadata",
+			"upstream Chat system fingerprint is invalid",
+			nil,
+		)
+	}
+	return nil
+}
+
+func validateChatChoiceExtensions(choice chatChoiceWire) error {
+	return validateChatOutputExtensions(choice.Message.Audio, choice.Message.LegacyFunctionCall)
+}
+
+func validateChatChunkChoiceExtensions(choice chatChunkChoiceWire) error {
+	// Neutral stream events intentionally have no token-logprob evidence slot.
+	// Reject non-null evidence instead of silently dropping it during the
+	// provider-to-public stream rewrite.
+	if choice.Logprobs != nil {
+		return llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"unsupported_upstream_stream_logprobs",
+			"upstream streamed Chat log probabilities are unsupported",
+			nil,
+		)
+	}
+	return validateChatOutputExtensions(choice.Delta.Audio, choice.Delta.LegacyFunctionCall)
+}
+
+// validateChatChunkModality admits vLLM-Omni's text chunks only. An audio or
+// other media chunk carries encoded media in delta.content, which must not be
+// read as answer text.
+func validateChatChunkModality(modality *string) error {
+	if modality == nil || *modality == "text" {
+		return nil
+	}
+	if *modality == "audio" {
+		return llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"unsupported_upstream_audio",
+			"upstream Chat output audio is unsupported",
+			nil,
+		)
+	}
+	return llmprotocol.NewError(
+		llmprotocol.ErrorUpstreamUnavailable,
+		"unsupported_upstream_modality",
+		"upstream Chat output modality is unsupported",
+		nil,
+	)
+}
+
+func validateChatOutputExtensions(
+	audio *chatAudioOutputWire,
+	legacyFunctionCall *chatLegacyCallWire,
+) error {
+	if audio != nil {
+		return llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"unsupported_upstream_audio",
+			"upstream Chat output audio is unsupported",
+			nil,
+		)
+	}
+	if legacyFunctionCall != nil {
+		return llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"unsupported_upstream_function_call",
+			"upstream legacy Chat function calls are unsupported",
+			nil,
+		)
+	}
+	return nil
+}

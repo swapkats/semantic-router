@@ -1,0 +1,492 @@
+package protocolcodec
+
+import (
+	"bytes"
+	"encoding/json"
+	"reflect"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+)
+
+type anthropicResponseWire struct {
+	ID                string              `json:"id"`
+	Type              string              `json:"type"`
+	Role              string              `json:"role"`
+	Model             string              `json:"model"`
+	Content           json.RawMessage     `json:"content"`
+	StopReason        *string             `json:"stop_reason"`
+	StopSequence      *string             `json:"stop_sequence"`
+	Usage             *anthropicUsageWire `json:"usage"`
+	Error             *anthropicErrorWire `json:"error,omitempty"`
+	Container         json.RawMessage     `json:"container"`
+	StopDetails       json.RawMessage     `json:"stop_details"`
+	Diagnostics       json.RawMessage     `json:"diagnostics,omitempty"`
+	ContextManagement json.RawMessage     `json:"context_management,omitempty"`
+}
+
+type anthropicUsageWire struct {
+	InputTokens              int64                            `json:"input_tokens"`
+	OutputTokens             int64                            `json:"output_tokens"`
+	CacheCreationInputTokens int64                            `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64                            `json:"cache_read_input_tokens"`
+	CacheCreation            *anthropicCacheCreationUsageWire `json:"cache_creation"`
+	InferenceGeo             string                           `json:"inference_geo"`
+	OutputTokensDetails      anthropicOutputUsageDetailsWire  `json:"output_tokens_details"`
+	ServerToolUse            anthropicServerToolUsageWire     `json:"server_tool_use"`
+	ServiceTier              string                           `json:"service_tier"`
+	Speed                    string                           `json:"speed,omitempty"`
+	Iterations               []json.RawMessage                `json:"iterations,omitempty"`
+}
+
+type anthropicCacheCreationUsageWire struct {
+	Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens,omitempty"`
+	Ephemeral5mInputTokens *int64 `json:"ephemeral_5m_input_tokens,omitempty"`
+}
+
+type anthropicOutputUsageDetailsWire struct {
+	ThinkingTokens int64 `json:"thinking_tokens"`
+}
+
+type anthropicServerToolUsageWire struct {
+	WebFetchRequests  int64 `json:"web_fetch_requests"`
+	WebSearchRequests int64 `json:"web_search_requests"`
+}
+
+type anthropicErrorWire struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type anthropicTransportErrorWire struct {
+	Type      string              `json:"type"`
+	Error     *anthropicErrorWire `json:"error"`
+	RequestID string              `json:"request_id,omitempty"`
+}
+
+func (AnthropicMessagesCodec) DecodeResponse(body []byte, policy llmprotocol.Policy) (llmprotocol.Response, llmprotocol.Envelope, llmprotocol.Diagnostics, error) {
+	var wire anthropicResponseWire
+	_, unknownFields, err := decodeProviderWireTolerant(body, &wire, policy)
+	if err != nil {
+		return llmprotocol.Response{}, llmprotocol.Envelope{}, nil, err
+	}
+	if err := validateAnthropicResponseResource(wire); err != nil {
+		return llmprotocol.Response{}, llmprotocol.Envelope{}, nil, err
+	}
+	unknownFields = append(unknownFields, anthropicContentUnknownFields(wire.Content, policy)...)
+	var diagnostics llmprotocol.Diagnostics
+	appendUnknownFieldDiagnostics(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, unknownFields)
+	stopSequenceDiagnostics, err := anthropicStopSequenceDiagnostics(body, "", policy)
+	if err != nil {
+		return llmprotocol.Response{}, llmprotocol.Envelope{}, nil, err
+	}
+	diagnostics = appendDiagnostics(diagnostics, stopSequenceDiagnostics, policy.Limits.Diagnostics)
+	diagnostics = appendDiagnostics(diagnostics, anthropicResponseMetadataDiagnostics(wire, policy), policy.Limits.Diagnostics)
+	response, err := decodeAnthropicResponseResource(wire, policy)
+	if err != nil {
+		return llmprotocol.Response{}, llmprotocol.Envelope{}, nil, err
+	}
+	appendAnthropicResponseUsage(&response, wire.Usage, policy, &diagnostics)
+	return response, responseEnvelope(llmprotocol.AnthropicMessagesV1, body, response.Generation, response.SourceStopReason, policy), diagnostics, nil
+}
+
+// anthropicContentUnknownFields reports the members of reply content blocks
+// that their wire contract does not declare. The blocks are raw values decoded
+// one by one, so the resource-level strip cannot see inside them.
+func anthropicContentUnknownFields(raw json.RawMessage, policy llmprotocol.Policy) []string {
+	if !dropUnknownUpstreamFields(policy) || !jsonFieldPresent(raw) {
+		return nil
+	}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil
+	}
+	dropped := make(map[string]struct{})
+	for _, block := range blocks {
+		_, fields := stripUnknownUpstreamFields(block, reflect.TypeOf(anthropicContentWire{}))
+		addUnknownFieldPaths(dropped, "content[]", fields)
+	}
+	return sortedUnknownFieldPaths(dropped)
+}
+
+func anthropicResponseMetadataDiagnostics(wire anthropicResponseWire, policy llmprotocol.Policy) llmprotocol.Diagnostics {
+	var diagnostics llmprotocol.Diagnostics
+	if len(wire.Container) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Container), []byte("null")) {
+		appendProviderFieldOmission(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, "container", "container execution metadata is not model output")
+	}
+	if len(wire.StopDetails) > 0 && !bytes.Equal(bytes.TrimSpace(wire.StopDetails), []byte("null")) {
+		appendProviderFieldOmission(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, "stop_details", "structured refusal detail has no neutral representation")
+	}
+	if len(wire.Diagnostics) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Diagnostics), []byte("null")) {
+		appendProviderFieldOmission(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, "diagnostics", "prompt-cache miss diagnostics have no neutral representation")
+	}
+	if len(wire.ContextManagement) > 0 && !bytes.Equal(bytes.TrimSpace(wire.ContextManagement), []byte("null")) {
+		appendProviderFieldOmission(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, "context_management", "applied context edits have no protocol-neutral representation")
+	}
+	return diagnostics
+}
+
+func decodeAnthropicResponseResource(wire anthropicResponseWire, policy llmprotocol.Policy) (llmprotocol.Response, error) {
+	response := llmprotocol.Response{Generation: 1, ID: wire.ID, Model: wire.Model, Usage: llmprotocol.Usage{State: llmprotocol.UsageUnavailable}}
+	if wire.Error != nil {
+		response.Error = &llmprotocol.ProtocolError{Category: decodeProviderErrorCategory(wire.Error.Type), Code: wire.Error.Type, Message: wire.Error.Message}
+		response.StopReason = llmprotocol.StopError
+	}
+	contents, err := decodeAnthropicResponseContent(wire.Content, policy)
+	if err != nil && wire.Error == nil {
+		return llmprotocol.Response{}, err
+	}
+	if len(contents) > 0 {
+		response.Output = []llmprotocol.OutputItem{{ID: llmprotocol.StableID("anthropic-response", wire.ID), Role: llmprotocol.RoleAssistant, Content: contents}}
+	}
+	if wire.StopReason != nil && response.Error == nil {
+		response.SourceStopReason = *wire.StopReason
+		response.StopReason = decodeAnthropicStop(*wire.StopReason)
+		if response.StopReason == llmprotocol.StopSequence && wire.StopSequence != nil {
+			response.MatchedStopSequence = *wire.StopSequence
+		}
+	}
+	return response, nil
+}
+
+func appendAnthropicResponseUsage(
+	response *llmprotocol.Response,
+	usage *anthropicUsageWire,
+	policy llmprotocol.Policy,
+	diagnostics *llmprotocol.Diagnostics,
+) {
+	if usage == nil {
+		return
+	}
+	response.Usage = decodeAnthropicUsage(*usage, policy, diagnostics)
+	appendProviderFieldOmissions(diagnostics, policy, llmprotocol.AnthropicMessagesV1, map[string]bool{
+		"usage.inference_geo": usage.InferenceGeo != "",
+		"usage.server_tool_use": usage.ServerToolUse.WebFetchRequests != 0 ||
+			usage.ServerToolUse.WebSearchRequests != 0,
+		"usage.service_tier": usage.ServiceTier != "",
+		"usage.speed":        usage.Speed != "",
+		"usage.iterations":   len(usage.Iterations) > 0,
+	}, anthropicUsageMetadataReason)
+}
+
+const anthropicUsageMetadataReason = "provider usage metadata has no neutral accounting bucket"
+
+func decodeAnthropicUsage(wire anthropicUsageWire, policy llmprotocol.Policy, diagnostics *llmprotocol.Diagnostics) llmprotocol.Usage {
+	cacheWrite := wire.CacheCreationInputTokens
+	cacheWrite5m, cacheWrite1h, derivedAggregate := decodeAnthropicCacheCreationTiers(wire.CacheCreation, cacheWrite, policy, diagnostics)
+	if derivedAggregate != nil {
+		cacheWrite = *derivedAggregate
+	}
+	inputTotal := wire.InputTokens + wire.CacheReadInputTokens + cacheWrite
+	reasoning := int64(0)
+	reasoning = wire.OutputTokensDetails.ThinkingTokens
+	other := wire.OutputTokens - reasoning
+	if other < 0 {
+		other = 0
+	}
+	return llmprotocol.Usage{
+		State:             llmprotocol.UsageAvailable,
+		InputUncached:     authoritative(wire.InputTokens),
+		InputCacheRead:    authoritative(wire.CacheReadInputTokens),
+		InputCacheWrite:   authoritative(cacheWrite),
+		InputCacheWrite5m: cacheWrite5m,
+		InputCacheWrite1h: cacheWrite1h,
+		OutputReasoning:   authoritative(reasoning),
+		OutputOther:       authoritative(other),
+		InputTotal:        authoritative(inputTotal),
+		OutputTotal:       authoritative(wire.OutputTokens),
+		Total:             llmprotocol.TokenCount{Value: llmprotocol.Int64(inputTotal + wire.OutputTokens), Provenance: llmprotocol.UsageDerived},
+	}
+}
+
+func (AnthropicMessagesCodec) EncodeResponse(response llmprotocol.Response, envelope llmprotocol.Envelope, policy llmprotocol.Policy) ([]byte, llmprotocol.Diagnostics, error) {
+	if err := rejectReasoningContinuity(llmprotocol.AnthropicMessagesV1, llmprotocol.RequiredResponseCapabilities(response)); err != nil {
+		return nil, nil, err
+	}
+	if response.Error != nil {
+		var diagnostics llmprotocol.Diagnostics
+		if response.Usage.State == llmprotocol.UsageAvailable {
+			appendAccountingOmission(&diagnostics, policy, envelope.Format, llmprotocol.AnthropicMessagesV1, "usage", "Messages error envelopes cannot carry token usage")
+		}
+		return encodeAnthropicError(response.Error, response.ProviderRequestID), diagnostics, nil
+	}
+	if envelope.CanReplay(llmprotocol.AnthropicMessagesV1, response.Generation, policy, true) {
+		return append([]byte(nil), envelope.Response...), nil, nil
+	}
+	var diagnostics llmprotocol.Diagnostics
+	if usageUnavailable(response.Usage) {
+		// The Messages wire requires usage fields, so the encoder emits an
+		// explicit zero-valued usage object. A backend that omitted usage is
+		// an accounting omission, not a lossy translation: rejecting the
+		// response here would turn a successful completion into a 502 for
+		// every non-streaming Anthropic request against such backends. The
+		// streaming encoder already tolerates unavailable usage the same way.
+		appendAccountingOmission(
+			&diagnostics, policy, envelope.Format, llmprotocol.AnthropicMessagesV1,
+			"usage", "backend response omitted usage; emitted an explicit zero-valued usage object",
+		)
+	}
+	appendAnthropicPartialCacheOmission(&diagnostics, policy, envelope.Format, response.Usage)
+	appendAnthropicPartialOutputOmission(&diagnostics, policy, envelope.Format, response.Usage)
+	appendAnthropicTierSplitOmission(&diagnostics, policy, envelope.Format, response.Usage)
+	if len(response.Alternatives) > 0 {
+		if err := appendLossy(&diagnostics, policy, envelope.Format, llmprotocol.AnthropicMessagesV1, "response.alternatives", "Messages has one output sequence"); err != nil {
+			return nil, diagnostics, err
+		}
+	}
+	contents := make([]llmprotocol.Content, 0)
+	for _, item := range response.Output {
+		contents = append(contents, item.Content...)
+	}
+	if truncated := llmprotocol.TruncatedToolCall(response, policy.Limits.JSONDepth); truncated != nil {
+		// tool_use.input is an object, so a call the output limit cut carries
+		// the members the model completed before the cut.
+		call := *truncated
+		call.Arguments, _ = llmprotocol.TruncatedJSONObject(truncated.Arguments, policy.Limits.JSONDepth)
+		contents[len(contents)-1].ToolCall = &call
+		diagnostics = appendDiagnostics(diagnostics, llmprotocol.Diagnostics{{
+			Source: envelope.Format, Target: llmprotocol.AnthropicMessagesV1,
+			Field: "content.tool_use.input", Action: llmprotocol.DiagnosticApproximated,
+			Reason: "a tool call cut by the output limit carries the members completed before the cut",
+		}}, policy.Limits.Diagnostics)
+	}
+	contentDiagnostics, err := anthropicContentDiagnostics(contents, envelope.Format, policy)
+	diagnostics = appendDiagnostics(diagnostics, contentDiagnostics, policy.Limits.Diagnostics)
+	if err != nil {
+		return nil, diagnostics, err
+	}
+	content, err := encodeAnthropicContent(contents)
+	if err != nil {
+		return nil, diagnostics, err
+	}
+	stop := encodeAnthropicStop(response.StopReason, responsesOutputHasToolCall(response.Output))
+	wire := anthropicResponseWire{ID: response.ID, Type: "message", Role: "assistant", Model: response.Model, Content: content, StopReason: &stop, Usage: encodeAnthropicUsage(response.Usage)}
+	if response.StopReason == llmprotocol.StopSequence {
+		wire.StopSequence = &response.MatchedStopSequence
+	}
+	body, err := marshalWire(wire)
+	return body, diagnostics, err
+}
+
+func encodeAnthropicUsage(usage llmprotocol.Usage) *anthropicUsageWire {
+	wire := newAnthropicUsageWire()
+	if usageUnavailable(usage) {
+		return wire
+	}
+	inputTokens := tokenValue(usage.InputUncached)
+	if usage.InputUncached.Value == nil {
+		// Messages input_tokens excludes cache buckets, unlike OpenAI's
+		// inclusive input total. Do not count known cache usage twice when an
+		// optional bucket is unknown and the uncached portion is unavailable.
+		inputTokens = max(0, tokenValue(usage.InputTotal)-tokenValue(usage.InputCacheRead)-tokenValue(usage.InputCacheWrite))
+	}
+	cacheWrite := tokenValue(usage.InputCacheWrite)
+	var creation anthropicCacheCreationUsageWire
+	has5m := usage.InputCacheWrite5m.Value != nil
+	has1h := usage.InputCacheWrite1h.Value != nil
+	if has5m || has1h {
+		if has5m {
+			v5m := *usage.InputCacheWrite5m.Value
+			creation.Ephemeral5mInputTokens = &v5m
+		}
+		if has1h {
+			v1h := *usage.InputCacheWrite1h.Value
+			creation.Ephemeral1hInputTokens = &v1h
+		}
+	} else if cacheWrite > 0 {
+		ephemeral5m := cacheWrite
+		ephemeral1h := int64(0)
+		creation.Ephemeral5mInputTokens = &ephemeral5m
+		creation.Ephemeral1hInputTokens = &ephemeral1h
+	} else {
+		ephemeral5m := int64(0)
+		ephemeral1h := int64(0)
+		creation.Ephemeral5mInputTokens = &ephemeral5m
+		creation.Ephemeral1hInputTokens = &ephemeral1h
+	}
+	*wire = anthropicUsageWire{
+		InputTokens:              inputTokens,
+		OutputTokens:             tokenValue(usage.OutputTotal),
+		CacheCreationInputTokens: cacheWrite,
+		CacheReadInputTokens:     tokenValue(usage.InputCacheRead),
+		CacheCreation:            &creation,
+		InferenceGeo:             "global",
+		OutputTokensDetails:      anthropicOutputUsageDetailsWire{ThinkingTokens: tokenValue(usage.OutputReasoning)},
+		ServerToolUse:            anthropicServerToolUsageWire{},
+		ServiceTier:              "standard",
+	}
+	return wire
+}
+
+func newAnthropicUsageWire() *anthropicUsageWire {
+	ephemeral1h := int64(0)
+	ephemeral5m := int64(0)
+	return &anthropicUsageWire{
+		CacheCreation: &anthropicCacheCreationUsageWire{
+			Ephemeral1hInputTokens: &ephemeral1h,
+			Ephemeral5mInputTokens: &ephemeral5m,
+		},
+		InferenceGeo: "global",
+		ServiceTier:  "standard",
+	}
+}
+
+func usageUnavailable(usage llmprotocol.Usage) bool {
+	return usage.State == llmprotocol.UsageUnavailable ||
+		usage.InputTotal.Value == nil && usage.OutputTotal.Value == nil
+}
+
+func decodeAnthropicStop(reason string) llmprotocol.StopReason {
+	switch reason {
+	case "end_turn":
+		return llmprotocol.StopEndTurn
+	case "max_tokens":
+		return llmprotocol.StopMaxTokens
+	case "stop_sequence":
+		return llmprotocol.StopSequence
+	case "tool_use":
+		return llmprotocol.StopToolCall
+	case "refusal":
+		return llmprotocol.StopContentFilter
+	case "pause_turn":
+		return llmprotocol.StopPaused
+	case "model_context_window_exceeded":
+		return llmprotocol.StopContextWindow
+	default:
+		return llmprotocol.StopUnknown
+	}
+}
+
+// A Messages turn that carries tool_use blocks stops with tool_use, which is
+// what Messages clients run calls on. A Chat backend ends a forced named tool
+// call with "stop", the end of the turn.
+func encodeAnthropicStop(reason llmprotocol.StopReason, toolUse bool) string {
+	if reason == llmprotocol.StopEndTurn && toolUse {
+		return "tool_use"
+	}
+	switch reason {
+	case llmprotocol.StopMaxTokens:
+		return "max_tokens"
+	case llmprotocol.StopSequence:
+		return "stop_sequence"
+	case llmprotocol.StopToolCall:
+		return "tool_use"
+	case llmprotocol.StopContentFilter:
+		return "refusal"
+	case llmprotocol.StopPaused:
+		return "pause_turn"
+	case llmprotocol.StopContextWindow:
+		return "model_context_window_exceeded"
+	default:
+		return "end_turn"
+	}
+}
+
+func encodeAnthropicError(protocolError *llmprotocol.ProtocolError, requestID string) []byte {
+	return AnthropicMessagesCodec{}.EncodeTransportError(llmprotocol.TransportError{
+		Error: protocolError, ProviderRequestID: requestID,
+	})
+}
+
+func (AnthropicMessagesCodec) DecodeTransportError(
+	body []byte,
+	policy llmprotocol.Policy,
+) (llmprotocol.TransportError, llmprotocol.Diagnostics, error) {
+	// Snowflake declares the Anthropic Messages operation as well, and its
+	// transport failure envelope is the same flat vendor object on both paths.
+	if policy.ResponseVendor == llmprotocol.ResponseVendorSnowflake {
+		return decodeSnowflakeTransportError(body, policy, llmprotocol.AnthropicMessagesV1)
+	}
+	var wire anthropicTransportErrorWire
+	_, unknownFields, err := decodeProviderWireTolerant(body, &wire, policy)
+	if err != nil {
+		return llmprotocol.TransportError{}, nil, err
+	}
+	var diagnostics llmprotocol.Diagnostics
+	appendUnknownFieldDiagnostics(&diagnostics, policy, llmprotocol.AnthropicMessagesV1, unknownFields)
+	if wire.Type != "error" {
+		return llmprotocol.TransportError{}, nil, invalidProviderResponse(
+			"invalid_upstream_error_envelope",
+			"Anthropic transport error type must be error",
+		)
+	}
+	if wire.Error == nil {
+		return llmprotocol.TransportError{}, nil, llmprotocol.NewError(
+			llmprotocol.ErrorUpstreamUnavailable,
+			"upstream_error_required",
+			"upstream transport error body is missing error details",
+			nil,
+		)
+	}
+	if err := validateTransportErrorDetails(wire.Error.Type, wire.Error.Message); err != nil {
+		return llmprotocol.TransportError{}, nil, err
+	}
+	return llmprotocol.TransportError{
+		Error: &llmprotocol.ProtocolError{
+			Category: decodeProviderErrorCategory(wire.Error.Type),
+			Code:     wire.Error.Type, Message: wire.Error.Message,
+		},
+		ProviderRequestID: wire.RequestID,
+	}, diagnostics, nil
+}
+
+func (AnthropicMessagesCodec) EncodeTransportError(transportError llmprotocol.TransportError) []byte {
+	protocolError := transportError.Error
+	if protocolError == nil {
+		protocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "internal", "request failed", nil)
+	}
+	wire := anthropicTransportErrorWire{
+		Type: "error", RequestID: transportError.ProviderRequestID,
+		Error: &anthropicErrorWire{Type: canonicalAnthropicErrorType(protocolError), Message: protocolError.Message},
+	}
+	body, _ := json.Marshal(wire)
+	return body
+}
+
+func canonicalAnthropicErrorType(protocolError *llmprotocol.ProtocolError) string {
+	if protocolError == nil {
+		return "api_error"
+	}
+	if canonicalAnthropicErrorTypeMatchesCategory(protocolError.Code, protocolError.Category) {
+		return protocolError.Code
+	}
+	switch protocolError.Category {
+	case llmprotocol.ErrorInvalidRequest, llmprotocol.ErrorUnsupportedFeature:
+		return "invalid_request_error"
+	case llmprotocol.ErrorAuthentication:
+		return "authentication_error"
+	case llmprotocol.ErrorPermission:
+		return "permission_error"
+	case llmprotocol.ErrorNotFound:
+		return "not_found_error"
+	case llmprotocol.ErrorConflict:
+		return "conflict_error"
+	case llmprotocol.ErrorRateLimited:
+		return "rate_limit_error"
+	case llmprotocol.ErrorUpstreamTimeout:
+		return "timeout_error"
+	default:
+		return "api_error"
+	}
+}
+
+func canonicalAnthropicErrorTypeMatchesCategory(code string, category llmprotocol.ErrorCategory) bool {
+	categories := map[string][]llmprotocol.ErrorCategory{
+		"invalid_request_error": {llmprotocol.ErrorInvalidRequest, llmprotocol.ErrorUnsupportedFeature},
+		"request_too_large":     {llmprotocol.ErrorInvalidRequest, llmprotocol.ErrorUnsupportedFeature},
+		"authentication_error":  {llmprotocol.ErrorAuthentication},
+		"billing_error":         {llmprotocol.ErrorUpstreamUnavailable},
+		"permission_error":      {llmprotocol.ErrorPermission},
+		"not_found_error":       {llmprotocol.ErrorNotFound},
+		"conflict_error":        {llmprotocol.ErrorConflict},
+		"rate_limit_error":      {llmprotocol.ErrorRateLimited},
+		"timeout_error":         {llmprotocol.ErrorUpstreamTimeout},
+		"api_error":             {llmprotocol.ErrorUpstreamUnavailable, llmprotocol.ErrorInternal},
+		"overloaded_error":      {llmprotocol.ErrorUpstreamUnavailable, llmprotocol.ErrorInternal},
+	}
+	for _, allowed := range categories[code] {
+		if allowed == category {
+			return true
+		}
+	}
+	return false
+}

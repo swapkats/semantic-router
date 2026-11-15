@@ -1,19 +1,335 @@
 import type { Config } from '@docusaurus/types'
 import type * as Preset from '@docusaurus/preset-classic'
-import { themes } from 'prism-react-renderer'
+import type { PrismTheme } from 'prism-react-renderer'
 import { SITE_SOCIAL_PREVIEW_IMAGE } from './src/data/socialPreview'
+import blogSearchIndexPlugin from './src/plugins/blogSearchIndex'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 
-const lightCodeTheme = themes.github
-const darkCodeTheme = themes.vsDark
-const siteUrl = 'https://vllm-semantic-router.com'
-const siteDefaultDescription = 'Open-source LLM router for Mixture-of-Models. Route requests by cost, latency, privacy, safety, and modality across local, private, and frontier models.'
+// Code blocks are ink in both colour modes, in System Duo's syntax colours (each at least 5:1 on ink), the colours the
+// homepage's terminals use.
+const codeTheme: PrismTheme = {
+  plain: { color: '#d9dbe0', backgroundColor: '#16181d' },
+  styles: [
+    { types: ['comment', 'prolog', 'doctype', 'cdata'], style: { color: '#8b8f99' } },
+    { types: ['string', 'char', 'attr-value', 'regex', 'inserted', 'url'], style: { color: '#f3d3a8' } },
+    { types: ['property', 'attr-name', 'tag', 'selector', 'key', 'atrule'], style: { color: '#9ec1ef' } },
+    { types: ['number', 'boolean', 'constant', 'symbol'], style: { color: '#f6a37f' } },
+    { types: ['keyword', 'important', 'builtin', 'deleted'], style: { color: '#ff8c69' } },
+    { types: ['function', 'class-name'], style: { color: '#ffffff', fontWeight: '600' } },
+    { types: ['operator', 'punctuation', 'entity'], style: { color: '#b8c6dc' } },
+    { types: ['variable', 'parameter', 'environment'], style: { color: '#ffcf7a' } },
+  ],
+}
+const siteUrl = 'https://vllm-sr.ai'
+const siteDefaultDescription
+  = 'An open, programmable decision layer for models and compute.'
+const siteSocialTitle
+  = 'Intelligence Beyond Any One Model | vLLM Semantic Router'
 const siteSocialPreviewImageUrl = `${siteUrl}/${SITE_SOCIAL_PREVIEW_IMAGE}`
+
+// Docs pages that moved, as paths under /docs. Until the current docs became
+// the default version, they were served under /docs/next and the v0.4 docs
+// under /docs, so each old path redirects from both.
+const movedDocs: { from: string[], to: string }[] = [
+  {
+    from: [
+      'tutorials/signal/learned/classifier',
+      'tutorials/signal/learned/preference',
+      'tutorials/signal/learned/kb',
+      'tutorials/signal/learned/embedding',
+      'tutorials/signal/learned/embedding-design-principles',
+      'tutorials/signal/learned/decision',
+      'tutorials/signal/learned/systemone',
+      'tutorials/signal/heuristic/action',
+    ],
+    to: 'tutorials/signal/systemone',
+  },
+  {
+    from: [
+      'tutorials/signal/learned/reask',
+      'tutorials/signal/heuristic/topic-continuity',
+    ],
+    to: 'tutorials/signal/application/turn-relation',
+  },
+  // The application signals moved from signal/learned to
+  // signal/application.
+  ...[
+    'complexity',
+    'domain',
+    'fact-check',
+    'hallucination',
+    'jailbreak',
+    'modality',
+    'pii',
+    'refusal',
+    'safety',
+    'turn-relation',
+    'user-feedback',
+  ].map(signal => ({
+    from: [`tutorials/signal/learned/${signal}`],
+    to: `tutorials/signal/application/${signal}`,
+  })),
+  {
+    from: ['tutorials/signal/heuristic/modality'],
+    to: 'tutorials/signal/application/modality',
+  },
+  // Pages folded into the System One chapter and the signal pages.
+  {
+    from: ['model-runtime/guides/decisions'],
+    to: 'system-one/overview',
+  },
+  {
+    from: ['model-runtime/guides/classify'],
+    to: 'tutorials/signal/overview',
+  },
+  {
+    from: ['model-runtime/guides/pii'],
+    to: 'tutorials/signal/application/pii',
+  },
+  {
+    from: ['model-runtime/guides/hallucination'],
+    to: 'tutorials/signal/application/hallucination',
+  },
+  {
+    from: ['tutorials/global/vela-models'],
+    to: 'system-one/deploy/deployments',
+  },
+  // Removed algorithms: the migration guide lists each rewrite.
+  {
+    from: [
+      'tutorials/algorithm/looper/confidence',
+      'tutorials/algorithm/native/cascade',
+    ],
+    to: 'tutorials/algorithm/looper/escalate',
+  },
+  {
+    from: [
+      'tutorials/algorithm/selection/automix',
+      'tutorials/algorithm/selection/hybrid',
+    ],
+    to: 'tutorials/algorithm/selection/multi-factor',
+  },
+  {
+    from: [
+      'tutorials/algorithm/selection/prompt',
+      'tutorials/algorithm/selection/router-dc',
+      'tutorials/algorithm/selection/knn',
+      'tutorials/algorithm/selection/kmeans',
+      'tutorials/algorithm/selection/svm',
+      'tutorials/algorithm/selection/mlp',
+      'tutorials/algorithm/selection/decision',
+      'training/ml-model-selection',
+    ],
+    to: 'tutorials/algorithm/selection/systemone',
+  },
+  {
+    from: [
+      'training/classifier-models',
+      'training/mmbert-safety-classifier',
+      'training/multimodal-embeddings',
+      'training/model-catalog',
+    ],
+    to: 'training/training-overview',
+  },
+  {
+    from: [
+      'installation/native-backends',
+      'installation/runtime/engines-and-hardware',
+    ],
+    to: 'model-runtime/overview',
+  },
+  {
+    from: [
+      'installation/runtime/in-process',
+      'installation/runtime/models-and-bindings',
+    ],
+    to: 'model-runtime/deploy/connect-the-router',
+  },
+  {
+    from: ['installation/runtime/openvino'],
+    to: 'model-runtime/deploy/migrate',
+  },
+  {
+    from: [
+      'installation/runtime/safety',
+      'tutorials/global/safety-models-and-policy',
+      'model-runtime/guides/safety',
+    ],
+    to: 'tutorials/signal/application/safety',
+  },
+  {
+    from: [
+      'tutorials/plugin/rag',
+      'tutorials/plugin/memory',
+      'tutorials/plugin/context-compression',
+      'model-runtime/guides/rerank',
+    ],
+    to: 'tutorials/plugin/context',
+  },
+  {
+    from: ['tutorials/plugin/shadow-dispatch'],
+    to: 'tutorials/plugin/router-replay',
+  },
+  {
+    from: ['tutorials/plugin/tool-selection'],
+    to: 'tutorials/plugin/tools',
+  },
+  {
+    from: [
+      'tutorials/plugin/hallucination',
+      'tutorials/plugin/response-jailbreak',
+    ],
+    to: 'tutorials/plugin/response-guard',
+  },
+  {
+    from: ['tutorials/plugin/semantic-cache'],
+    to: 'tutorials/plugin/response-cache',
+  },
+  {
+    from: [
+      'installation/runtime/embeddings',
+      'tutorials/global/remote-embeddings',
+    ],
+    to: 'model-runtime/guides/embeddings',
+  },
+  {
+    from: ['installation/runtime/lifecycle-diagnostics'],
+    to: 'model-runtime/deploy/troubleshooting',
+  },
+  {
+    from: ['model-runtime/profiles'],
+    to: 'model-runtime/deploy/engine-args',
+  },
+  {
+    from: [
+      'tutorials/signal/heuristic/event',
+      'tutorials/signal/heuristic/structure',
+    ],
+    to: 'tutorials/signal/heuristic/keyword',
+  },
+  {
+    from: ['installation/kubernetes'],
+    to: 'installation/k8s/ai-gateway',
+  },
+  {
+    from: [
+      'cli/overview',
+      'cli/commands-reference',
+    ],
+    to: 'installation/',
+  },
+  {
+    from: ['installation/models-and-recipes'],
+    to: 'tutorials/global/models-entrypoints-serving',
+  },
+  {
+    from: ['cli/troubleshooting'],
+    to: 'troubleshooting/common-errors',
+  },
+  {
+    from: ['tutorials/signal/projections'],
+    to: 'tutorials/projection/overview',
+  },
+  {
+    from: ['overview/collective-intelligence'],
+    to: 'overview/mom-model-family',
+  },
+  {
+    from: ['troubleshooting/vsr-headers'],
+    to: 'api/headers',
+  },
+  // System One, Model Runtime and the global settings regrouped into folders.
+  // The two section overviews keep their paths with a slug.
+  {
+    from: ['tutorials/global/overview'],
+    to: 'installation/global-settings',
+  },
+  {
+    from: ['system-one/concepts'],
+    to: 'system-one/get-started/concepts',
+  },
+  {
+    from: ['system-one/api'],
+    to: 'system-one/use/api',
+  },
+  {
+    from: ['system-one/router'],
+    to: 'system-one/use/router',
+  },
+  {
+    from: ['system-one/custom-questions'],
+    to: 'system-one/use/custom-questions',
+  },
+  {
+    from: ['system-one/deployments'],
+    to: 'system-one/deploy/deployments',
+  },
+  {
+    from: ['system-one/performance'],
+    to: 'system-one/deploy/performance',
+  },
+  {
+    from: ['system-one/reference'],
+    to: 'system-one/reference/presets',
+  },
+  {
+    from: ['model-runtime/quickstart'],
+    to: 'model-runtime/get-started/quickstart',
+  },
+  {
+    from: ['model-runtime/choose-a-model'],
+    to: 'model-runtime/get-started/choose-a-model',
+  },
+  {
+    from: [
+      'model-runtime/deploy',
+      'tutorials/global/model-runtime',
+    ],
+    to: 'model-runtime/deploy/connect-the-router',
+  },
+  {
+    from: ['model-runtime/engine-args'],
+    to: 'model-runtime/deploy/engine-args',
+  },
+  {
+    from: ['installation/runtime/external'],
+    to: 'model-runtime/deploy/remote-services',
+  },
+  {
+    from: ['model-runtime/migrate'],
+    to: 'model-runtime/deploy/migrate',
+  },
+  {
+    from: ['model-runtime/troubleshooting'],
+    to: 'model-runtime/deploy/troubleshooting',
+  },
+  {
+    from: ['model-runtime/plugins'],
+    to: 'model-runtime/extend/plugins',
+  },
+  {
+    from: ['model-runtime/reference'],
+    to: 'model-runtime/reference/http-api',
+  },
+]
+
+// Pages the current docs dropped without a replacement. The v0.4 docs still
+// have them, so their old paths under /docs lead there.
+const releasedOnlyDocs = [
+  'fleet-sim/getting-started',
+  'fleet-sim/guide',
+  'fleet-sim/overview',
+  'fleet-sim/power-model',
+  'fleet-sim/related-work',
+  'fleet-sim/sim-algorithms',
+  'fleet-sim/use-cases',
+  'tutorials/algorithm/selection/gmtrouter',
+]
 
 const config: Config = {
   title: 'vLLM Semantic Router',
-  tagline: 'Open-source LLM router for Mixture-of-Models',
+  tagline: 'An open, programmable decision layer for models and compute.',
   favicon: 'img/vllm.png',
 
   // Set the production url of your site here
@@ -46,25 +362,57 @@ const config: Config = {
       onBrokenMarkdownLinks: 'warn',
     },
   },
-  themes: ['@docusaurus/theme-mermaid'],
+  themes: [
+    '@docusaurus/theme-mermaid',
+    [
+      require.resolve('@easyops-cn/docusaurus-search-local'),
+      {
+        hashed: true, // cache-bust the index between deploys
+        indexDocs: true,
+        indexBlog: true,
+        indexPages: false, // homepage/community are marketing pages, not docs
+        docsRouteBasePath: '/docs',
+        blogRouteBasePath: '/blog',
+        searchBarShortcut: true,
+        searchBarShortcutHint: true,
+        // The site ships a full zh-Hans locale, so the index needs a Chinese
+        // tokenizer as well: Chinese is written without spaces and the default
+        // English tokenizer cannot split it. "zh" pulls in @node-rs/jieba, a
+        // native module that ships prebuilt binaries.
+        language: ['en', 'zh'],
+        // v1 scope: index the default docs version only (the latest docs, from
+        // main), per the decision on #2737.
+        // To make the released versions searchable later, drop this and add
+        // searchContextByPaths: ['docs', 'docs/v0.4', 'docs/v0.3', 'docs/v0.2', 'docs/v0.1']
+        // so results stay scoped to the version the reader is on.
+        // NOTE: ignoreFiles matches the route *without* a leading slash (the
+        // plugin strips baseUrl, which is "/" here, off the front) and without
+        // the base URL itself, so the pattern must not anchor on "/".
+        ignoreFiles: [/^docs\/v\d+\.\d+\//],
+        // styling is handled in a later phase
+      },
+    ],
+  ],
 
   presets: [
     [
       'classic',
       {
         docs: {
-          beforeDefaultRemarkPlugins: [
-            [remarkMath, {}],
-          ],
-          beforeDefaultRehypePlugins: [
-            [rehypeKatex, {}],
-          ],
+          beforeDefaultRemarkPlugins: [[remarkMath, {}]],
+          beforeDefaultRehypePlugins: [[rehypeKatex, {}]],
           sidebarPath: './sidebars.ts',
           lastVersion: 'current',
           versions: {
             'current': {
-              label: 'Latest',
+              label: 'Latest (main)',
               path: '',
+              banner: 'none',
+              badge: true,
+            },
+            'v0.4': {
+              label: 'v0.4',
+              path: 'v0.4',
               badge: true,
             },
             'v0.3': {
@@ -97,7 +445,8 @@ const config: Config = {
           showReadingTime: true,
           postsPerPage: 10,
           blogTitle: 'vLLM Semantic Router Blog',
-          blogDescription: 'Latest updates, insights, and technical articles about vLLM Semantic Router',
+          blogDescription:
+            'Latest updates, insights, and technical articles about vLLM Semantic Router',
           blogSidebarTitle: 'Recent Posts',
           blogSidebarCount: 10,
           // Please change this to your repo.
@@ -119,35 +468,38 @@ const config: Config = {
   ],
 
   plugins: [
+    // Publishes every published blog post as global data so the blog list page can
+    // search the whole archive instead of just the posts on the current page.
+    blogSearchIndexPlugin,
     [
       '@docusaurus/plugin-client-redirects',
       {
         redirects: [
           {
-            from: '/docs/installation/kubernetes',
-            to: '/docs/installation/k8s/ai-gateway',
+            from: '/blog/introduce-vela',
+            to: '/blog/vela-models',
           },
           {
-            from: '/docs/cli/overview',
-            to: '/docs/installation/',
+            from: '/blog/multi-objective-mom-on-amd-developer-cloud',
+            to: '/docs/overview/mom-model-family',
           },
-          {
-            from: '/docs/cli/commands-reference',
-            to: '/docs/installation/',
-          },
-          {
-            from: '/docs/cli/troubleshooting',
-            to: '/docs/troubleshooting/common-errors',
-          },
-          {
-            from: '/docs/tutorials/signal/projections',
-            to: '/docs/tutorials/projection/overview',
-          },
-          {
-            from: '/docs/tutorials/signal/heuristic/modality',
-            to: '/docs/tutorials/signal/learned/modality',
-          },
+          ...movedDocs.map(({ from, to }) => ({
+            from: from.flatMap(path => [`/docs/${path}`, `/docs/next/${path}`]),
+            to: `/docs/${to}`,
+          })),
+          ...releasedOnlyDocs.map(path => ({
+            from: `/docs/${path}`,
+            to: `/docs/v0.4/${path}`,
+          })),
         ],
+        // Every current page was served under /docs/next until the current
+        // docs became the default version.
+        createRedirects(existingPath: string) {
+          if (existingPath.startsWith('/docs/') && !/^\/docs\/v\d+\.\d+(\/|$)/.test(existingPath)) {
+            return existingPath.replace('/docs/', '/docs/next/')
+          }
+          return undefined
+        },
       },
     ],
   ],
@@ -156,20 +508,30 @@ const config: Config = {
     image: SITE_SOCIAL_PREVIEW_IMAGE,
     metadata: [
       { name: 'description', content: siteDefaultDescription },
-      { name: 'keywords', content: 'open-source LLM router, multi-model routing, semantic router, model selection, AI gateway, vLLM, Envoy, inference routing, policy-aware routing, privacy-aware routing, safety routing' },
+      {
+        name: 'keywords',
+        content:
+          'programmable decision layer, agent harness, models and compute, Mixture-of-Models, open-source LLM router, multi-model routing, model selection, bounded model collaboration, semantic router, vLLM',
+      },
       { name: 'author', content: 'vLLM Semantic Router Team' },
       { name: 'application-name', content: 'vLLM Semantic Router' },
-      { property: 'og:title', content: 'vLLM Semantic Router | Open-Source LLM Router' },
+      { property: 'og:title', content: siteSocialTitle },
       { property: 'og:description', content: siteDefaultDescription },
       { property: 'og:type', content: 'website' },
       { property: 'og:site_name', content: 'vLLM Semantic Router' },
       { property: 'og:image', content: siteSocialPreviewImageUrl },
-      { property: 'og:image:alt', content: 'vLLM Semantic Router social preview' },
+      {
+        property: 'og:image:alt',
+        content: 'vLLM Semantic Router social preview',
+      },
       { name: 'twitter:card', content: 'summary_large_image' },
-      { name: 'twitter:title', content: 'vLLM Semantic Router | Open-Source LLM Router' },
+      { name: 'twitter:title', content: siteSocialTitle },
       { name: 'twitter:description', content: siteDefaultDescription },
       { name: 'twitter:image', content: siteSocialPreviewImageUrl },
-      { name: 'twitter:image:alt', content: 'vLLM Semantic Router social preview' },
+      {
+        name: 'twitter:image:alt',
+        content: 'vLLM Semantic Router social preview',
+      },
 
       // GEO metadata config
       { name: 'geo.region', content: 'US-CA' },
@@ -178,11 +540,11 @@ const config: Config = {
       { name: 'ICBM', content: '37.7749, -122.4194' },
     ],
     navbar: {
-      title: 'vLLM-SR',
+      // Navbar and logo follow the reader's color mode on every page.
       logo: {
         alt: 'vLLM Semantic Router Logo',
-        src: 'img/vllm.png',
-        srcDark: 'img/vllm.png',
+        src: 'img/vllm-sr-logo.light.png',
+        srcDark: 'img/vllm-sr-logo.white.png',
       },
       items: [
         {
@@ -192,113 +554,95 @@ const config: Config = {
         },
         {
           type: 'docsVersionDropdown',
+          className: 'nav-docs-only',
           position: 'right',
           dropdownActiveClassDisabled: true,
         },
         {
-          type: 'docSidebar',
-          sidebarId: 'tutorialSidebar',
-          className: 'nav-primary',
-          position: 'left',
           label: 'Docs',
-        },
-        {
-          type: 'dropdown',
+          to: '/docs/intro',
           className: 'nav-primary',
-          label: 'Research',
           position: 'left',
-          items: [
-            {
-              label: 'Paper & Talks',
-              to: '/publications',
-            },
-            {
-              label: 'White Paper',
-              to: '/white-paper',
-            },
-            {
-              label: 'Vision Paper',
-              to: '/vision-paper',
-            },
-          ],
         },
         {
+          label: 'Research',
+          to: '/publications',
+          className: 'nav-primary',
+          position: 'left',
+        },
+        {
+          label: 'Blog',
           to: '/blog',
           className: 'nav-primary',
-          label: 'Blog',
           position: 'left',
         },
-
+        {
+          label: 'Community',
+          to: '/community/team',
+          className: 'nav-primary',
+          position: 'left',
+        },
+        // Secondary destinations live in one overflow menu so the bar fits on a
+        // 1024px laptop instead of collapsing to a hamburger at 1340px.
         {
           type: 'dropdown',
-          className: 'nav-primary',
-          label: 'Community',
-          position: 'left',
+          label: 'More',
+          className: 'nav-utility',
+          position: 'right',
           items: [
             {
-              label: 'Governance',
-              to: '/community/team',
+              label: 'Model Hub',
+              to: '/models',
             },
             {
-              label: 'Working Group',
-              to: '/community/work-groups',
+              label: 'Leaderboard',
+              to: '/community/contributors',
             },
             {
-              label: 'Contributing Guide',
-              to: '/community/contributing',
+              label: 'GitHub',
+              href: 'https://github.com/vllm-project/semantic-router',
             },
             {
-              label: 'Code of Conduct',
-              to: '/community/code-of-conduct',
-            },
-
-            {
-              type: 'html',
-              value: '<hr style="margin: 0.3rem 0;">',
+              label: 'Hugging Face',
+              href: 'https://huggingface.co/vllm-sr',
             },
             {
-              label: 'GitHub Issues',
-              href: 'https://github.com/vllm-project/semantic-router/issues',
+              label: 'Discussions',
+              href: 'https://github.com/vllm-project/semantic-router/discussions',
+            },
+            // The locale dropdown above gives up its place from 997px to
+            // 1339px; shell.css shows these links only in that range.
+            {
+              type: 'custom-localeLinks',
+              className: 'nav-locale-more',
             },
           ],
         },
         {
-          to: '/community/contributors',
-          className: 'nav-primary',
-          label: 'Leaderboard',
-          position: 'left',
-        },
-        {
-          label: 'GitHub',
-          href: 'https://github.com/vllm-project/semantic-router',
-          className: 'nav-utility',
-          position: 'right',
-        },
-        {
-          label: 'Models',
-          href: 'https://huggingface.co/LLM-Semantic-Router',
-          className: 'nav-utility',
+          label: 'System Duo',
+          href: 'https://app.vllm-sr.ai/',
+          className: 'nav-dashboard-cta',
           position: 'right',
         },
       ],
     },
     footer: {
-      style: 'light',
+      style: 'dark',
       links: [
         {
           title: 'Documentation',
           items: [
             {
-              label: 'Quick Start',
+              label: 'Introduction',
               to: '/docs/intro',
             },
             {
-              label: 'Installation',
+              label: 'Quick Start',
               to: '/docs/installation',
             },
             {
               label: 'Governance',
-              to: '/community/team',
+              to: '/community/governance',
             },
             {
               label: 'Contributing',
@@ -315,7 +659,7 @@ const config: Config = {
             },
             {
               label: 'Hugging Face',
-              href: 'https://huggingface.co/LLM-Semantic-Router',
+              href: 'https://huggingface.co/vllm-sr',
             },
             {
               label: 'GitHub Discussions',
@@ -346,7 +690,6 @@ const config: Config = {
               label: 'Vision Paper',
               to: '/vision-paper',
             },
-
             {
               label: 'License',
               href: 'https://github.com/vllm-project/semantic-router/blob/main/LICENSE',
@@ -354,20 +697,53 @@ const config: Config = {
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} vLLM Semantic Router Team. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} vLLM Semantic Router Team.`,
     },
     prism: {
-      theme: lightCodeTheme,
-      darkTheme: darkCodeTheme,
+      theme: codeTheme,
+      darkTheme: codeTheme,
       additionalLanguages: ['bash', 'json', 'yaml', 'go', 'rust', 'python'],
     },
     colorMode: {
+      // Only applies when the OS states no preference.
       defaultMode: 'light',
-      disableSwitch: true,
-      respectPrefersColorScheme: false,
+      disableSwitch: false,
+      // Sets the default from the OS. Upstream also uses this flag to make the
+      // navbar button a three-way cycle; the swizzle in
+      // `src/theme/Navbar/ColorModeToggle` keeps it at two states.
+      respectPrefersColorScheme: true,
+    },
+    mermaid: {
+      theme: {
+        light: 'neutral',
+        dark: 'dark',
+      },
     },
   } satisfies Preset.ThemeConfig,
   headTags: [
+    // Inter + JetBrains Mono. Preconnect first so the font CSS and the font
+    // files resolve in parallel rather than in a serial @import waterfall.
+    {
+      tagName: 'link',
+      attributes: { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
+    },
+    {
+      tagName: 'link',
+      attributes: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: 'anonymous' },
+    },
+    {
+      tagName: 'link',
+      attributes: {
+        rel: 'stylesheet',
+        href: 'https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&family=JetBrains+Mono:wght@400;500;600&display=swap',
+      },
+    },
+    // The homepage's Cormorant faces. Not in the homepage's <Head>: it re-inserts its tags on hydration, and the faces
+    // would vanish for a few frames. The files load only where the family is used.
+    {
+      tagName: 'link',
+      attributes: { rel: 'stylesheet', href: '/fonts/cormorant.css' },
+    },
     {
       tagName: 'script',
       attributes: { type: 'application/ld+json' },
@@ -377,8 +753,8 @@ const config: Config = {
         'name': 'vLLM Semantic Router',
         'applicationCategory': 'AIInfrastructure',
         'operatingSystem': 'Cross-platform',
-        'description': 'Open-source LLM router for Mixture-of-Models',
-        'url': 'https://vllm-semantic-router.com',
+        'description': siteDefaultDescription,
+        'url': 'https://vllm-sr.ai',
         'publisher': {
           '@type': 'Organization',
           'name': 'vLLM Semantic Router Team',

@@ -1,8 +1,26 @@
 .container {
   position: relative;
   min-height: 100vh;
-  overflow: hidden;
-  background: #000;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: #050505;
+}
+
+.container::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+    radial-gradient(circle at 50% 45%, transparent 0, rgba(5, 5, 5, 0.46) 74%);
+  background-size:
+    42px 42px,
+    42px 42px,
+    auto;
 }
 
 .backgroundEffect {
@@ -17,18 +35,19 @@
   position: relative;
   z-index: 1;
   min-height: 100vh;
+  min-height: 100dvh;
   width: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 3.5rem 1.5rem;
+  padding: 2rem 1.25rem;
 }
 
 .shell {
-  width: min(1160px, 100%);
+  width: min(1040px, 100%);
   display: grid;
-  grid-template-columns: minmax(320px, 1.05fr) minmax(0, 0.95fr);
-  gap: 1.25rem;
+  grid-template-columns: minmax(320px, 1fr) minmax(360px, 0.9fr);
+  gap: 1rem;
   align-items: stretch;
 }
 
@@ -37,50 +56,43 @@
   position: relative;
   isolation: isolate;
   overflow: hidden;
-  border-radius: 1.35rem;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background:
-    linear-gradient(135deg, rgba(16, 22, 44, 0.58), rgba(9, 12, 24, 0.38) 58%, rgba(4, 8, 18, 0.62)),
-    rgba(8, 12, 24, 0.26);
-  box-shadow:
-    0 30px 72px rgba(0, 0, 0, 0.34),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(24px) saturate(140%);
-  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(15, 16, 19, 0.96);
+  box-shadow: 0 34px 100px rgba(0, 0, 0, 0.34);
 }
 
 .storyPanel::before,
 .card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background:
-    radial-gradient(circle at top left, rgba(255, 255, 255, 0.1), transparent 32%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015) 28%, transparent 72%);
-  pointer-events: none;
+  content: none;
 }
 
 .storyPanel {
-  padding: 1.55rem;
+  min-height: 540px;
+  padding: 1.6rem;
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
   gap: 1.3rem;
+  background:
+    radial-gradient(circle at 20% 80%, rgba(86, 130, 255, 0.17), transparent 37%),
+    radial-gradient(circle at 90% 5%, rgba(153, 92, 255, 0.13), transparent 31%),
+    rgba(14, 15, 18, 0.96);
 }
 
 .heroBadge {
   display: inline-flex;
   align-items: center;
   gap: 0.8rem;
-  min-height: 54px;
+  min-height: 38px;
   width: fit-content;
   max-width: 100%;
-  padding: 0.6rem 1rem;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  color: #f7f8fb;
-  font-size: 0.95rem;
+  padding: 0.45rem 0.7rem;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  background: rgba(0, 0, 0, 0.2);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 0.78rem;
   font-weight: 650;
   letter-spacing: 0.01em;
 }
@@ -99,7 +111,7 @@
 .storyEyebrow,
 .stageEyebrow {
   margin: 0;
-  color: rgba(118, 185, 0, 0.96);
+  color: rgba(255, 255, 255, 0.52);
   font-size: 0.76rem;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -109,18 +121,19 @@
 .storyTitle {
   margin: 0;
   color: #ffffff;
-  font-size: clamp(2rem, 3.4vw, 3.3rem);
-  line-height: 1.02;
-  letter-spacing: -0.04em;
-  max-width: 12ch;
+  font-size: clamp(3rem, 6vw, 5.5rem);
+  font-weight: 570;
+  line-height: 0.93;
+  letter-spacing: -0.065em;
+  max-width: none;
 }
 
 .storyDescription,
 .stageDescription {
   margin: 0;
-  color: rgba(255, 255, 255, 0.72);
-  font-size: 1rem;
-  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.88rem;
+  line-height: 1.55;
 }
 
 .progressRail {
@@ -134,24 +147,25 @@
   gap: 0.85rem;
   align-items: center;
   padding: 0.85rem 0.95rem;
-  border-radius: 1rem;
+  border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
+  background: #18181b;
 }
 
 .progressStepActive {
-  border-color: rgba(118, 185, 0, 0.22);
-  background: linear-gradient(180deg, rgba(118, 185, 0, 0.14), rgba(8, 10, 20, 0.9));
+  border-color: rgba(227, 27, 35, 0.34);
+  background: #18181b;
+  box-shadow: inset 3px 0 0 var(--brand-amd);
 }
 
 .progressStepComplete {
-  border-color: rgba(0, 212, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.2);
 }
 
 .progressIndex {
   width: 2rem;
   height: 2rem;
-  border-radius: 999px;
+  border-radius: 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -182,14 +196,35 @@
   gap: 0.85rem;
 }
 
+.storyIdentity {
+  width: fit-content;
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.78rem 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.storyIdentity span {
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.storyIdentity small {
+  color: rgba(255, 255, 255, 0.38);
+  font-size: 0.65rem;
+}
+
 .storyMetric,
 .summaryCard {
   display: grid;
   gap: 0.4rem;
   padding: 1rem;
-  border-radius: 1rem;
+  border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.05);
+  background: #18181b;
 }
 
 .metricValue,
@@ -200,7 +235,7 @@
 }
 
 .card {
-  padding: 1.55rem;
+  padding: 1.7rem;
   display: flex;
   flex-direction: column;
   gap: 1.1rem;
@@ -215,7 +250,7 @@
 .stageTitle {
   margin: 0;
   color: #ffffff;
-  font-size: clamp(1.55rem, 2.4vw, 2.25rem);
+  font-size: clamp(1.75rem, 2.4vw, 2rem);
   line-height: 1.08;
   letter-spacing: -0.03em;
 }
@@ -234,12 +269,12 @@
 
 .input {
   width: 100%;
-  min-height: 58px;
+  min-height: 50px;
   padding: 0 1rem;
   box-sizing: border-box;
-  border-radius: 1rem;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(9, 12, 22, 0.62);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #090a0c;
   color: #ffffff;
   font-size: 1rem;
 }
@@ -250,8 +285,8 @@
 
 .input:focus {
   outline: none;
-  border-color: rgba(118, 185, 0, 0.95);
-  box-shadow: 0 0 0 3px rgba(118, 185, 0, 0.14);
+  border-color: rgba(255, 255, 255, 0.42);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
 }
 
 .summaryDetail {
@@ -261,7 +296,7 @@
 
 .error {
   padding: 0.9rem 1rem;
-  border-radius: 0.95rem;
+  border-radius: 6px;
   border: 1px solid rgba(255, 107, 107, 0.26);
   background: rgba(255, 107, 107, 0.1);
   color: #ff9f9f;
@@ -277,40 +312,37 @@
 .button,
 .secondaryButton {
   flex: 1 1 0;
-  min-height: 52px;
-  border-radius: 999px;
+  min-height: 48px;
+  border-radius: 8px;
   padding: 0 1.2rem;
   font-size: 0.95rem;
   font-weight: 650;
   letter-spacing: 0.01em;
-  transition: transform 0.2s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
 }
 
 .button {
   border: 1px solid transparent;
   color: #0c0c10;
   background: #ffffff;
-  box-shadow: 0 14px 28px rgba(255, 255, 255, 0.2);
 }
 
 .button:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 16px 34px rgba(255, 255, 255, 0.28);
+  background: #e4e4e7;
 }
 
 .secondaryButton {
   border: 1px solid rgba(255, 255, 255, 0.24);
   color: #f5f5f7;
-  background: rgba(16, 18, 31, 0.56);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  background: #18181b;
 }
 
 .secondaryButton:hover:not(:disabled) {
   border-color: rgba(255, 255, 255, 0.45);
-  transform: translateY(-2px);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.15),
-    0 14px 26px rgba(5, 10, 24, 0.5);
+  background: #202024;
 }
 
 .button:disabled,

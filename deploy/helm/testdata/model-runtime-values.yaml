@@ -1,0 +1,49 @@
+# Rendering fixture: model paths identify maintained artifacts, not installed weights.
+configOverride:
+  version: v0.5
+  listeners:
+    - name: http-8899
+      address: 0.0.0.0
+      port: 8899
+  providers: {}
+  recipes:
+    - name: default
+      model_bindings:
+        domain: local-domain
+    - name: private
+      model_bindings:
+        pii: local-pii
+  global:
+    model_catalog:
+      deployments:
+        local-domain:
+          artifact: vllm-sr/Vela-1.0-Encoder-307M-Domain
+          revision: f6354f54adcf38770f635ad903be2b00577f6c11
+          provider: model_runtime
+          device: cpu
+          input:
+            max_tokens: 512
+            overflow: reject
+        local-pii:
+          artifact: vllm-sr/Vela-1.0-Encoder-307M-PII
+          revision: 6d3300c4bd7975f30a664503f6c725cf1fbbad48
+          provider: model_runtime
+          device: cpu
+          input:
+            max_tokens: 512
+            overflow: reject
+      admission:
+        local-domain:
+          max_concurrency: 2
+          max_queue: 8
+          queue_timeout_ms: 1000
+          on_overflow: shed
+        local-pii:
+          max_concurrency: 1
+          max_queue: 4
+          queue_timeout_ms: 500
+          on_overflow: shed
+  entrypoints:
+    - model_names: [vllm-sr/auto]
+      recipe: default
+      default: true

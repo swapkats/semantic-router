@@ -4,12 +4,44 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelservice"
 )
 
+// piiDetection is one span the pii preset found, with byte offsets into the
+// text it read.
+type piiDetection struct {
+	EntityType string
+	Start      int
+	End        int
+	Text       string
+	Confidence float32
+}
+
+// piiDetections are the spans of an answer whose probability meets
+// threshold, with their code-point offsets converted to bytes.
+func piiDetections(text string, spans []modelservice.Span, threshold float64) []piiDetection {
+	var detected []modelservice.Span
+	for _, span := range spans {
+		if span.Probability >= threshold {
+			detected = append(detected, span)
+		}
+	}
+	offsets := modelservice.ByteOffsets(text)
+	var detections []piiDetection
+	for _, span := range classification.CoverRepeatedSpans(text, detected) {
+		detections = append(detections, piiDetection{
+			EntityType: span.Label, Start: offsets(span.Start), End: offsets(span.End),
+			Text: span.Text, Confidence: float32(span.Probability),
+		})
+	}
+	return detections
+}
+
 // buildPIIResponse processes raw PII detections into a PIIResponse, applying all options.
-func (s *ClassificationService) buildPIIResponse(text string, detections []classification.PIIDetection, options *PIIOptions) *PIIResponse {
+func (s *ClassificationService) buildPIIResponse(text string, detections []piiDetection, options *PIIOptions) *PIIResponse {
 	detections = filterPIIDetectionsByType(detections, options)
 
 	returnPositions := options != nil && options.ReturnPositions
@@ -23,7 +55,7 @@ func (s *ClassificationService) buildPIIResponse(text string, detections []class
 
 	response := &PIIResponse{
 		HasPII:   len(detections) > 0,
-		Entities: buildPIIEntities(detections, returnPositions, maskEntities, revealEntityText, placeholders),
+		Entities: buildPIIEntities(text, detections, returnPositions, maskEntities, revealEntityText, placeholders),
 	}
 
 	if maskEntities && len(detections) > 0 {
@@ -34,7 +66,7 @@ func (s *ClassificationService) buildPIIResponse(text string, detections []class
 	return response
 }
 
-func filterPIIDetectionsByType(detections []classification.PIIDetection, options *PIIOptions) []classification.PIIDetection {
+func filterPIIDetectionsByType(detections []piiDetection, options *PIIOptions) []piiDetection {
 	if options == nil || len(options.EntityTypes) == 0 {
 		return detections
 	}
@@ -50,7 +82,7 @@ func filterPIIDetectionsByType(detections []classification.PIIDetection, options
 	return filtered
 }
 
-func buildPIIMaskPlaceholders(detections []classification.PIIDetection) map[string]string {
+func buildPIIMaskPlaceholders(detections []piiDetection) map[string]string {
 	typeCounters := make(map[string]map[string]int)
 	placeholders := make(map[string]string)
 	for _, detection := range detections {
@@ -70,8 +102,24 @@ func buildPIIMaskPlaceholders(detections []classification.PIIDetection) map[stri
 	return placeholders
 }
 
+// byteOffsetToRuneOffset converts a byte offset into text to a code-point offset.
+//
+// The classifier reports byte offsets, which is what buildMaskedPIIText needs
+// because it slices a Go string. Clients index by code point, so the API
+// converts on the way out.
+func byteOffsetToRuneOffset(text string, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 0
+	}
+	if byteOffset >= len(text) {
+		return utf8.RuneCountInString(text)
+	}
+	return utf8.RuneCountInString(text[:byteOffset])
+}
+
 func buildPIIEntities(
-	detections []classification.PIIDetection,
+	text string,
+	detections []piiDetection,
 	returnPositions bool,
 	maskEntities bool,
 	revealEntityText bool,
@@ -85,8 +133,10 @@ func buildPIIEntities(
 			Confidence: float64(detection.Confidence),
 		}
 		if returnPositions {
-			entity.StartPos = detection.Start
-			entity.EndPos = detection.End
+			startPos := byteOffsetToRuneOffset(text, detection.Start)
+			endPos := byteOffsetToRuneOffset(text, detection.End)
+			entity.StartPos = &startPos
+			entity.EndPos = &endPos
 		}
 		if maskEntities {
 			entity.MaskedValue = placeholders[detection.EntityType+"\x00"+detection.Text]
@@ -103,18 +153,68 @@ func buildPIIEntityValue(text string, revealEntityText bool) string {
 	return "[DETECTED]"
 }
 
-func buildMaskedPIIText(text string, detections []classification.PIIDetection, placeholders map[string]string) string {
-	sorted := make([]classification.PIIDetection, len(detections))
-	copy(sorted, detections)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Start > sorted[j].Start
-	})
-	maskedText := text
-	for _, detection := range sorted {
-		placeholder := placeholders[detection.EntityType+"\x00"+detection.Text]
-		if detection.Start >= 0 && detection.End <= len(maskedText) && detection.Start < detection.End {
-			maskedText = maskedText[:detection.Start] + placeholder + maskedText[detection.End:]
+// buildMaskedPIIText replaces every detected span with its placeholder.
+//
+// token_spans.v1 allows overlapping and nested spans (PERSON inside ADDRESS,
+// EMAIL inside URL), so spans are first merged into a union of disjoint byte
+// ranges and the replacements are applied from the end of the string
+// backwards. Replacing one span at a time against an already modified string
+// would let a later-starting span change the length and push an earlier,
+// overlapping span past the end or onto the wrong boundary, leaving PII in
+// the output. A merged range takes the placeholder of its longest span, so
+// single, non-overlapping detections mask exactly as before.
+func buildMaskedPIIText(text string, detections []piiDetection, placeholders map[string]string) string {
+	type span struct {
+		start, end  int
+		placeholder string
+		// sourceLen is the length of the original detection whose placeholder
+		// the merged range currently carries. The merged range grows as spans
+		// chain, so comparing against its width would let a later, longer
+		// detection lose to a union it is not part of.
+		sourceLen int
+	}
+	spans := make([]span, 0, len(detections))
+	for _, detection := range detections {
+		if detection.Start < 0 || detection.End > len(text) || detection.Start >= detection.End {
+			continue
 		}
+		spans = append(spans, span{
+			start:       detection.Start,
+			end:         detection.End,
+			placeholder: placeholders[detection.EntityType+"\x00"+detection.Text],
+			sourceLen:   detection.End - detection.Start,
+		})
+	}
+	if len(spans) == 0 {
+		return text
+	}
+	// Longest span first within the same start, so the merged range keeps the
+	// outermost placeholder when spans nest.
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		return spans[i].end > spans[j].end
+	})
+	merged := []span{spans[0]}
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start < last.end {
+			if s.sourceLen > last.sourceLen {
+				last.placeholder = s.placeholder
+				last.sourceLen = s.sourceLen
+			}
+			if s.end > last.end {
+				last.end = s.end
+			}
+			continue
+		}
+		merged = append(merged, s)
+	}
+	maskedText := text
+	for i := len(merged) - 1; i >= 0; i-- {
+		m := merged[i]
+		maskedText = maskedText[:m.start] + m.placeholder + maskedText[m.end:]
 	}
 	return maskedText
 }

@@ -1,238 +1,120 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package benchmarks
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
 	"testing"
 
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/cache"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/embedding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelruntime"
 )
 
-// BenchmarkCacheSearch_1000Entries benchmarks cache search with 1000 entries
+const cacheEmbeddingDeployment = "perf-cache-embedding"
+
+var (
+	cacheEmbeddingOnce     sync.Once
+	cacheEmbeddingErr      error
+	cacheEmbeddingOwner    *embedding.Set
+	cacheEmbeddingProvider embedding.Provider
+	// The width and layer the response cache embeds with.
+	cacheEmbeddingDimension, cacheEmbeddingLayer int
+)
+
+func cacheEmbeddingDevice() string {
+	if useGPU := os.Getenv("USE_GPU"); useGPU == "true" || useGPU == "1" {
+		return "cuda:0"
+	}
+	return "cpu"
+}
+
+// cacheEmbeddingConfig is a configuration whose semantic response cache, in
+// memory, recalls with the benchmark's embedding deployment.
+func cacheEmbeddingConfig(spec config.ResolvedModelBinding) (*config.RouterConfig, error) {
+	cfg := &config.RouterConfig{}
+	cfg.SemanticCache.InUse = true
+	cfg.GlobalPlugins = []config.DecisionPlugin{{
+		Type:          config.DecisionPluginResponseCache,
+		Configuration: config.MustStructuredPayload(map[string]any{"enabled": true}),
+	}}
+	if err := cfg.LayerPlugins(); err != nil {
+		return nil, err
+	}
+	cfg.EmbeddingDeployment = cacheEmbeddingDeployment
+	cfg.ModelDeployments = map[string]config.ModelDeployment{cacheEmbeddingDeployment: spec.Deployment}
+	return cfg, nil
+}
+
+// Prepare the shared response-cache owner used by the router and retain it
+// until TestMain cleanup, including failures after preparation.
+func initCacheEmbeddingModels(b *testing.B) embedding.Provider {
+	b.Helper()
+	cacheEmbeddingOnce.Do(func() {
+		// benchmarkDeployment stops this benchmark (b.Fatalf) inside Do, and Do
+		// still counts as done, so later benchmarks fail on this error unless
+		// setup ends.
+		cacheEmbeddingErr = errors.New("prepare Vela embedding: an earlier benchmark stopped while preparing it")
+		spec := benchmarkDeployment(b, "embedding", cacheEmbeddingDeployment, benchmarkInput)
+		cfg, err := cacheEmbeddingConfig(spec)
+		if err != nil {
+			cacheEmbeddingErr = fmt.Errorf("configure the response cache: %w", err)
+			return
+		}
+		_, cacheEmbeddingDimension, cacheEmbeddingLayer = cfg.ResponseCacheEmbedding()
+		set, err := modelruntime.PrepareOwnedResponseCacheEmbeddings(context.Background(), cfg, benchmarkRuntime)
+		if err != nil {
+			cacheEmbeddingErr = fmt.Errorf("prepare Vela embedding: %w", err)
+			return
+		}
+		provider, err := set.Default()
+		if err != nil {
+			cacheEmbeddingErr = errors.Join(err, set.Close())
+			return
+		}
+		cacheEmbeddingOwner = set
+		cacheEmbeddingProvider = provider
+		cacheEmbeddingErr = nil
+	})
+	if cacheEmbeddingErr != nil {
+		b.Fatal(cacheEmbeddingErr)
+	}
+	recordModelIdentity(b, "embedding")
+	return cacheEmbeddingProvider
+}
+
 func BenchmarkCacheSearch_1000Entries(b *testing.B) {
-	// Initialize embedding models once
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         1000,
-		ConcurrencyLevels: []int{1},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.OverallP95, "p95_ms")
-		b.ReportMetric(result.OverallP99, "p99_ms")
-		b.ReportMetric(result.Throughput, "qps")
-		b.ReportMetric(result.CacheHitRate*100, "hit_rate_%")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 1000, workers: 1, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheSearch_10000Entries benchmarks cache search with 10,000 entries
 func BenchmarkCacheSearch_10000Entries(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         10000,
-		ConcurrencyLevels: []int{1},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.OverallP95, "p95_ms")
-		b.ReportMetric(result.OverallP99, "p99_ms")
-		b.ReportMetric(result.Throughput, "qps")
-		b.ReportMetric(result.CacheHitRate*100, "hit_rate_%")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 10000, workers: 1, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheSearch_HNSW benchmarks HNSW index search
 func BenchmarkCacheSearch_HNSW(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         5000,
-		ConcurrencyLevels: []int{1},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.SearchP95, "search_p95_ms")
-		b.ReportMetric(result.EmbeddingP95, "embedding_p95_ms")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 5000, workers: 1, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheSearch_Linear benchmarks linear search (no HNSW)
 func BenchmarkCacheSearch_Linear(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         1000, // Smaller for linear search
-		ConcurrencyLevels: []int{1},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           false,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.SearchP95, "search_p95_ms")
-		b.ReportMetric(result.EmbeddingP95, "embedding_p95_ms")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 1000, workers: 1, hnsw: false, repeatPercent: 70})
 }
 
-// BenchmarkCacheConcurrency_1 benchmarks cache with concurrency level 1
 func BenchmarkCacheConcurrency_1(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         5000,
-		ConcurrencyLevels: []int{1},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.Throughput, "qps")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 5000, workers: 1, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheConcurrency_10 benchmarks cache with concurrency level 10
 func BenchmarkCacheConcurrency_10(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         5000,
-		ConcurrencyLevels: []int{10},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.Throughput, "qps")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 5000, workers: 10, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheConcurrency_50 benchmarks cache with concurrency level 50
 func BenchmarkCacheConcurrency_50(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	config := cache.BenchmarkConfig{
-		CacheSize:         5000,
-		ConcurrencyLevels: []int{50},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.7,
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.Throughput, "qps")
-		b.ReportMetric(result.CacheHitRate*100, "hit_rate_%")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 5000, workers: 50, hnsw: true, repeatPercent: 70})
 }
 
-// BenchmarkCacheHitRate benchmarks cache hit rate effectiveness
 func BenchmarkCacheHitRate(b *testing.B) {
-	if err := cache.InitEmbeddingModels(); err != nil {
-		b.Fatalf("Failed to initialize embedding models: %v", err)
-	}
-
-	// High hit ratio scenario
-	config := cache.BenchmarkConfig{
-		CacheSize:         5000,
-		ConcurrencyLevels: []int{10},
-		RequestsPerLevel:  b.N,
-		SimilarityThresh:  0.85,
-		UseHNSW:           true,
-		EmbeddingModel:    "qwen3",
-		HitRatio:          0.9, // 90% expected hit rate
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	results := cache.RunStandaloneBenchmark(context.Background(), config)
-
-	if len(results) > 0 {
-		result := results[0]
-		b.ReportMetric(result.CacheHitRate*100, "hit_rate_%")
-		b.ReportMetric(result.OverallP95, "p95_ms")
-	}
+	runCacheLookupBenchmark(b, cacheScenario{entries: 5000, workers: 10, hnsw: true, repeatPercent: 90})
 }

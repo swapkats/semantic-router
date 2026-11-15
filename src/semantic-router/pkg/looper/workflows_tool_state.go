@@ -5,11 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/shared"
+	"github.com/tidwall/gjson"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 const (
@@ -43,6 +48,9 @@ type workflowAgentToolTurn struct {
 type workflowPendingToolState struct {
 	ID                          string                             `json:"id"`
 	CreatedAt                   time.Time                          `json:"created_at"`
+	RecipeName                  string                             `json:"recipe_name,omitempty"`
+	ClaimToken                  string                             `json:"claim_token,omitempty"`
+	ClaimedAt                   time.Time                          `json:"claimed_at,omitempty"`
 	DecisionName                string                             `json:"decision_name,omitempty"`
 	Mode                        string                             `json:"mode,omitempty"`
 	Template                    string                             `json:"template,omitempty"`
@@ -70,6 +78,31 @@ type workflowPendingToolState struct {
 	ToolCallIDs                 []string                           `json:"tool_call_ids,omitempty"`
 	ToolTrajectory              []workflowAgentToolTurn            `json:"tool_trajectory,omitempty"`
 	Streaming                   bool                               `json:"streaming"`
+}
+
+// UnmarshalJSON decodes a stored state. The SDK decodes every response_format
+// as its text variant and drops a json_schema payload (#3024), so each stored
+// request takes its schema back from the stored JSON.
+func (s *workflowPendingToolState) UnmarshalJSON(data []byte) error {
+	type storedState workflowPendingToolState
+	if err := json.Unmarshal(data, (*storedState)(s)); err != nil {
+		return err
+	}
+	for _, stored := range []struct {
+		key string
+		req *openai.ChatCompletionNewParams
+	}{{"original_request", s.OriginalRequest}, {"step_request", s.StepRequest}, {"agent_request", s.AgentRequest}} {
+		format := gjson.GetBytes(data, stored.key+".response_format")
+		if stored.req == nil || format.Get("type").String() != "json_schema" {
+			continue
+		}
+		var schema shared.ResponseFormatJSONSchemaParam
+		if err := json.Unmarshal([]byte(format.Raw), &schema); err != nil {
+			return err
+		}
+		stored.req.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{OfJSONSchema: &schema}
+	}
+	return nil
 }
 
 func workflowToolPhase(state *workflowPendingToolState) string {
@@ -116,6 +149,14 @@ func parseWorkflowToolStateID(toolCallID string) (string, bool) {
 		return "", false
 	}
 	return rest[:idx], true
+}
+
+// IsWorkflowToolCallID reports whether a tool call ID carries Router Flow
+// continuation state. It intentionally exposes only the protocol shape, not
+// the embedded state identifier.
+func IsWorkflowToolCallID(toolCallID string) bool {
+	_, ok := parseWorkflowToolStateID(toolCallID)
+	return ok
 }
 
 func requestHasTools(req *openai.ChatCompletionNewParams) bool {
@@ -325,7 +366,8 @@ func normalizeWorkflowToolCallFinishReason(completion map[string]interface{}) {
 		return
 	}
 	if toolCalls, ok := message["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
-		choice["finish_reason"] = "tool_calls"
+		reason, _ := choice["finish_reason"].(string)
+		choice["finish_reason"] = toolCallFinishReason(reason)
 	}
 }
 
@@ -485,6 +527,8 @@ func appendWorkflowRawMessages(req *openai.ChatCompletionNewParams, rawMessages 
 	if err := json.Unmarshal(data, &appended); err != nil {
 		return nil, fmt.Errorf("parse request with workflow tool messages: %w", err)
 	}
+	// Decoding drops a json_schema payload from response_format (#3024).
+	appended.ResponseFormat = req.ResponseFormat
 	return &appended, nil
 }
 
@@ -500,21 +544,23 @@ func (l *WorkflowsLooper) formatWorkflowToolCallInterrupt(
 	ctx context.Context,
 	interrupt *workflowToolCallInterrupt,
 	cfg workflowsExecutionConfig,
-) (*Response, error) {
+	claim *workflowStateClaim,
+) (*Response, bool, error) {
 	if interrupt == nil || interrupt.resp == nil || interrupt.state == nil {
-		return nil, fmt.Errorf("workflow tool-call interrupt is incomplete")
+		return nil, false, fmt.Errorf("workflow tool-call interrupt is incomplete")
 	}
 	state := interrupt.state
 	patchedRaw, toolCallIDs, err := patchWorkflowToolCallResponse(interrupt.resp.Raw, state)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	state.AssistantRaw = patchedRaw
 	state.ToolCallIDs = append([]string(nil), toolCallIDs...)
 	state.CreatedAt = time.Now().UTC()
-	if _, err := l.toolStates.Put(ctx, state); err != nil {
-		return nil, err
+	if strings.TrimSpace(state.RecipeName) == "" {
+		return nil, false, fmt.Errorf("workflow tool state missing recipe namespace")
 	}
+	ensureWorkflowToolStateID(state)
 
 	patchedResp := *interrupt.resp
 	patchedResp.Raw = patchedRaw
@@ -536,10 +582,40 @@ func (l *WorkflowsLooper) formatWorkflowToolCallInterrupt(
 	extraProgress := workflowPendingProgressResponses(state, &patchedResp)
 	usage := workflowProgressUsage(state.PlannerResp, traceResults, extraProgress...)
 	modelsUsed := workflowProgressModels(cfg, state.PlannerResp, traceResults, extraProgress...)
+	var out *Response
 	if state.Streaming {
-		return formatWorkflowStreamingResponse(&patchedResp, modelsUsed, state.Iteration, trace, usage, cfg)
+		out, err = formatWorkflowStreamingResponse(&patchedResp, modelsUsed, state.Iteration, trace, usage, cfg)
+	} else {
+		out, err = formatWorkflowJSONResponse(&patchedResp, modelsUsed, state.Iteration, trace, usage, cfg)
 	}
-	return formatWorkflowJSONResponse(&patchedResp, modelsUsed, state.Iteration, trace, usage, cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	replacedHeld, persistErr := l.persistWorkflowToolState(ctx, state, claim)
+	if persistErr != nil {
+		return nil, false, persistErr
+	}
+	return out, replacedHeld, nil
+}
+
+func (l *WorkflowsLooper) persistWorkflowToolState(
+	ctx context.Context,
+	state *workflowPendingToolState,
+	claim *workflowStateClaim,
+) (bool, error) {
+	if l == nil || l.toolStates == nil {
+		return false, fmt.Errorf("workflow tool state store missing")
+	}
+	if claim != nil && state != nil && state.ID == claim.ID {
+		if err := l.toolStates.Replace(ctx, claim.Recipe, claim.ID, claim.Token, state); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if _, err := l.toolStates.Put(ctx, state); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func workflowPendingTraceStep(state *workflowPendingToolState) workflowPlanStep {
@@ -623,37 +699,45 @@ func (l *WorkflowsLooper) resumeWorkflowToolCall(
 	cfg workflowsExecutionConfig,
 	workerModels []string,
 	stateID string,
-) (*Response, error) {
-	state, err := l.takeWorkflowToolState(ctx, stateID)
+) (out *Response, err error) {
+	claim, err := l.claimWorkflowToolState(ctx, req.RecipeName, stateID)
 	if err != nil {
 		return nil, err
 	}
-	restoreState := true
-	defer l.restoreWorkflowToolState(ctx, state, &restoreState)
+	restoreClaim := true
+	defer func() {
+		err = errors.Join(err, l.releaseWorkflowToolState(claim, &restoreClaim))
+	}()
 
-	out, consumed, err := l.resumeWorkflowToolCallWithState(ctx, req, cfg, workerModels, state)
+	holdCtx, stopHold := l.watchWorkflowStateClaim(ctx, claim)
+	defer stopHold()
+
+	out, consumed, replacedHeld, err := l.resumeWorkflowToolCallWithState(holdCtx, req, cfg, workerModels, claim)
 	if err != nil {
 		return nil, err
 	}
-	restoreState = !consumed
-	return out, nil
+	if consumed {
+		restoreClaim = false
+		if !replacedHeld {
+			err = l.commitWorkflowToolState(claim)
+		}
+	}
+	return out, err
 }
 
-func (l *WorkflowsLooper) takeWorkflowToolState(ctx context.Context, stateID string) (*workflowPendingToolState, error) {
-	state, ok, err := l.toolStates.Take(ctx, stateID)
+func (l *WorkflowsLooper) claimWorkflowToolState(
+	ctx context.Context,
+	recipe config.RecipeName,
+	stateID string,
+) (*workflowStateClaim, error) {
+	claim, ok, err := l.toolStates.Claim(ctx, recipe, stateID)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
+	if !ok || claim == nil {
 		return nil, fmt.Errorf("workflow tool state %q not found or expired", stateID)
 	}
-	return state, nil
-}
-
-func (l *WorkflowsLooper) restoreWorkflowToolState(ctx context.Context, state *workflowPendingToolState, restore *bool) {
-	if *restore {
-		_, _ = l.toolStates.Put(ctx, state)
-	}
+	return claim, nil
 }
 
 func (l *WorkflowsLooper) resumeWorkflowToolCallWithState(
@@ -661,50 +745,63 @@ func (l *WorkflowsLooper) resumeWorkflowToolCallWithState(
 	req *Request,
 	cfg workflowsExecutionConfig,
 	workerModels []string,
-	state *workflowPendingToolState,
-) (*Response, bool, error) {
+	claim *workflowStateClaim,
+) (*Response, bool, bool, error) {
+	if claim == nil || claim.State == nil {
+		return nil, false, false, fmt.Errorf("workflow tool state missing")
+	}
+	state := claim.State
+	clearReportedUsage(state)
+	cfg, err := resolvedWorkflowPlannerForResume(cfg, state, workerModels)
+	if err != nil {
+		return nil, false, false, err
+	}
 	state.Streaming = req.IsStreaming
 	resumeCtx := newWorkflowResumeRequestContext(req, state)
-	if validateErr := validateWorkflowResumeState(state, workerModels, cfg, req.DecisionName); validateErr != nil {
-		return nil, false, validateErr
+	if validateErr := validateWorkflowResumeState(state, workerModels, cfg, req.DecisionName, req.RecipeName); validateErr != nil {
+		return nil, false, false, validateErr
 	}
 	toolMessages, err := workflowToolMessagesForState(req.OriginalRequest, state)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	resp, agentReq, err := l.callWorkflowAgentAfterTool(ctx, req, cfg, state, toolMessages)
+	if err != nil && workflowToolPhase(state) == workflowToolPhaseFinal {
+		resp, err = workflowFinalOrFallback(req, cfg, state.StepResults, nil, err)
+	}
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if resp.HasToolCalls {
 		state.AgentRequest = agentReq
 		state.Iteration++
-		return l.workflowToolInterruptResponse(ctx, cfg, &workflowToolCallInterrupt{resp: resp, state: state})
+		return l.workflowToolInterruptResponse(ctx, cfg, &workflowToolCallInterrupt{resp: resp, state: state}, claim)
 	}
 	if workflowToolPhase(state) == workflowToolPhaseFinal {
 		out, finishErr := l.finishResumedWorkflowFinal(ctx, &resumeCtx.looperRequest, cfg, state, resumeCtx.originalRequest, resp)
-		return out, finishErr == nil, finishErr
+		return out, finishErr == nil, false, finishErr
 	}
 
 	results, interrupt, err := l.continueWorkflowAfterResumedAgent(ctx, req, cfg, state, resp, resumeCtx)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if interrupt != nil {
-		return l.workflowToolInterruptResponse(ctx, cfg, interrupt)
+		return l.workflowToolInterruptResponse(ctx, cfg, interrupt, claim)
 	}
 
-	out, finishErr := l.finishResumedWorkflow(ctx, &resumeCtx.looperRequest, cfg, state, resumeCtx.originalRequest, results)
-	return out, finishErr == nil, finishErr
+	out, replacedHeld, finishErr := l.finishResumedWorkflow(ctx, &resumeCtx.looperRequest, cfg, state, resumeCtx.originalRequest, results, claim)
+	return out, finishErr == nil, replacedHeld, finishErr
 }
 
 func (l *WorkflowsLooper) workflowToolInterruptResponse(
 	ctx context.Context,
 	cfg workflowsExecutionConfig,
 	interrupt *workflowToolCallInterrupt,
-) (*Response, bool, error) {
-	out, err := l.formatWorkflowToolCallInterrupt(ctx, interrupt, cfg)
-	return out, err == nil, err
+	claim *workflowStateClaim,
+) (*Response, bool, bool, error) {
+	out, replacedHeld, err := l.formatWorkflowToolCallInterrupt(ctx, interrupt, cfg, claim)
+	return out, err == nil, replacedHeld, err
 }
 
 func (l *WorkflowsLooper) continueWorkflowAfterResumedAgent(
@@ -737,9 +834,13 @@ func validateWorkflowResumeState(
 	workerModels []string,
 	cfg workflowsExecutionConfig,
 	decisionName string,
+	recipeName config.RecipeName,
 ) error {
 	if state == nil {
 		return fmt.Errorf("workflow tool state missing")
+	}
+	if err := workflowStateClaimable(state, recipeName); err != nil {
+		return err
 	}
 	if strings.TrimSpace(state.DecisionName) != "" && state.DecisionName != decisionName {
 		return fmt.Errorf("workflow tool state belongs to decision %q, not %q", state.DecisionName, decisionName)

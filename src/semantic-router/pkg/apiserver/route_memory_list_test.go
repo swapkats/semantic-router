@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/memory"
 )
 
@@ -23,7 +24,7 @@ func TestHandleListMemories_Success(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -55,7 +56,7 @@ func TestHandleListMemories_FilterByType(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice&type=semantic", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&type=semantic", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -81,7 +82,7 @@ func TestHandleListMemories_FilterByMultipleTypes(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice&type=semantic,episodic", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&type=semantic,episodic", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -104,7 +105,7 @@ func TestHandleListMemories_Limit(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice&limit=2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&limit=2", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -134,7 +135,7 @@ func TestHandleListMemories_LimitValidation(t *testing.T) {
 	seedTestMemories(store)
 
 	for _, limit := range []string{"abc", "0", "-1"} {
-		req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice&limit="+limit, nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&limit="+limit, nil)
 		w := httptest.NewRecorder()
 
 		server.handleListMemories(w, req)
@@ -152,7 +153,7 @@ func TestHandleListMemories_LimitCapsAtMax(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-alice&limit=1000", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&limit=1000", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -174,7 +175,7 @@ func TestHandleListMemories_EmptyResult(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-nobody", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-nobody", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -199,7 +200,7 @@ func TestHandleListMemories_EmptyResult(t *testing.T) {
 func TestHandleListMemories_MissingUserID(t *testing.T) {
 	server, _ := newTestServer()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -218,7 +219,7 @@ func TestHandleListMemories_UserIsolation(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-bob", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-bob", nil)
 	w := httptest.NewRecorder()
 
 	server.handleListMemories(w, req)
@@ -242,7 +243,7 @@ func TestHandleListMemories_AuthHeaderPriority(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory?user_id=user-bob", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-bob", nil)
 	req.Header.Set("x-authz-user-id", "user-alice")
 	w := httptest.NewRecorder()
 
@@ -271,7 +272,7 @@ func TestHandleListMemories_AuthHeaderOnly(t *testing.T) {
 	server, store := newTestServer()
 	seedTestMemories(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/memory", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories", nil)
 	req.Header.Set("x-authz-user-id", "user-alice")
 	w := httptest.NewRecorder()
 
@@ -288,5 +289,61 @@ func TestHandleListMemories_AuthHeaderOnly(t *testing.T) {
 
 	if resp.Total != 3 {
 		t.Errorf("Expected 3 memories for user-alice, got %d", resp.Total)
+	}
+}
+
+func TestHandleListMemories_OffsetSecondPage(t *testing.T) {
+	server, store := newTestServer()
+	seedTestMemories(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&limit=2&offset=2", nil)
+	w := httptest.NewRecorder()
+	server.handleListMemories(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp MemoryListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if resp.Total != 3 || len(resp.Memories) != 1 || resp.Offset != 2 {
+		t.Fatalf("page = total %d len %d offset %d", resp.Total, len(resp.Memories), resp.Offset)
+	}
+}
+
+func TestHandleListMemories_RejectsNegativeOffset(t *testing.T) {
+	server, _ := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories?user_id=user-alice&offset=-1", nil)
+	w := httptest.NewRecorder()
+	server.handleListMemories(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The memory API reads the user from the header
+// global.services.authz.identity.user_id_header names, as the Router does;
+// the default x-authz-user-id then carries no identity.
+func TestHandleListMemories_ReadsTheConfiguredUserIDHeader(t *testing.T) {
+	server, store := newTestServer()
+	server.config = &config.RouterConfig{Authz: config.AuthzConfig{Identity: config.IdentityConfig{UserIDHeader: "x-jwt-sub"}}}
+	seedTestMemories(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage/memories", nil)
+	req.Header.Set("x-jwt-sub", "user-bob")
+	req.Header.Set("x-authz-user-id", "user-alice")
+	w := httptest.NewRecorder()
+
+	server.handleListMemories(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp MemoryListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if resp.Total != 1 || resp.Memories[0].UserID != "user-bob" {
+		t.Fatalf("listed %d memories, want user-bob's one from x-jwt-sub", resp.Total)
 	}
 }

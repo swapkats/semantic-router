@@ -37,10 +37,52 @@ var rawParser = participle.MustBuild[rawProgram](
 	participle.UseLookahead(3),
 )
 
+// maxNestingDepth bounds parenthesis nesting before the participle parser
+// runs. The grammar is recursive (BoolFactor -> BoolExprTop -> BoolFactor), so
+// every level costs one stack frame; a 400 KB input with 200k levels ends in an
+// unrecoverable "fatal error: stack overflow" that takes the whole process down.
+// Real policies nest a handful of levels, so the cap stays far above legitimate
+// input while keeping a request from deciding how much stack to burn.
+const maxNestingDepth = 256
+
+// exceedsNestingDepth reports whether parentheses nest deeper than limit.
+// String literals and comments are skipped so their contents cannot trip it.
+func exceedsNestingDepth(input string, limit int) bool {
+	depth := 0
+	for i := 0; i < len(input); i++ {
+		switch input[i] {
+		case '"':
+			for i++; i < len(input) && input[i] != '"'; i++ {
+				if input[i] == '\\' {
+					i++
+				}
+			}
+		case '#':
+			for i < len(input) && input[i] != '\n' {
+				i++
+			}
+		case '(':
+			depth++
+			if depth > limit {
+				return true
+			}
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return false
+}
+
 // Parse tokenizes and parses a DSL source string into a Program AST.
 // If the input has syntax errors, Parse attempts error recovery by
 // splitting the input into top-level blocks and parsing each independently.
 func Parse(input string) (*Program, []error) {
+	if exceedsNestingDepth(input, maxNestingDepth) {
+		return nil, []error{fmt.Errorf("dsl: parentheses nest deeper than %d levels", maxNestingDepth)}
+	}
+
 	raw, err := rawParser.ParseString("", input)
 	if err == nil {
 		return rawToProgram(raw)
@@ -67,14 +109,7 @@ func Parse(input string) (*Program, []error) {
 		}
 		parsedAny = true
 		resolved, lowerErrs := rawToProgram(r)
-		prog.Signals = append(prog.Signals, resolved.Signals...)
-		prog.ProjectionPartitions = append(prog.ProjectionPartitions, resolved.ProjectionPartitions...)
-		prog.ProjectionScores = append(prog.ProjectionScores, resolved.ProjectionScores...)
-		prog.ProjectionMappings = append(prog.ProjectionMappings, resolved.ProjectionMappings...)
-		prog.Routes = append(prog.Routes, resolved.Routes...)
-		prog.Models = append(prog.Models, resolved.Models...)
-		prog.Plugins = append(prog.Plugins, resolved.Plugins...)
-		prog.TestBlocks = append(prog.TestBlocks, resolved.TestBlocks...)
+		mergeProgram(prog, resolved)
 		allErrors = append(allErrors, lowerErrs...)
 	}
 
@@ -91,7 +126,10 @@ func splitTopLevelBlocks(input string) []string {
 	var blocks []string
 	depth := 0
 	start := 0
-	keywords := []string{"DECISION_TREE", "PROJECTION", "SIGNAL", "ROUTE", "MODEL", "PLUGIN", "TEST"}
+	keywords := []string{
+		"DECISION_TREE", "ENTRYPOINT", "PROJECTION", "ROUTING", "RECIPE",
+		"SIGNAL", "ROUTE", "MODEL", "PLUGIN", "TEST",
+	}
 
 	for i := 0; i < len(input); i++ {
 		ch := input[i]
@@ -156,6 +194,16 @@ func rawToProgram(raw *rawProgram) (*Program, []error) {
 	treeCount := 0
 	for _, entry := range raw.Entries {
 		switch {
+		case entry.Routing != nil:
+			errs = append(errs, applyRawRouting(prog, entry.Routing)...)
+		case entry.Entrypoint != nil:
+			decl, entryErrs := rawToEntrypoint(entry.Entrypoint)
+			prog.Entrypoints = append(prog.Entrypoints, decl)
+			errs = append(errs, entryErrs...)
+		case entry.Recipe != nil:
+			decl, recipeErrs := rawToRecipe(entry.Recipe)
+			prog.Recipes = append(prog.Recipes, decl)
+			errs = append(errs, recipeErrs...)
 		case entry.Signal != nil:
 			prog.Signals = append(prog.Signals, rawToSignal(entry.Signal))
 		case entry.Projection != nil:
@@ -187,6 +235,34 @@ func rawToProgram(raw *rawProgram) (*Program, []error) {
 		errs = append(errs, fmt.Errorf("DECISION_TREE and ROUTE declarations cannot coexist in the same program. Use only DECISION_TREE (for if/else conditional logic) or only ROUTE (for priority-based routing with WHEN clauses), not both"))
 	}
 	return prog, errs
+}
+
+func mergeProgram(dst, src *Program) {
+	if src.ModelBindings != nil {
+		if dst.ModelBindings == nil {
+			dst.ModelBindings = cloneModelBindings(src.ModelBindings)
+		} else {
+			for name, binding := range src.ModelBindings {
+				dst.ModelBindings[name] = binding
+			}
+		}
+	}
+	if src.CandidateRequirements != nil {
+		dst.CandidateRequirements = src.CandidateRequirements.Clone()
+	}
+	if src.Strategy != "" {
+		dst.Strategy = src.Strategy
+	}
+	dst.Entrypoints = append(dst.Entrypoints, src.Entrypoints...)
+	dst.Recipes = append(dst.Recipes, src.Recipes...)
+	dst.Signals = append(dst.Signals, src.Signals...)
+	dst.ProjectionPartitions = append(dst.ProjectionPartitions, src.ProjectionPartitions...)
+	dst.ProjectionScores = append(dst.ProjectionScores, src.ProjectionScores...)
+	dst.ProjectionMappings = append(dst.ProjectionMappings, src.ProjectionMappings...)
+	dst.Routes = append(dst.Routes, src.Routes...)
+	dst.Models = append(dst.Models, src.Models...)
+	dst.Plugins = append(dst.Plugins, src.Plugins...)
+	dst.TestBlocks = append(dst.TestBlocks, src.TestBlocks...)
 }
 
 func rawToProjectionPartition(r *rawProjectionDecl) *ProjectionPartitionDecl {
@@ -248,12 +324,6 @@ func rawToProjectionScore(r *rawProjectionDecl) *ProjectionScoreDecl {
 			if signalName, ok := getStringField(ov.Fields, "name"); ok {
 				input.SignalName = signalName
 			}
-			if kb, ok := getStringField(ov.Fields, "kb"); ok {
-				input.KB = kb
-			}
-			if metric, ok := getStringField(ov.Fields, "metric"); ok {
-				input.Metric = metric
-			}
 			if weight, ok := getFloat64Field(ov.Fields, "weight"); ok {
 				input.Weight = weight
 			}
@@ -261,7 +331,7 @@ func rawToProjectionScore(r *rawProjectionDecl) *ProjectionScoreDecl {
 				input.ValueSource = valueSource
 			}
 			if match, ok := getFloat64Field(ov.Fields, "match"); ok {
-				input.Match = match
+				input.Match = &match
 			}
 			if miss, ok := getFloat64Field(ov.Fields, "miss"); ok {
 				input.Miss = miss
@@ -357,12 +427,7 @@ func rawToRoute(r *rawRouteDecl) *RouteDecl {
 		Pos:  posFromLexer(r.Pos),
 	}
 
-	// Process options
-	for _, opt := range r.Opts {
-		if opt.Key == "description" && opt.Value != nil && opt.Value.Str != nil {
-			route.Description = unquote(*opt.Value.Str)
-		}
-	}
+	applyRouteOptions(route, r.Opts)
 
 	// Process body items
 	for _, item := range r.Body {
@@ -383,10 +448,18 @@ func rawToRoute(r *rawRouteDecl) *RouteDecl {
 			route.Plugins = append(route.Plugins, rawToPluginRef(item.Plugin))
 		case item.Description != nil:
 			route.Description = unquote(*item.Description)
+		case item.Action != nil:
+			route.Action = &ActionDecl{
+				Type:        item.Action.Type,
+				Destination: unquoteIdent(item.Action.Destination),
+				Pos:         posFromLexer(item.Action.Pos),
+			}
 		case item.CandidateFor != nil:
 			route.CandidateIterations = append(route.CandidateIterations, rawToCandidateIteration(item.CandidateFor))
-		case item.Emit != nil:
-			route.Emits = append(route.Emits, rawToEmitDecl(item.Emit))
+		case item.Retention != nil:
+			route.Retention = rawToRetentionDecl(item.Retention)
+		case item.Output != nil:
+			route.Output = rawToOutputDecl(item.Output)
 		}
 	}
 
@@ -425,14 +498,12 @@ func rawToPluginRef(r *rawPluginRef) *PluginRef {
 // underscore form. Only known inline types are normalized; template names pass
 // through unchanged so "PLUGIN my-template system_prompt {}" keeps its name.
 var knownInlinePluginAliases = map[string]string{
-	"semantic-cache":     "semantic_cache",
-	"system-prompt":      "system_prompt",
-	"header-mutation":    "header_mutation",
-	"router-replay":      "router_replay",
-	"image-gen":          "image_gen",
-	"fast-response":      "fast_response",
-	"request-params":     "request_params",
-	"response-jailbreak": "response_jailbreak",
+	"response-cache":  "response_cache",
+	"system-prompt":   "system_prompt",
+	"header-mutation": "header_mutation",
+	"router-replay":   "router_replay",
+	"fast-response":   "fast_response",
+	"request-params":  "request_params",
 }
 
 // normalizePluginName converts known hyphenated plugin type aliases to their
@@ -472,6 +543,10 @@ func rawToModelRef(r *rawModelRef) *ModelRef {
 		case "effort":
 			if v.Str != nil {
 				m.Effort = unquote(*v.Str)
+			}
+		case "mode":
+			if v.Str != nil {
+				m.Mode = unquote(*v.Str)
 			}
 		case "lora":
 			if v.Str != nil {
@@ -532,6 +607,7 @@ func toFactorExpr(f *BoolFactor) BoolExpr {
 		return &SignalRefExpr{
 			SignalType: f.SignalRef.SignalType,
 			SignalName: unquote(f.SignalRef.SignalName),
+			Fields:     entriesToMap(f.SignalRef.Fields),
 			Pos:        pos,
 		}
 	}
@@ -570,7 +646,7 @@ func valToValue(v *Val) Value {
 		}
 		return ArrayValue{Items: items}
 	case v.Object != nil:
-		return ObjectValue{Fields: entriesToMap(v.Object)}
+		return ObjectValue{Fields: entriesToMap(v.Object.Fields)}
 	case v.BareStr != nil:
 		return StringValue{V: *v.BareStr}
 	}

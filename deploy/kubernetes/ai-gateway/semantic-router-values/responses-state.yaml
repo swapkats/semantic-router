@@ -1,0 +1,40 @@
+# The gateway in front of the Router calls it over ext_proc.
+gateway:
+  mode: extproc
+replicaCount: 1
+
+# ExtProc-only Responses state and protocol conversion. The external gateway
+# owns the public listener, route, backend, credentials, and traffic policy.
+# Replace the chart's example routing config atomically. Using `config` here
+# would recursively merge in its placeholder default route and signals.
+configOverride:
+  version: v0.5
+  listeners: []
+  providers:
+    models:
+      # Protocol metadata only: intentionally no backend_refs or credentials.
+      - name: openai/gpt-oss-20b
+        api_format: openai
+  recipes:
+    - name: default
+  global:
+    router:
+      clear_route_cache: false
+      model_selection:
+        enabled: false
+    services:
+      response_api:
+        enabled: true
+        store_backend: memory
+        ttl_seconds: 86400
+        max_responses: 1000
+      router_replay:
+        store_backend: memory
+      observability:
+        tracing:
+          enabled: false
+service:
+  type: ClusterIP
+
+persistence:
+  enabled: false

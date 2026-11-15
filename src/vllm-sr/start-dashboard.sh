@@ -1,7 +1,7 @@
 #!/bin/sh
 # Start dashboard with dynamically determined Envoy port from config.yaml
 
-CONFIG_FILE="${1:-/app/config.yaml}"
+CONFIG_FILE="${1:-${VLLM_SR_RUNTIME_CONFIG_PATH:-/app/.vllm-sr/runtime-config.yaml}}"
 
 # Check if dashboard is disabled (minimal mode)
 if [ "${DISABLE_DASHBOARD}" = "true" ]; then
@@ -31,7 +31,12 @@ ENVOY_URL="${TARGET_ENVOY_URL:-http://localhost:${ENVOY_PORT}}"
 
 echo "Starting dashboard with Router API at ${ROUTER_API_URL}"
 echo "Starting dashboard with Router metrics at ${ROUTER_METRICS_URL}"
-echo "Starting dashboard with Envoy at ${ENVOY_URL}"
+# A stack started before standalone mode existed sets no gateway and runs Envoy.
+if [ "${VLLM_SR_GATEWAY:-extproc}" = "standalone" ]; then
+    echo "Starting dashboard with the Router's listener at ${ENVOY_URL}"
+else
+    echo "Starting dashboard with Envoy at ${ENVOY_URL}"
+fi
 
 # Check for read-only mode
 READONLY_ARG=""

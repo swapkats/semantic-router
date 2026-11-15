@@ -1,175 +1,172 @@
 // topology/constants.ts - Constants and Color Schemes
 
 import { SignalType, PluginType, AlgorithmType } from './types'
+import {
+  ALGORITHM_TYPES as ROUTER_ALGORITHM_TYPES,
+  PLUGIN_TYPES as ROUTER_PLUGIN_TYPES,
+  SIGNAL_TYPES as ROUTER_SIGNAL_TYPES,
+} from '../../generated/routerConfigContract'
+
+function compactSurfaceIcon(value: string): string {
+  const words = value.split('_').filter(Boolean)
+  if (words.length > 1) return words.map((word) => word[0]?.toUpperCase()).join('')
+  return value.slice(0, 3).toUpperCase()
+}
+
+export const SIGNAL_TYPES: SignalType[] = [...ROUTER_SIGNAL_TYPES, 'projection']
+export const PLUGIN_TYPES: PluginType[] = [...ROUTER_PLUGIN_TYPES]
+export const ALGORITHM_TYPES: AlgorithmType[] = [...ROUTER_ALGORITHM_TYPES]
 
 // ============== Signal Icons ==============
-export const SIGNAL_ICONS: Record<SignalType, string> = {
+const SIGNAL_ICON_OVERRIDES: Partial<Record<SignalType, string>> = {
   keyword: 'KW',
-  embedding: 'EMB',
   domain: 'DOM',
   fact_check: 'FC',
   user_feedback: 'UF',
-  reask: 'RA',
-  preference: 'PREF',
   language: 'LANG',
   context: 'CTX',
-  structure: 'STR',
   complexity: 'CPX',
   modality: 'MOD',
   authz: 'AUTH',
   jailbreak: 'JB',
+  hallucination: 'HL',
   pii: 'PII',
-  kb: 'KB',
   conversation: 'CONV',
-  event: 'EVT',
   projection: 'PRJ',
 }
 
-// ============== Signal Colors (Gray Nodes, Green Paths) ==============
-export const SIGNAL_COLORS: Record<SignalType, { background: string; border: string }> = {
-  keyword: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  embedding: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  domain: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  fact_check: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  user_feedback: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  reask: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  preference: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  language: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  context: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  structure: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  complexity: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  modality: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  authz: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  jailbreak: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  pii: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  kb: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  conversation: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  event: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  projection: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-}
+export const SIGNAL_ICONS = Object.fromEntries(
+  SIGNAL_TYPES.map((type) => [type, SIGNAL_ICON_OVERRIDES[type] || compactSurfaceIcon(type)]),
+) as Record<SignalType, string>
+
+// ============== Signal Colors (Gray Nodes, Alloy Paths) ==============
+export const SIGNAL_COLORS = Object.fromEntries(
+  SIGNAL_TYPES.map((type) => [type, { background: '#4a5568', border: '#2d3748' }]),
+) as Record<SignalType, { background: string; border: string }>
 
 // ============== Signal Latency ==============
-export const SIGNAL_LATENCY: Record<SignalType, string> = {
+const SIGNAL_LATENCY_OVERRIDES: Partial<Record<SignalType, string>> = {
   keyword: '<1ms',
-  embedding: '10-50ms',
   domain: '10-50ms',
   fact_check: '10-50ms',
   user_feedback: '10-50ms',
-  reask: '10-50ms',
-  preference: '200-500ms',
   language: '<1ms',
   context: '<1ms',
-  structure: '<1ms',
   complexity: '50-100ms',
   modality: '50-100ms',
   authz: '<1ms',
   jailbreak: '10-50ms',
+  hallucination: '200-500ms',
   pii: '10-50ms',
-  kb: '10-50ms',
   conversation: '<1ms',
-  event: '<1ms',
   projection: '<1ms',
 }
 
+export const SIGNAL_LATENCY = Object.fromEntries(
+  SIGNAL_TYPES.map((type) => [type, SIGNAL_LATENCY_OVERRIDES[type] || '~100ms']),
+) as Record<SignalType, string>
+
 // ============== Plugin Icons ==============
-export const PLUGIN_ICONS: Record<PluginType, string> = {
-  'semantic-cache': 'SC',
-  memory: 'MEM',
+const PLUGIN_ICON_OVERRIDES: Partial<Record<PluginType, string>> = {
+  response_cache: 'RC',
+  context: 'CTX',
   system_prompt: 'SP',
   header_mutation: 'HM',
-  hallucination: 'HAL',
   router_replay: 'RR',
-  rag: 'RAG',
-  image_gen: 'IMG',
   fast_response: 'FR',
   request_params: 'RP',
-  response_jailbreak: 'RJ',
+  response_guard: 'RG',
   tools: 'TL',
-  tool_selection: 'TS',
+  prompt_cache: 'PC',
+  masking: 'MSK',
 }
 
-// ============== Plugin Colors (NVIDIA Dark Theme) ==============
-export const PLUGIN_COLORS: Record<PluginType, { background: string; border: string }> = {
-  'semantic-cache': { background: '#76b900', border: '#5a8f00' }, // NVIDIA Green
-  memory: { background: '#3f6b73', border: '#2e4f55' },
-  system_prompt: { background: '#8fd400', border: '#76b900' }, // Light Green
-  header_mutation: { background: '#606c7a', border: '#3d4a59' }, // Slate Gray
-  hallucination: { background: '#556b7d', border: '#3d4a59' }, // Cool Gray
-  router_replay: { background: '#6ba300', border: '#5a8f00' }, // Green (consistent with other plugins)
-  rag: { background: '#2f855a', border: '#276749' },
-  image_gen: { background: '#7b5ea7', border: '#5b3f86' },
-  fast_response: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  request_params: { background: '#805ad5', border: '#6b46c1' },
-  response_jailbreak: { background: '#c05621', border: '#9c4221' },
-  tools: { background: '#5a6c7d', border: '#3d4a59' },
-  tool_selection: { background: '#4b6f7f', border: '#344f5c' },
-}
+export const PLUGIN_ICONS = Object.fromEntries(
+  PLUGIN_TYPES.map((type) => [type, PLUGIN_ICON_OVERRIDES[type] || compactSurfaceIcon(type)]),
+) as Record<PluginType, string>
+
+// ============== Plugin Colors (Graphite Theme) ==============
+const PLUGIN_COLOR_OVERRIDES: Partial<Record<PluginType, { background: string; border: string }>> =
+  {
+    response_cache: { background: '#8f949c', border: '#696d74' }, // Graphite Alloy
+    context: { background: '#2f855a', border: '#276749' },
+    system_prompt: { background: '#c9cbd0', border: '#8f949c' }, // Light Alloy
+    header_mutation: { background: '#606c7a', border: '#3d4a59' }, // Slate Gray
+    router_replay: { background: '#737780', border: '#696d74' }, // Green (consistent with other plugins)
+    fast_response: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
+    request_params: { background: '#805ad5', border: '#6b46c1' },
+    response_guard: { background: '#c05621', border: '#9c4221' },
+    tools: { background: '#5a6c7d', border: '#3d4a59' },
+    prompt_cache: { background: '#6b7280', border: '#4b5563' },
+    masking: { background: '#4f6a7a', border: '#374d59' },
+  }
+
+export const PLUGIN_COLORS = Object.fromEntries(
+  PLUGIN_TYPES.map((type) => [
+    type,
+    PLUGIN_COLOR_OVERRIDES[type] || { background: '#607D8B', border: '#455A64' },
+  ]),
+) as Record<PluginType, { background: string; border: string }>
 
 // ============== Algorithm Icons ==============
-export const ALGORITHM_ICONS: Record<AlgorithmType, string> = {
-  confidence: 'CF',
-  concurrent: 'CC',
-  sequential: 'SEQ',
+const ALGORITHM_ICON_OVERRIDES: Partial<Record<AlgorithmType, string>> = {
+  escalate: 'ES',
   ratings: 'RT',
   static: 'ST',
-  router_dc: 'RDC',
-  automix: 'AM',
-  hybrid: 'HY',
   remom: 'RM',
   fusion: 'FU',
   workflows: 'FL',
-  latency_aware: 'LAT',
-  knn: 'KNN',
-  kmeans: 'KM',
-  svm: 'SVM',
-  mlp: 'MLP',
   multi_factor: 'MF',
 }
 
-// ============== Algorithm Colors (NVIDIA Dark Theme) ==============
-export const ALGORITHM_COLORS: Record<AlgorithmType, { background: string; border: string }> = {
-  confidence: { background: '#76b900', border: '#5a8f00' }, // NVIDIA Green
-  concurrent: { background: '#5a6c7d', border: '#3d4a59' }, // Blue Gray
-  sequential: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  ratings: { background: '#8fd400', border: '#76b900' }, // Light Green
+export const ALGORITHM_ICONS = Object.fromEntries(
+  ALGORITHM_TYPES.map((type) => [
+    type,
+    ALGORITHM_ICON_OVERRIDES[type] || compactSurfaceIcon(type),
+  ]),
+) as Record<AlgorithmType, string>
+
+// ============== Algorithm Colors (Graphite Theme) ==============
+const ALGORITHM_COLOR_OVERRIDES: Partial<
+  Record<AlgorithmType, { background: string; border: string }>
+> = {
+  escalate: { background: '#8f949c', border: '#696d74' }, // Graphite Alloy
+  ratings: { background: '#c9cbd0', border: '#8f949c' }, // Light Alloy
   static: { background: '#606c7a', border: '#3d4a59' }, // Slate Gray
-  router_dc: { background: '#556b7d', border: '#3d4a59' }, // Cool Gray
-  remom: { background: '#76b900', border: '#5a8f00' }, // NVIDIA Green (same as plugins)
-  fusion: { background: '#60784f', border: '#455a36' }, // Muted Green
+  remom: { background: '#8f949c', border: '#696d74' }, // Graphite Alloy (same as plugins)
+  fusion: { background: '#60784f', border: '#455a36' }, // Muted Alloy
   workflows: { background: '#4f6f78', border: '#38545c' }, // Flow Teal
-  automix: { background: '#5d6d7e', border: '#3d4a59' }, // Steel Gray
-  hybrid: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
-  latency_aware: { background: '#5a6c7d', border: '#3d4a59' }, // Blue Gray
-  knn: { background: '#687887', border: '#4b5968' },
-  kmeans: { background: '#596b5d', border: '#3f5144' },
-  svm: { background: '#6d687a', border: '#504a5c' },
-  mlp: { background: '#586d7a', border: '#40515d' },
   multi_factor: { background: '#4e6f63', border: '#38534a' },
 }
 
-// ============== Reasoning Effort Display (NVIDIA Dark Theme) ==============
+export const ALGORITHM_COLORS = Object.fromEntries(
+  ALGORITHM_TYPES.map((type) => [
+    type,
+    ALGORITHM_COLOR_OVERRIDES[type] || { background: '#607D8B', border: '#455A64' },
+  ]),
+) as Record<AlgorithmType, { background: string; border: string }>
+
+// ============== Reasoning Effort Display (Graphite Theme) ==============
 export const REASONING_EFFORT_DISPLAY: Record<
   string,
   { icon: string; label: string; color: string }
 > = {
-  low: { icon: 'L', label: 'Low', color: '#8fd400' }, // Light Green
-  medium: { icon: 'M', label: 'Medium', color: '#76b900' }, // NVIDIA Green
-  high: { icon: 'H', label: 'High', color: '#5a8f00' }, // Dark Green
+  low: { icon: 'L', label: 'Low', color: '#c9cbd0' }, // Light Alloy
+  medium: { icon: 'M', label: 'Medium', color: '#8f949c' }, // Graphite Alloy
+  high: { icon: 'H', label: 'High', color: '#696d74' }, // Dark Alloy
 }
 
 export const MODEL_NODE_WIDTH = 220
 
-// ============== Global Plugin Display (NVIDIA Dark Theme) ==============
+// ============== Global Plugin Display (Graphite Theme) ==============
 export const GLOBAL_PLUGIN_DISPLAY: Record<string, { icon: string; label: string; color: string }> =
   {
-    prompt_guard: { icon: 'PG', label: 'Jailbreak Guard', color: '#718096' }, // Medium Gray
-    pii_detection: { icon: 'PII', label: 'PII Detection', color: '#5a6c7d' }, // Blue Gray
-    semantic_cache: { icon: 'SC', label: 'Semantic Cache', color: '#76b900' }, // NVIDIA Green
+    response_cache: { icon: 'RC', label: 'Response Cache', color: '#8f949c' }, // Graphite Alloy
   }
 
-// ============== Node Colors (Gray Nodes, Green Paths) ==============
+// ============== Node Colors (Gray Nodes, Alloy Paths) ==============
 export const NODE_COLORS = {
-  client: { background: '#76b900', border: '#5a8f00' }, // NVIDIA Green (Client stays green)
+  client: { background: '#8f949c', border: '#696d74' }, // Graphite Alloy (Client stays alloy)
   decision: {
     normal: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
     reasoning: { background: '#4a5568', border: '#2d3748' }, // Dark Gray
@@ -183,13 +180,13 @@ export const NODE_COLORS = {
   disabled: { background: '#3d4a59', border: '#2d3748' }, // Very Dark Gray
 }
 
-// ============== Edge Colors (Green Paths) ==============
+// ============== Edge Colors (Alloy Paths) ==============
 export const EDGE_COLORS = {
-  normal: '#76b900', // NVIDIA Green (All paths green)
-  reasoning: '#76b900', // NVIDIA Green (All paths green)
-  active: '#76b900', // NVIDIA Green
+  normal: '#8f949c', // Graphite Alloy (All paths use alloy)
+  reasoning: '#8f949c', // Graphite Alloy (All paths use alloy)
+  active: '#8f949c', // Graphite Alloy
   disabled: '#3d4a59', // Very Dark Gray
-  highlighted: '#8fd400', // Light Green (Highlighted paths brighter)
+  highlighted: '#c9cbd0', // Light Alloy (Highlighted paths brighter)
 }
 
 // ============== Layout Configuration ==============
@@ -288,43 +285,3 @@ export const TOPOLOGY_LAYER_LAYOUT = {
     },
   },
 } as const
-
-// ============== Signal Types Array ==============
-export const SIGNAL_TYPES: SignalType[] = [
-  'keyword',
-  'embedding',
-  'domain',
-  'fact_check',
-  'user_feedback',
-  'reask',
-  'preference',
-  'language',
-  'context',
-  'structure',
-  'complexity',
-  'modality',
-  'authz',
-  'jailbreak',
-  'pii',
-  'kb',
-  'conversation',
-  'event',
-  'projection',
-]
-
-// ============== Plugin Types Array ==============
-export const PLUGIN_TYPES: PluginType[] = [
-  'semantic-cache',
-  'memory',
-  'system_prompt',
-  'header_mutation',
-  'hallucination',
-  'router_replay',
-  'rag',
-  'image_gen',
-  'fast_response',
-  'request_params',
-  'response_jailbreak',
-  'tools',
-  'tool_selection',
-]

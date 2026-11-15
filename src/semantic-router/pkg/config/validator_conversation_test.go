@@ -37,6 +37,34 @@ func TestValidateConversationRuleContract_ActiveToolLoopSource(t *testing.T) {
 	}
 }
 
+func TestValidateConversationRuleContract_FlowToolStateSource(t *testing.T) {
+	rule := ConversationRule{
+		Name: "flow_tool_state",
+		Feature: ConversationFeature{
+			Type:   "exists",
+			Source: ConversationSource{Type: "flow_tool_state"},
+		},
+	}
+	if err := ValidateConversationRuleContract(rule); err != nil {
+		t.Fatalf("expected flow_tool_state source to pass, got: %v", err)
+	}
+}
+
+func TestValidateConversationRuleContract_ToolChoiceSources(t *testing.T) {
+	for _, sourceType := range []string{"tool_choice_required", "tool_choice_none"} {
+		rule := ConversationRule{
+			Name: sourceType,
+			Feature: ConversationFeature{
+				Type:   "exists",
+				Source: ConversationSource{Type: sourceType},
+			},
+		}
+		if err := ValidateConversationRuleContract(rule); err != nil {
+			t.Fatalf("expected %s source to pass, got: %v", sourceType, err)
+		}
+	}
+}
+
 func TestValidateConversationRuleContract_EmptyName(t *testing.T) {
 	rule := validConversationRule()
 	rule.Name = ""
@@ -152,5 +180,34 @@ func TestValidateConversationRuleContract_ExistsWithoutPredicate(t *testing.T) {
 	}
 	if err := ValidateConversationRuleContract(rule); err != nil {
 		t.Fatalf("expected exists without predicate to pass, got: %v", err)
+	}
+}
+
+// A count rule needs a predicate to match: without one it would match every
+// request, even one with nothing to count, so the config does not load.
+func TestConversationCountRuleWithoutPredicateDoesNotLoad(t *testing.T) {
+	_, err := ParseYAMLBytes([]byte(`version: v0.5
+recipes:
+  - name: default
+    signals:
+      conversation:
+        - name: tool_heavy
+          feature:
+            type: count
+            source: {type: tool_definition}
+    decisions:
+      - name: agentic
+        priority: 100
+        rules: {operator: AND, conditions: [{type: conversation, name: tool_heavy}]}
+        modelRefs: [{model: local}]
+providers:
+  models:
+    - name: local
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+`))
+	if err == nil || !strings.Contains(err.Error(), "requires a predicate") {
+		t.Fatalf("err = %v, want a count rule without a predicate to be refused", err)
 	}
 }

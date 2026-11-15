@@ -1,19 +1,24 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerruntime"
 )
 
 func TestHandleConfigPatchMergesExistingConfig(t *testing.T) {
@@ -49,7 +54,159 @@ func TestHandleConfigPutReplacesExistingConfig(t *testing.T) {
 	routing := requireRoutingSection(t, doc)
 	requireFirstDecisionName(t, routing, "new_route")
 	if projections, ok := routing["projections"].(map[string]any); ok && len(projections) > 0 {
-		t.Fatalf("expected replace deploy to drop omitted routing.projections, got %#v", projections)
+		t.Fatalf("expected replace deploy to drop omitted recipes[default].projections, got %#v", projections)
+	}
+}
+
+func TestHandleConfigPutPreservesDisabledRouterReplay(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	payloadCfg := minimalDeployTestConfig("new_route")
+	payloadCfg.RouterReplay = config.RouterReplayConfig{StoreBackend: "memory", TTLSeconds: 600}
+	payloadCfg.GlobalPlugins = []config.DecisionPlugin{{
+		Type: config.DecisionPluginRouterReplay, Configuration: config.MustStructuredPayload(map[string]interface{}{"enabled": false}),
+	}}
+	payloadYAML := mustMarshalCanonicalConfigYAML(t, payloadCfg)
+	body, err := json.Marshal(RouterConfigUpdateRequest{YAML: string(payloadYAML)})
+	if err != nil {
+		t.Fatalf("json.Marshal error: %v", err)
+	}
+
+	apiServer := &ClassificationAPIServer{configPath: configPath}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, req, configPath)
+	rr := httptest.NewRecorder()
+	apiServer.handleConfigPut(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+	reloaded, err := config.Parse(configPath)
+	if err != nil {
+		t.Fatalf("parse deployed config: %v", err)
+	}
+	if reloaded.UsesRouterReplay() || len(reloaded.GlobalPlugins) != 1 {
+		t.Fatalf("expected global.plugins router_replay enabled: false to survive canonical PUT normalization, got %+v", reloaded.GlobalPlugins)
+	}
+}
+
+func TestHandleConfigPutPreservesCanonicalUserDocument(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	payloadYAML := mustMarshalCanonicalConfigYAML(t, minimalDeployTestConfig("new_route"))
+	var expected map[string]any
+	if err := yaml.Unmarshal(payloadYAML, &expected); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+
+	providers := expected["providers"].(map[string]any)
+	models := providers["models"].([]any)
+	model := models[0].(map[string]any)
+	backendRefs := model["backend_refs"].([]any)
+	backendRefs[0].(map[string]any)["name"] = "vllm_primary"
+
+	recipe := expected["recipes"].([]any)[0].(map[string]any)
+	decisions := recipe["decisions"].([]any)
+	rules := decisions[0].(map[string]any)["rules"].(map[string]any)
+	rules["conditions"] = []any{}
+
+	payloadYAML, err := yaml.Marshal(expected)
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	body, err := json.Marshal(RouterConfigUpdateRequest{YAML: string(payloadYAML)})
+	if err != nil {
+		t.Fatalf("json.Marshal error: %v", err)
+	}
+
+	apiServer := &ClassificationAPIServer{configPath: configPath}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, req, configPath)
+	rr := httptest.NewRecorder()
+	apiServer.handleConfigPut(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	persistedYAML, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read persisted config: %v", err)
+	}
+	var persisted map[string]any
+	if err := yaml.Unmarshal(persistedYAML, &persisted); err != nil {
+		t.Fatalf("decode persisted config: %v", err)
+	}
+	if !reflect.DeepEqual(persisted, expected) {
+		t.Fatalf("management PUT rewrote canonical user intent:\nexpected: %#v\nactual: %#v", expected, persisted)
+	}
+}
+
+func TestHandleConfigPutRejectsNonCanonicalRequestFields(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read base config: %v", err)
+	}
+	payloadYAML := mustMarshalCanonicalConfigYAML(t, minimalDeployTestConfig("new_route"))
+	body, err := json.Marshal(map[string]string{
+		"yaml": string(payloadYAML),
+		"dsl":  "ROUTE new_route",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPut, apiConfigPath, bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, request, configPath)
+	response := httptest.NewRecorder()
+	(&ClassificationAPIServer{configPath: configPath}).handleConfigPut(response, request)
+
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "unknown field") {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after rejection: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected non-canonical request mutated the config")
+	}
+}
+
+func TestHandleConfigPatchRejectsAStoreDimensionItsDeploymentDoesNotServe(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	invalidCfg := minimalDeployTestConfig("new_route")
+	if invalidCfg.ModelDeployments == nil {
+		invalidCfg.ModelDeployments = map[string]config.ModelDeployment{}
+	}
+	invalidCfg.ModelDeployments["remote-embed"] = config.ModelDeployment{
+		Provider: config.OpenAIEmbeddingsProvider, Endpoint: "http://embedding-service:8000/v1", Model: "e5",
+		Capabilities: &config.DeploymentCapabilities{Dimensions: 1536},
+	}
+	invalidCfg.Memory.Embedding = &config.EmbeddingBinding{Deployment: "remote-embed", Dimension: 768}
+	payloadYAML := mustMarshalCanonicalConfigYAML(t, invalidCfg)
+	body, err := json.Marshal(RouterConfigUpdateRequest{YAML: string(payloadYAML)})
+	if err != nil {
+		t.Fatalf("json.Marshal error: %v", err)
+	}
+
+	apiServer := &ClassificationAPIServer{configPath: configPath}
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, req, configPath)
+	rr := httptest.NewRecorder()
+
+	apiServer.handleConfigPatch(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d: %s", rr.Code, rr.Body.String())
+	}
+	response := rr.Body.String()
+	for _, want := range []string{"CONFIG_VALIDATION_ERROR", "global.stores.memory.embedding.dimension", "answers with 1536 dimensions"} {
+		if !strings.Contains(response, want) {
+			t.Fatalf("expected response to contain %q, got: %s", want, response)
+		}
 	}
 }
 
@@ -88,8 +245,9 @@ func executeRouterConfigUpdateAndRead(
 	}
 
 	apiServer := &ClassificationAPIServer{configPath: configPath}
-	req := httptest.NewRequest(method, "/config/router", bytes.NewReader(body))
+	req := httptest.NewRequest(method, "/api/v1/config", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, req, configPath)
 	rr := httptest.NewRecorder()
 
 	switch method {
@@ -121,11 +279,15 @@ func executeRouterConfigUpdateAndRead(
 func requireRoutingSection(t *testing.T, doc map[string]any) map[string]any {
 	t.Helper()
 
-	routing, ok := doc["routing"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected routing block in updated config, got %#v", doc)
+	recipes, ok := doc["recipes"].([]any)
+	if !ok || len(recipes) == 0 {
+		t.Fatalf("expected recipes in updated config, got %#v", doc)
 	}
-	return routing
+	recipe, ok := recipes[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a recipe mapping, got %#v", recipes[0])
+	}
+	return recipe
 }
 
 func requireRoutingProjectionBlock(t *testing.T, routing map[string]any, rawYAML []byte) {
@@ -133,7 +295,7 @@ func requireRoutingProjectionBlock(t *testing.T, routing map[string]any, rawYAML
 
 	projections, ok := routing["projections"].(map[string]any)
 	if !ok || len(projections) == 0 {
-		t.Fatalf("expected merge to preserve existing routing.projections, got %#v in:\n%s", routing["projections"], string(rawYAML))
+		t.Fatalf("expected merge to preserve existing recipes[default].projections, got %#v in:\n%s", routing["projections"], string(rawYAML))
 	}
 }
 
@@ -142,63 +304,14 @@ func requireFirstDecisionName(t *testing.T, routing map[string]any, want string)
 
 	decisions, ok := routing["decisions"].([]any)
 	if !ok || len(decisions) == 0 {
-		t.Fatalf("expected routing.decisions in updated config, got %#v", routing["decisions"])
+		t.Fatalf("expected recipes[default].decisions in updated config, got %#v", routing["decisions"])
 	}
 	firstDecision, ok := decisions[0].(map[string]any)
 	if !ok {
-		t.Fatalf("expected routing.decisions[0] to be a map, got %#v", decisions[0])
+		t.Fatalf("expected recipes[default].decisions[0] to be a map, got %#v", decisions[0])
 	}
 	if got := firstDecision["name"]; got != want {
-		t.Fatalf("expected routing.decisions[0].name = %s, got %v", want, got)
-	}
-}
-
-func minimalDeployTestConfig(decisionName string) *config.RouterConfig {
-	return &config.RouterConfig{
-		APIServer: config.APIServer{
-			Listeners: []config.Listener{{
-				Name:    "http-8899",
-				Address: "0.0.0.0",
-				Port:    8899,
-				Timeout: "120s",
-			}},
-		},
-		BackendModels: config.BackendModels{
-			DefaultModel: "qwen-test",
-			ModelConfig: map[string]config.ModelParams{
-				"qwen-test": {},
-			},
-			VLLMEndpoints: []config.VLLMEndpoint{{
-				Name:     "primary",
-				Address:  "vllm",
-				Port:     8000,
-				Protocol: "http",
-				Model:    "qwen-test",
-				Weight:   1,
-			}},
-		},
-		IntelligentRouting: config.IntelligentRouting{
-			Signals: config.Signals{
-				Categories: []config.Category{{
-					CategoryMetadata: config.CategoryMetadata{Name: "math"},
-				}},
-			},
-			Decisions: []config.Decision{{
-				Name:     decisionName,
-				Priority: 100,
-				Tier:     1,
-				Rules: config.RuleCombination{
-					Operator: "AND",
-					Conditions: []config.RuleNode{{
-						Type: "domain",
-						Name: "math",
-					}},
-				},
-				ModelRefs: []config.ModelRef{{
-					Model: "qwen-test",
-				}},
-			}},
-		},
+		t.Fatalf("expected recipes[default].decisions[0].name = %s, got %v", want, got)
 	}
 }
 
@@ -234,11 +347,22 @@ func postRollback(t *testing.T, configPath, version string) *httptest.ResponseRe
 		t.Fatalf("marshal rollback body: %v", err)
 	}
 	apiServer := &ClassificationAPIServer{configPath: configPath}
-	req := httptest.NewRequest(http.MethodPost, "/config/router/rollback", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/rollback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	setConfigPrecondition(t, req, configPath)
 	rr := httptest.NewRecorder()
 	apiServer.handleConfigRollback(rr, req)
 	return rr
+}
+
+func setConfigPrecondition(t *testing.T, request *http.Request, configPath string) {
+	t.Helper()
+	sourcePath := resolveConfigPersistencePaths(configPath).sourcePath
+	current, err := os.ReadFile(sourcePath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read config precondition from %s: %v", sourcePath, err)
+	}
+	request.Header.Set("If-Match", configDocumentETag(current))
 }
 
 // TestHandleConfigRollbackRejectsMaliciousVersion ensures the rollback endpoint
@@ -309,11 +433,51 @@ func TestHandleConfigRollbackAcceptsWellFormedVersion(t *testing.T) {
 	}
 }
 
+func TestHandleConfigRollbackAcceptsCollisionSuffixedVersion(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+
+	rr := postRollback(t, configPath, "20240101-000000-001")
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for well-formed missing suffixed version, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if code := rollbackErrorCode(t, rr.Body.Bytes()); code != "VERSION_NOT_FOUND" {
+		t.Fatalf("expected error code VERSION_NOT_FOUND, got %q", code)
+	}
+}
+
+func TestNextConfigVersionAvoidsSameSecondBackupCollisions(t *testing.T) {
+	backupDir := t.TempDir()
+	now := time.Date(2026, time.August, 2, 10, 11, 12, 0, time.UTC)
+	base := nextConfigVersion(backupDir, now)
+	if base != "20260802-101112" {
+		t.Fatalf("base version = %q", base)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "config."+base+".yaml"), []byte("first"), 0o644); err != nil {
+		t.Fatalf("write first backup: %v", err)
+	}
+
+	second := nextConfigVersion(backupDir, now)
+	if second != "20260802-101112-001" {
+		t.Fatalf("second version = %q", second)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "config."+second+".yaml"), []byte("second"), 0o644); err != nil {
+		t.Fatalf("write second backup: %v", err)
+	}
+	if third := nextConfigVersion(backupDir, now); third != "20260802-101112-002" {
+		t.Fatalf("third version = %q", third)
+	}
+}
+
 func TestHandleConfigHashReturnsHashAndNoPath(t *testing.T) {
 	configPath := writeDeployTestBaseConfig(t)
-	apiServer := &ClassificationAPIServer{configPath: configPath}
+	activeCfg, err := config.Parse(configPath)
+	if err != nil {
+		t.Fatalf("parse active config: %v", err)
+	}
+	apiServer := &ClassificationAPIServer{configPath: configPath, config: activeCfg}
 
-	req := httptest.NewRequest(http.MethodGet, "/config/hash", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/hash", nil)
 	rr := httptest.NewRecorder()
 	apiServer.handleConfigHash(rr, req)
 
@@ -321,16 +485,22 @@ func TestHandleConfigHashReturnsHashAndNoPath(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	var resp map[string]string
+	var resp configHashResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal response: %v", err)
 	}
 
-	hash, ok := resp["hash"]
-	if !ok || len(hash) != 64 {
-		t.Fatalf("expected 64-char hex hash, got %q", hash)
+	if len(resp.SourceConfigHash) != 64 || len(resp.GeneratedRuntimeHash) != 64 {
+		t.Fatalf("expected source and runtime hashes, got %+v", resp)
 	}
-	if _, hasPath := resp["path"]; hasPath {
+	if resp.ActivationStatus != "active" {
+		t.Fatalf("expected active status, got %+v", resp)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("json.Unmarshal raw response: %v", err)
+	}
+	if _, hasPath := raw["path"]; hasPath {
 		t.Error("response should not expose filesystem path")
 	}
 }
@@ -338,7 +508,7 @@ func TestHandleConfigHashReturnsHashAndNoPath(t *testing.T) {
 func TestHandleConfigHashErrorsWithoutConfigPath(t *testing.T) {
 	apiServer := &ClassificationAPIServer{configPath: ""}
 
-	req := httptest.NewRequest(http.MethodGet, "/config/hash", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/hash", nil)
 	rr := httptest.NewRecorder()
 	apiServer.handleConfigHash(rr, req)
 
@@ -353,18 +523,170 @@ func TestHandleConfigHashStableForSameContent(t *testing.T) {
 
 	hashes := make([]string, 2)
 	for i := range hashes {
-		req := httptest.NewRequest(http.MethodGet, "/config/hash", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/config/hash", nil)
 		rr := httptest.NewRecorder()
 		apiServer.handleConfigHash(rr, req)
 
-		var resp map[string]string
+		var resp configHashResponse
 		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("json.Unmarshal: %v", err)
 		}
-		hashes[i] = resp["hash"]
+		hashes[i] = resp.SourceConfigHash
 	}
 
 	if hashes[0] != hashes[1] {
 		t.Fatalf("expected identical hashes for unchanged config, got %q vs %q", hashes[0], hashes[1])
+	}
+}
+
+func TestHandleConfigHashReportsPendingRuntime(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	registry := routerruntime.NewRegistry(&config.RouterConfig{DocumentHash: "previous-runtime"})
+	apiServer := &ClassificationAPIServer{configPath: configPath, runtimeRegistry: registry}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/hash", nil)
+	rr := httptest.NewRecorder()
+	apiServer.handleConfigHash(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp configHashResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal response: %v", err)
+	}
+	if resp.ActivationStatus != "pending" || resp.ActiveRuntimeHash != "previous-runtime" {
+		t.Fatalf("expected pending runtime status, got %+v", resp)
+	}
+}
+
+func TestWaitForRuntimeConfigActivationRecognizesPublishedDocument(t *testing.T) {
+	configPath := writeDeployTestBaseConfig(t)
+	activeCfg, err := config.Parse(configPath)
+	if err != nil {
+		t.Fatalf("parse active config: %v", err)
+	}
+	registry := routerruntime.NewRegistry(activeCfg)
+	apiServer := &ClassificationAPIServer{configPath: configPath, runtimeRegistry: registry}
+
+	generatedDocument, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated document: %v", err)
+	}
+	runtimeHash, status := apiServer.waitForRuntimeConfigActivation(configPath, generatedDocument, 0)
+	if status != "active" || runtimeHash != activeCfg.DocumentHash {
+		t.Fatalf("activation result = (%q, %q), want (%q, active)", runtimeHash, status, activeCfg.DocumentHash)
+	}
+}
+
+func TestConfigVersionSourceMetadataUsesCanonicalOrigins(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	server := &ClassificationAPIServer{}
+	privateBackupDir := filepath.Join(tempDir, ".vllm-sr", "config-backups")
+	if err := os.MkdirAll(privateBackupDir, 0o755); err != nil {
+		t.Fatalf("create permissive backup directory: %v", err)
+	}
+	if err := os.Chmod(privateBackupDir, 0o755); err != nil {
+		t.Fatalf("set permissive backup directory mode: %v", err)
+	}
+
+	apiVersion, backupDir, backupErr := server.recordRouterConfigArtifacts(configPath, []byte("version: v0.5\n"))
+	if backupErr != nil {
+		t.Fatal(backupErr)
+	}
+	if got := readConfigVersionSource(backupDir, apiVersion); got != configVersionSourceAPI {
+		t.Fatalf("API backup source = %q, want %q", got, configVersionSourceAPI)
+	}
+	assertPrivatePathMode(t, backupDir, 0o700)
+	assertPrivatePathMode(t, filepath.Join(backupDir, "config."+apiVersion+".yaml"), 0o600)
+	assertPrivatePathMode(t, configVersionSourcePath(backupDir, apiVersion), 0o600)
+
+	unknownVersion := "20260802-120000"
+	if got := readConfigVersionSource(backupDir, unknownVersion); got != configVersionSourceUnknown {
+		t.Fatalf("backup without metadata source = %q, want %q", got, configVersionSourceUnknown)
+	}
+}
+
+func assertPrivatePathMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode for %s = %#o, want %#o", path, got, want)
+	}
+}
+
+func TestConfigCleanupBackupsRemovesSourceSidecar(t *testing.T) {
+	backupDir := t.TempDir()
+	for i := 0; i <= maxBackups; i++ {
+		version := fmt.Sprintf("20260802-1200%02d", i)
+		if err := os.WriteFile(
+			filepath.Join(backupDir, fmt.Sprintf("config.%s.yaml", version)),
+			[]byte("version: v0.5\n"),
+			0o644,
+		); err != nil {
+			t.Fatalf("write backup: %v", err)
+		}
+		if sourceErr := writeConfigVersionSource(backupDir, version, configVersionSourceAPI); sourceErr != nil {
+			t.Fatal(sourceErr)
+		}
+	}
+
+	configCleanupBackups(backupDir)
+	oldest := "20260802-120000"
+	if _, err := os.Stat(configVersionSourcePath(backupDir, oldest)); !os.IsNotExist(err) {
+		t.Fatalf("oldest source sidecar should be removed, stat err=%v", err)
+	}
+}
+
+func minimalDeployTestConfig(decisionName string) *config.RouterConfig {
+	return &config.RouterConfig{
+		APIServer: config.APIServer{
+			Listeners: []config.Listener{{
+				Name:    "http-8899",
+				Address: "0.0.0.0",
+				Port:    8899,
+				Timeout: "120s",
+			}},
+		},
+		BackendModels: config.BackendModels{
+			DefaultModel: "qwen-test",
+			ModelConfig: map[string]config.ModelParams{
+				"qwen-test": {},
+			},
+			VLLMEndpoints: []config.VLLMEndpoint{{
+				Name:     "primary",
+				Address:  "vllm",
+				Port:     8000,
+				Protocol: "http",
+				Model:    "qwen-test",
+				Weight:   1,
+			}},
+		},
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				Categories: []config.Category{{
+					Name: "math",
+				}},
+			},
+			Decisions: []config.Decision{{
+				Name:     decisionName,
+				Priority: 100,
+				Tier:     1,
+				Rules: config.RuleCombination{
+					Operator: "AND",
+					Conditions: []config.RuleNode{{
+						Type: "domain",
+						Name: "math",
+					}},
+				},
+				ModelRefs: []config.ModelRef{{
+					Model: "qwen-test",
+				}},
+			}},
+		},
 	}
 }

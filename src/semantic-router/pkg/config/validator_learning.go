@@ -3,20 +3,67 @@ package config
 import (
 	"fmt"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 )
 
-func validateRouterLearningConfig(cfg *RouterConfig) error {
+func validateGlobalRouterLearningConfig(cfg *RouterConfig) error {
 	if cfg == nil {
 		return nil
 	}
 	if err := validateRouterLearningAdaptationConfig(cfg.RouterLearning.Adaptation); err != nil {
 		return err
 	}
-	if err := validateRouterLearningProtectionConfig(cfg.RouterLearning.Protection); err != nil {
+	if err := validateRouterLearningProtectionConfig(cfg.RouterLearning.Protection, cfg.Headers.SessionIDHeaderNames()); err != nil {
 		return err
 	}
-	for _, decision := range cfg.Decisions {
-		if err := validateDecisionAdaptationsConfig(decision.Name, decision.Adaptations); err != nil {
+	return validateRouterLearningStateStoreConfig(cfg.RouterLearning.StateStore)
+}
+
+func validateRouterLearningStateStoreConfig(cfg RouterLearningStateStoreConfig) error {
+	switch strings.TrimSpace(cfg.Backend) {
+	case "", "local":
+	case "redis":
+		if strings.TrimSpace(cfg.Redis.Address) == "" {
+			return fmt.Errorf("global.router.learning.state_store.redis.address is required for redis backend")
+		}
+	default:
+		return fmt.Errorf(
+			"global.router.learning.state_store.backend must be %q or %q",
+			"local",
+			"redis",
+		)
+	}
+	if cfg.TTLSeconds < 0 {
+		return fmt.Errorf("global.router.learning.state_store.ttl_seconds cannot be negative")
+	}
+	if cfg.TimeoutMS < 0 {
+		return fmt.Errorf("global.router.learning.state_store.timeout_ms cannot be negative")
+	}
+	return nil
+}
+
+func validateDecisionRouterLearningConfig(cfg *RouterConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, ref := range cfg.RoutingDecisionRefs() {
+		if ref.Decision == nil {
+			continue
+		}
+		if ref.Decision.Tier < 0 {
+			return fmt.Errorf(
+				"recipe %q decision %q: tier cannot be negative",
+				ref.Recipe,
+				ref.Decision.Name,
+			)
+		}
+		if err := validateDecisionAdaptationsConfig(
+			ref.Decision.Name,
+			ref.Decision.Adaptations,
+		); err != nil {
 			return err
 		}
 	}
@@ -42,7 +89,7 @@ func validateRouterLearningAdaptationConfig(cfg RouterLearningAdaptationConfig) 
 	return nil
 }
 
-func validateRouterLearningProtectionConfig(cfg RouterLearningProtectionConfig) error {
+func validateRouterLearningProtectionConfig(cfg RouterLearningProtectionConfig, sessionHeaders []string) error {
 	if err := validateProtectionScope(
 		"global.router.learning.protection.scope",
 		cfg.Scope,
@@ -55,6 +102,12 @@ func validateRouterLearningProtectionConfig(cfg RouterLearningProtectionConfig) 
 	}
 	if cfg.Identity.Headers.Conversation != nil && strings.TrimSpace(*cfg.Identity.Headers.Conversation) == "" {
 		return fmt.Errorf("global.router.learning.protection.identity.headers.conversation cannot be empty")
+	}
+	if cfg.Identity.Headers.Agent != nil && strings.TrimSpace(*cfg.Identity.Headers.Agent) == "" {
+		return fmt.Errorf("global.router.learning.protection.identity.headers.agent cannot be empty")
+	}
+	if err := validateProtectionRelease(cfg, sessionHeaders); err != nil {
+		return err
 	}
 
 	return validateProtectionTuning(
@@ -89,6 +142,63 @@ func validateProtectionTuning(prefix string, tuning RouterLearningProtectionTuni
 		{prefix + ".stability_weight", tuning.StabilityWeight},
 	}); err != nil {
 		return err
+	}
+	return validateProgressGateTuning(prefix+".progress_gate", tuning.ProgressGate)
+}
+
+// validateProgressGateTuning checks the switch-gate knobs, including the two
+// relationships the gate depends on: the escalation threshold must not be
+// easier than the downgrade threshold (that ordering is what produces
+// hysteresis), and the window cannot require more evidence than it can hold.
+func validateProgressGateTuning(prefix string, cfg *ProgressGateTuning) error {
+	if cfg == nil {
+		return nil
+	}
+	switch strings.TrimSpace(cfg.Mode) {
+	case "", "observe", "enforce":
+	default:
+		return fmt.Errorf("%s.mode must be observe or enforce, got %q", prefix, cfg.Mode)
+	}
+	if err := validateOptionalNonNegativeIntFields([]optionalNonNegativeIntField{
+		{prefix + ".window_size", cfg.WindowSize},
+		{prefix + ".window_ttl_seconds", cfg.WindowTTLSeconds},
+		{prefix + ".min_window_outcomes", cfg.MinWindowOutcomes},
+		{prefix + ".min_consecutive_regressions", cfg.MinConsecutiveRegressions},
+		{prefix + ".min_consecutive_recoveries", cfg.MinConsecutiveRecoveries},
+		{prefix + ".max_switches_per_window", cfg.MaxSwitchesPerWindow},
+	}); err != nil {
+		return err
+	}
+	if err := validateOptionalNonNegativeFloatFields([]optionalNonNegativeFloatField{
+		{prefix + ".cooldown_seconds", cfg.CooldownSeconds},
+	}); err != nil {
+		return err
+	}
+	effective := cfg.EffectiveConfig()
+	if effective.WindowSize < 1 || effective.WindowSize > 256 {
+		return fmt.Errorf("%s.window_size must be between 1 and 256", prefix)
+	}
+	if effective.WindowTTLSeconds < 1 || effective.WindowTTLSeconds > 86400 {
+		return fmt.Errorf("%s.window_ttl_seconds must be between 1 and 86400", prefix)
+	}
+	if effective.MaxSwitchesPerWindow > 256 {
+		return fmt.Errorf("%s.max_switches_per_window must not exceed 256", prefix)
+	}
+	if effective.MinWindowOutcomes > effective.WindowSize ||
+		effective.MinConsecutiveRegressions > effective.WindowSize || effective.MinConsecutiveRecoveries > effective.WindowSize {
+		return fmt.Errorf("%s evidence thresholds must not exceed window_size", prefix)
+	}
+	if effective.MinConsecutiveRegressions < effective.MinConsecutiveRecoveries {
+		return fmt.Errorf("%s.min_consecutive_regressions must be at least min_consecutive_recoveries", prefix)
+	}
+	if effective.CalibrationID != "" {
+		name, version, ok := strings.Cut(effective.CalibrationID, "@")
+		if !ok || name == "" || version == "" || strings.ContainsAny(effective.CalibrationID, " \t\n\r") {
+			return fmt.Errorf("%s.calibration_id must identify an external profile as name@version", prefix)
+		}
+	}
+	if effective.Enabled && effective.Mode == "enforce" && effective.CalibrationID == "" {
+		return fmt.Errorf("%s.calibration_id is required in enforce mode", prefix)
 	}
 	return nil
 }
@@ -206,36 +316,6 @@ func validateDecisionAdaptationMode(decisionName string, field string, mode stri
 	}
 }
 
-func isSessionAwareSelectionConfigConfigured(cfg SessionAwareSelectionConfig) bool {
-	return cfg.BaseMethod != "" || anyTrue(
-		cfg.IdleTimeoutSeconds != nil,
-		cfg.MinTurnsBeforeSwitch != nil,
-		cfg.SwitchMargin != nil,
-		cfg.StayBias != nil,
-		cfg.ToolLoopHardLock != nil,
-		cfg.ContextPortabilityHardLock != nil,
-		cfg.DecisionDriftReset != nil,
-		cfg.ToolLoopStayBias != nil,
-		cfg.PrefixCacheWeight != nil,
-		cfg.HandoffPenaltyWeight != nil,
-		cfg.DefaultHandoffPenalty != nil,
-		cfg.QualityGapMultiplier != nil,
-		cfg.MaxCacheCostMultiplier != nil,
-		cfg.SwitchHistoryWeight != nil,
-		cfg.RemainingTurnPriorWeight != nil,
-		cfg.RemainingTurnPriorHorizon != nil,
-		cfg.MinRemainingTurnPriorSamples != nil,
-	)
-}
-
-func isModelSwitchGateConfigured(cfg ModelSwitchGateConfig) bool {
-	return cfg.Enabled ||
-		cfg.Mode != "" ||
-		cfg.MinSwitchAdvantage != 0 ||
-		cfg.DefaultHandoffPenalty != 0 ||
-		cfg.CacheWarmthWeight != 0
-}
-
 func isLookupTableConfigConfigured(cfg LookupTableConfig) bool {
 	return cfg.Enabled ||
 		cfg.StoragePath != "" ||
@@ -247,22 +327,52 @@ func isLookupTableConfigConfigured(cfg LookupTableConfig) bool {
 		len(cfg.RemainingTurnPriors) > 0
 }
 
-func isEloSelectionConfigConfigured(cfg EloSelectionConfig) bool {
-	return cfg.InitialRating != 0 ||
-		cfg.KFactor != 0 ||
-		cfg.CategoryWeighted ||
-		cfg.DecayFactor != 0 ||
-		cfg.MinComparisons != 0 ||
-		cfg.CostScalingFactor != 0 ||
-		cfg.StoragePath != "" ||
-		cfg.AutoSaveInterval != ""
+// validateProtectionRelease checks the release header against the headers
+// protection reads identity from; sessionHeaders carry the session id when
+// identity.headers.session names none.
+func validateProtectionRelease(cfg RouterLearningProtectionConfig, sessionHeaders []string) error {
+	const field = "global.router.learning.protection.release"
+	release := cfg.Release
+	if release.Header != nil {
+		header := strings.TrimSpace(*release.Header)
+		if header == "" {
+			return fmt.Errorf("%s.header cannot be empty", field)
+		}
+		if !httpguts.ValidHeaderFieldName(header) {
+			return fmt.Errorf("%s.header %q is not a valid header name", field, header)
+		}
+	}
+	header := release.EffectiveHeader()
+	if protectionReleaseHeaderReserved(header) {
+		return fmt.Errorf("%s.header %q is reserved; use an x- header the router can remove before the backend", field, header)
+	}
+	for _, identity := range []string{"session", "conversation", "agent"} {
+		names := []string{cfg.HeaderName(identity)}
+		if identity == "session" && names[0] == "" {
+			names = sessionHeaders
+		}
+		for _, name := range names {
+			if strings.EqualFold(header, name) {
+				return fmt.Errorf("%s.header %q must differ from identity header %s", field, header, identity)
+			}
+		}
+	}
+	if release.MinUserTurnsBetween != nil && *release.MinUserTurnsBetween < 0 {
+		return fmt.Errorf("%s.min_user_turns_between must be >= 0, got %d", field, *release.MinUserTurnsBetween)
+	}
+	return nil
 }
 
-func anyTrue(values ...bool) bool {
-	for _, value := range values {
-		if value {
+// protectionReleaseHeaderReserved rejects names whose removal before the backend
+// would break a standard, credential, gateway or router control header.
+func protectionReleaseHeaderReserved(header string) bool {
+	if !strings.HasPrefix(header, headers.ExtensionPrefix) || IsShadowCredentialHeader(header) || header == headers.RequestID {
+		return true
+	}
+	for _, prefix := range []string{headers.EnvoyPrefix, headers.AuthzPrefix, headers.ForwardedPrefix} {
+		if strings.HasPrefix(header, prefix) {
 			return true
 		}
 	}
-	return false
+	return strings.HasPrefix(header, headers.VSRPrefix) && header != headers.VSRProtectionRelease
 }

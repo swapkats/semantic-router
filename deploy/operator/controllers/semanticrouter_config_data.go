@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,15 +31,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	vllmv1alpha1 "github.com/vllm-project/semantic-router/operator/api/v1alpha1"
-	"gopkg.in/yaml.v3"
 )
 
 func (r *SemanticRouterReconciler) reconcileConfigMap(ctx context.Context, sr *vllmv1alpha1.SemanticRouter) error {
-	if err := validateSemanticCacheConfig(sr.Spec.Config.SemanticCache); err != nil {
-		return fmt.Errorf("invalid semantic cache configuration: %w", err)
+	responseCache, err := operatorResponseCacheConfig(sr.Spec.Config)
+	if err != nil {
+		return err
+	}
+	if err = validateSemanticCacheConfig(responseCache); err != nil {
+		return fmt.Errorf("invalid response cache configuration: %w", err)
 	}
 
-	if err := r.resolveSemanticCacheSecrets(ctx, sr); err != nil {
+	if err = r.resolveSemanticCacheSecrets(ctx, sr); err != nil {
 		return fmt.Errorf("failed to resolve cache secrets: %w", err)
 	}
 
@@ -63,7 +67,7 @@ func (r *SemanticRouterReconciler) reconcileConfigMap(ctx context.Context, sr *v
 		},
 	}
 
-	if err := controllerutil.SetControllerReference(sr, cm, r.Scheme); err != nil {
+	if err = controllerutil.SetControllerReference(sr, cm, r.Scheme); err != nil {
 		return err
 	}
 

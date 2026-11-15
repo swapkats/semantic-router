@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
@@ -6,8 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/redis/go-redis/v9"
-
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/startupstatus"
 )
 
@@ -39,20 +38,20 @@ func (s *ClassificationAPIServer) loadStartupState() *startupstatus.State {
 	if s.startupStateLoader != nil {
 		return s.startupStateLoader()
 	}
+	if s.runtimeRegistry != nil {
+		return s.runtimeRegistry.StartupState()
+	}
 
-	cfg := s.config
-	if cfg != nil && cfg.StartupStatus.StoreBackend == "redis" && cfg.StartupStatus.Redis != nil {
-		client := redis.NewClient(&redis.Options{
-			Addr:     cfg.StartupStatus.Redis.Address,
-			Password: cfg.StartupStatus.Redis.Password,
-			DB:       cfg.StartupStatus.Redis.DB,
-		})
-		defer func() { _ = client.Close() }()
-
-		state, err := startupstatus.LoadFromRedis(client)
-		if err == nil {
-			return state
-		}
+	var startupConfig *config.StartupStatusConfig
+	if s.startupStatusConfig != nil {
+		startupConfig = s.startupStatusConfig
+	} else if cfg := s.currentConfig(); cfg != nil {
+		startupConfig = &cfg.StartupStatus
+	}
+	if startupConfig != nil && startupConfig.StoreBackend == "redis" {
+		// Without a local registry or an explicit loader, no replica identity is
+		// known. Never substitute a neighbor or a stale file for Redis status.
+		return nil
 	}
 
 	state, _ := startupstatus.Load(startupstatus.StatusPathFromConfigPath(s.configPath))

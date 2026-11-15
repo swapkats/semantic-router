@@ -8,9 +8,7 @@ import (
 
 func TestEvaluateDecisionsWithTrace_BasicLeaf(t *testing.T) {
 	engine := NewDecisionEngine(
-		[]config.KeywordRule{{Name: "code_help", Keywords: []string{"code"}}},
-		nil,
-		nil,
+
 		[]config.Decision{
 			{
 				Name:     "code_route",
@@ -21,14 +19,13 @@ func TestEvaluateDecisionsWithTrace_BasicLeaf(t *testing.T) {
 				},
 			},
 		},
-		"priority",
-	)
+		"priority")
 
 	signals := &SignalMatches{
 		KeywordRules: []string{"code_help"},
 	}
 
-	result, traces := engine.EvaluateDecisionsWithTrace(signals)
+	result, traces, _, _ := engine.EvaluateDecisionsWithTraceAndDiagnostics(signals)
 	if result == nil {
 		t.Fatal("expected a decision result")
 	}
@@ -52,14 +49,27 @@ func TestEvaluateDecisionsWithTrace_BasicLeaf(t *testing.T) {
 	}
 }
 
+func TestEvaluateDecisionsWithTrace_OmittedRulesFallback(t *testing.T) {
+	engine := NewDecisionEngine([]config.Decision{{
+		Name:     "default-route",
+		Priority: 10,
+	}}, config.RoutingStrategyPriority)
+
+	result, traces, _, _ := engine.EvaluateDecisionsWithTraceAndDiagnostics(&SignalMatches{})
+	if result == nil || result.Decision.Name != "default-route" {
+		t.Fatalf("result = %#v, want default-route", result)
+	}
+	if len(traces) != 1 || traces[0].RootTrace == nil {
+		t.Fatalf("traces = %#v, want one root trace", traces)
+	}
+	if traces[0].RootTrace.NodeType != "fallback" || !traces[0].RootTrace.Matched {
+		t.Fatalf("root trace = %#v, want matched fallback", traces[0].RootTrace)
+	}
+}
+
 func TestEvaluateDecisionsWithTrace_ANDWithOneFailing(t *testing.T) {
 	engine := NewDecisionEngine(
-		[]config.KeywordRule{
-			{Name: "code_help", Keywords: []string{"code"}},
-			{Name: "math_help", Keywords: []string{"math"}},
-		},
-		nil,
-		nil,
+
 		[]config.Decision{
 			{
 				Name:     "both_route",
@@ -73,14 +83,13 @@ func TestEvaluateDecisionsWithTrace_ANDWithOneFailing(t *testing.T) {
 				},
 			},
 		},
-		"priority",
-	)
+		"priority")
 
 	signals := &SignalMatches{
 		KeywordRules: []string{"code_help"},
 	}
 
-	result, traces := engine.EvaluateDecisionsWithTrace(signals)
+	result, traces, _, _ := engine.EvaluateDecisionsWithTraceAndDiagnostics(signals)
 	if result != nil {
 		t.Error("expected no match when one AND branch fails")
 	}
@@ -107,12 +116,7 @@ func TestEvaluateDecisionsWithTrace_ANDWithOneFailing(t *testing.T) {
 
 func TestEvaluateDecisionsWithTrace_MultipleDecisions(t *testing.T) {
 	engine := NewDecisionEngine(
-		[]config.KeywordRule{
-			{Name: "code_help", Keywords: []string{"code"}},
-			{Name: "math_help", Keywords: []string{"math"}},
-		},
-		nil,
-		nil,
+
 		[]config.Decision{
 			{
 				Name:     "code_route",
@@ -131,14 +135,13 @@ func TestEvaluateDecisionsWithTrace_MultipleDecisions(t *testing.T) {
 				},
 			},
 		},
-		"priority",
-	)
+		"priority")
 
 	signals := &SignalMatches{
 		KeywordRules: []string{"code_help"},
 	}
 
-	result, traces := engine.EvaluateDecisionsWithTrace(signals)
+	result, traces, _, _ := engine.EvaluateDecisionsWithTraceAndDiagnostics(signals)
 	if result == nil {
 		t.Fatal("expected a result")
 	}

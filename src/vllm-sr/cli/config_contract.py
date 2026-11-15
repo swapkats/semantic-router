@@ -4,50 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
-CANONICAL_VERSION = "v0.3"
+from cli.config_schema import routing_surface_catalog
 
-CANONICAL_TOP_LEVEL_KEYS = frozenset(
-    {
-        "version",
-        "listeners",
-        "providers",
-        "routing",
-        "global",
-        "setup",
-    }
-)
+CANONICAL_VERSION = str(routing_surface_catalog()["config_version"])
 
-LEGACY_PROVIDER_DEFAULT_KEYS = (
-    "default_model",
-    "reasoning_families",
-    "default_reasoning_effort",
-)
+UNKNOWN_POLICY_VALUES = ("no_match", "match", "fail_request")
+UnknownPolicy = Literal["no_match", "match", "fail_request"]
 
-LEGACY_PROVIDER_KEYS = frozenset(
-    {
-        *LEGACY_PROVIDER_DEFAULT_KEYS,
-        "model_config",
-        "vllm_endpoints",
-        "provider_profiles",
-    }
-)
+# Fusion panel-level quorum-failure policy. Values MUST match the Go contract in
+# pkg/config/fusion_config.go (FusionQuorumFailurePolicies).
+QUORUM_FAILURE_POLICY_VALUES = ("fail", "fallback")
+QuorumFailurePolicy = Literal["fail", "fallback"]
 
-LEGACY_PROVIDER_MODEL_SURFACE_KEYS = frozenset(
-    {
-        "endpoints",
-        "access_key",
-        "param_size",
-        "context_window_size",
-        "description",
-        "capabilities",
-        "loras",
-        "quality_score",
-        "modality",
-        "tags",
-    }
-)
+CONDITION_TYPE_DOMAIN = "domain"
+CONDITION_TYPE_PROJECTION = "projection"
 
 
 @dataclass(frozen=True)
@@ -57,50 +29,35 @@ class SignalFamilySpec:
     canonical_key: str
     signal_attr: str
     condition_type: str
-    legacy_key: str | None = None
-    reference_suffixes: tuple[str, ...] = ()
+    display_name: str
 
 
-SIGNAL_FAMILY_SPECS = (
-    SignalFamilySpec("keywords", "keywords", "keyword", "keyword_rules"),
-    SignalFamilySpec("embeddings", "embeddings", "embedding", "embedding_rules"),
-    SignalFamilySpec("domains", "domains", "domain", "categories"),
-    SignalFamilySpec("fact_check", "fact_check", "fact_check", "fact_check_rules"),
+@dataclass(frozen=True)
+class ProjectionFamilySpec:
+    """Canonical inventory for one derived-routing collection."""
+
+    canonical_key: str
+    projection_attr: str
+    display_name: str
+
+
+SIGNAL_FAMILY_SPECS = tuple(
     SignalFamilySpec(
-        "user_feedbacks",
-        "user_feedbacks",
-        "user_feedback",
-        "user_feedback_rules",
-    ),
-    SignalFamilySpec("reasks", "reasks", "reask", "reask_rules"),
-    SignalFamilySpec("preferences", "preferences", "preference", "preference_rules"),
-    SignalFamilySpec("language", "language", "language", "language_rules"),
-    SignalFamilySpec("context", "context", "context", "context_rules"),
-    SignalFamilySpec("structure", "structure", "structure", "structure_rules"),
-    SignalFamilySpec(
-        "complexity",
-        "complexity",
-        "complexity",
-        "complexity_rules",
-        ("easy", "medium", "hard"),
-    ),
-    SignalFamilySpec("modality", "modality", "modality", "modality_rules"),
-    SignalFamilySpec("role_bindings", "role_bindings", "authz", "role_bindings"),
-    SignalFamilySpec("jailbreak", "jailbreak", "jailbreak", "jailbreak"),
-    SignalFamilySpec("pii", "pii", "pii", "pii"),
-    SignalFamilySpec("kb", "kb", "kb", "kb"),
-    SignalFamilySpec("conversation", "conversation", "conversation", "conversation"),
-    SignalFamilySpec("events", "events", "event", "events"),
+        canonical_key=surface["collection"],
+        signal_attr=surface["collection"],
+        condition_type=surface["type"],
+        display_name=surface["display_name"],
+    )
+    for surface in routing_surface_catalog()["signals"]
 )
 
-LEGACY_SIGNAL_KEY_TO_CANONICAL = {
-    spec.legacy_key: spec.canonical_key
-    for spec in SIGNAL_FAMILY_SPECS
-    if spec.legacy_key is not None
-}
-
-LEGACY_ROUTING_KEYS = frozenset(
-    {"signals", "decisions", *LEGACY_SIGNAL_KEY_TO_CANONICAL}
+PROJECTION_FAMILY_SPECS = tuple(
+    ProjectionFamilySpec(
+        canonical_key=surface["collection"],
+        projection_attr=surface["collection"],
+        display_name=surface["display_name"],
+    )
+    for surface in routing_surface_catalog()["projections"]
 )
 
 _SIGNAL_FAMILY_BY_CONDITION_TYPE = {
@@ -108,33 +65,43 @@ _SIGNAL_FAMILY_BY_CONDITION_TYPE = {
 }
 
 
-def iter_named_signal_entries(signals: Any) -> Iterable[tuple[str, str]]:
-    """Yield canonical signal family keys and declared signal names."""
-    if not signals:
-        return
-    for spec in SIGNAL_FAMILY_SPECS:
-        for signal in getattr(signals, spec.signal_attr, None) or []:
-            name = getattr(signal, "name", None)
-            if name:
-                yield spec.canonical_key, name
+def iter_routing_profiles(config: Any) -> Iterable[tuple[str, Any]]:
+    """Yield each recipe by name; a document without recipes routes through an
+    empty recipe named default."""
+    if not config.recipes:
+        yield "default", config.default_recipe
+    for recipe in config.recipes:
+        yield recipe.name, recipe
 
 
-def build_signal_reference_index(signals: Any) -> set[str]:
-    """Build the valid decision reference names for declared signals."""
-    names: set[str] = set()
+def iter_condition_leaves(conditions: Any) -> Iterable[Any]:
+    """Yield leaf conditions from a nested decision expression."""
+    for condition in conditions or ():
+        children = getattr(condition, "conditions", None)
+        if children:
+            yield from iter_condition_leaves(children)
+        else:
+            yield condition
+
+
+# The Router emits a matched role binding's role, never the binding's name, so
+# authz conditions reference the role.
+_SIGNAL_REFERENCE_FIELDS = {"role_bindings": "role"}
+
+
+def build_signal_reference_index(signals: Any) -> dict[str, set[str]]:
+    """Index valid decision references by canonical condition type."""
+    names: dict[str, set[str]] = {}
     if not signals:
         return names
 
     for spec in SIGNAL_FAMILY_SPECS:
+        family_names = names.setdefault(spec.condition_type, set())
+        field = _SIGNAL_REFERENCE_FIELDS.get(spec.signal_attr, "name")
         for signal in getattr(signals, spec.signal_attr, None) or []:
-            name = getattr(signal, "name", None)
-            if not name:
-                continue
-            if spec.reference_suffixes:
-                for suffix in spec.reference_suffixes:
-                    names.add(f"{name}:{suffix}")
-                continue
-            names.add(name)
+            name = getattr(signal, field, None)
+            if name:
+                family_names.add(name)
 
     return names
 
@@ -162,7 +129,9 @@ def is_signal_condition_type(condition_type: str | None) -> bool:
 
 
 def signal_reference_exists(
-    signal_names: set[str], condition_type: str | None, raw_name: str | None
+    signal_names: dict[str, set[str]],
+    condition_type: str | None,
+    raw_name: str | None,
 ) -> bool:
     """Return whether a decision condition references a known signal."""
     if not raw_name or not is_signal_condition_type(condition_type):
@@ -170,6 +139,5 @@ def signal_reference_exists(
 
     normalized_type = condition_type.strip().lower()
     spec = _SIGNAL_FAMILY_BY_CONDITION_TYPE[normalized_type]
-    if spec.reference_suffixes:
-        return raw_name in signal_names
-    return raw_name.split(":", 1)[0] in signal_names
+    family_names = signal_names.get(spec.condition_type, set())
+    return raw_name in family_names

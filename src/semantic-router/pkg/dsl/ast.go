@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/alecthomas/participle/v2/lexer"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 // Position represents a source location.
@@ -32,11 +34,48 @@ type rawProgram struct {
 // rawTopLevel is a union for top-level declarations.
 type rawTopLevel struct {
 	Pos          lexer.Position
-	Signal       *rawSignalDecl       `parser:"  @@"`
+	Routing      *rawRoutingDecl      `parser:"  @@"`
+	Entrypoint   *rawEntrypointDecl   `parser:"| @@"`
+	Recipe       *rawRecipeDecl       `parser:"| @@"`
+	Signal       *rawSignalDecl       `parser:"| @@"`
 	Projection   *rawProjectionDecl   `parser:"| @@"`
 	Route        *rawRouteDecl        `parser:"| @@"`
 	DecisionTree *rawDecisionTreeDecl `parser:"| @@"`
 	Model        *rawModelDecl        `parser:"| @@"`
+	Plugin       *rawPluginDecl       `parser:"| @@"`
+	TestBlock    *rawTestBlockDecl    `parser:"| @@"`
+}
+
+// rawRoutingDecl configures the ordering strategy for the current routing
+// scope. At the top level it describes the default profile; inside RECIPE it
+// applies only to that recipe.
+type rawRoutingDecl struct {
+	Pos    lexer.Position
+	Fields []*FieldEntry `parser:"'ROUTING' '{' @@* '}'"`
+}
+
+// rawEntrypointDecl binds one or more request-facing model IDs to a recipe.
+type rawEntrypointDecl struct {
+	Pos    lexer.Position
+	Fields []*FieldEntry `parser:"'ENTRYPOINT' '{' @@* '}'"`
+}
+
+// rawRecipeDecl owns a complete, isolated routing program. MODEL declarations
+// intentionally remain top-level because the runtime model catalog is shared.
+type rawRecipeDecl struct {
+	Pos  lexer.Position
+	Name string            `parser:"'RECIPE' @(Ident | String)"`
+	Opts []*RouteOpt       `parser:"( '(' @@* ')' )?"`
+	Body []*rawRecipeEntry `parser:"'{' @@* '}'"`
+}
+
+type rawRecipeEntry struct {
+	Pos          lexer.Position
+	Routing      *rawRoutingDecl      `parser:"  @@"`
+	Signal       *rawSignalDecl       `parser:"| @@"`
+	Projection   *rawProjectionDecl   `parser:"| @@"`
+	Route        *rawRouteDecl        `parser:"| @@"`
+	DecisionTree *rawDecisionTreeDecl `parser:"| @@"`
 	Plugin       *rawPluginDecl       `parser:"| @@"`
 	TestBlock    *rawTestBlockDecl    `parser:"| @@"`
 }
@@ -111,16 +150,23 @@ type rawDecisionTreeItem struct {
 	Algorithm    *rawAlgoSpec         `parser:"| 'ALGORITHM' @@"`
 	Plugin       *rawPluginRef        `parser:"| 'PLUGIN' @@"`
 	CandidateFor *rawCandidateForDecl `parser:"| @@"`
-	Emit         *rawEmitDecl         `parser:"| @@"`
+	Retention    *rawRetentionDecl    `parser:"| @@"`
+	Output       *rawOutputDecl       `parser:"| @@"`
 }
 
-// rawEmitDecl: EMIT <kind> { fields... }. Currently only kind="retention" is
-// recognized by the validator, but the grammar accepts any identifier so the
-// validator can emit a friendly error rather than a parse error.
-type rawEmitDecl struct {
+// rawRetentionDecl: RETENTION { fields... }, the decision's retention. The
+// grammar accepts any field so the validator can name an unknown one.
+type rawRetentionDecl struct {
 	Pos    lexer.Position
-	Kind   string        `parser:"'EMIT' @Ident"`
-	Fields []*FieldEntry `parser:"'{' @@* '}'"`
+	Fields []*FieldEntry `parser:"'RETENTION' '{' @@* '}'"`
+}
+
+// rawOutputDecl: OUTPUT { kind: ..., action: ... }, the decision's output
+// contract. The grammar accepts any field so the validator can name an
+// unknown one.
+type rawOutputDecl struct {
+	Pos    lexer.Position
+	Fields []*FieldEntry `parser:"'OUTPUT' '{' @@* '}'"`
 }
 
 // rawModelDecl: MODEL <name> { fields... }
@@ -134,7 +180,7 @@ type rawModelDecl struct {
 type RouteOpt struct {
 	Pos   lexer.Position
 	Key   string `parser:"@Ident '='"`
-	Value *Val   `parser:"@@"`
+	Value *Val   `parser:"@@ ','?"`
 }
 
 // rawRouteItem: a single element inside a route body
@@ -147,8 +193,17 @@ type rawRouteItem struct {
 	Algorithm    *rawAlgoSpec         `parser:"| 'ALGORITHM' @@"`
 	Plugin       *rawPluginRef        `parser:"| 'PLUGIN' @@"`
 	Description  *string              `parser:"| 'DESCRIPTION' @String"`
+	Action       *rawActionDecl       `parser:"| 'ACTION' @@"`
 	CandidateFor *rawCandidateForDecl `parser:"| @@"`
-	Emit         *rawEmitDecl         `parser:"| @@"`
+	Retention    *rawRetentionDecl    `parser:"| @@"`
+	Output       *rawOutputDecl       `parser:"| @@"`
+}
+
+// rawActionDecl: ACTION <type> <destination>, e.g. ACTION route "safe-model".
+type rawActionDecl struct {
+	Pos         lexer.Position
+	Type        string `parser:"@Ident"`
+	Destination string `parser:"@(Ident | String)"`
 }
 
 // rawCandidateForDecl: FOR <var> IN decision.candidates|[models...] { body... }
@@ -237,11 +292,12 @@ type BoolFactor struct {
 	SignalRef *rawSignalRefExpr `parser:"| @@"`
 }
 
-// rawSignalRefExpr: signal_type("signal_name") or signal_type(signal_name)
+// rawSignalRefExpr: signal_type("signal_name", optional: fields)
 type rawSignalRefExpr struct {
 	Pos        lexer.Position
-	SignalType string `parser:"@Ident"`
-	SignalName string `parser:"'(' @(String | Ident) ')'"`
+	SignalType string        `parser:"@Ident"`
+	SignalName string        `parser:"'(' @(String | Ident)"`
+	Fields     []*FieldEntry `parser:"@@* ')'"`
 }
 
 // ---------- Field / Value (parsed by participle) ----------
@@ -256,13 +312,18 @@ type FieldEntry struct {
 // Val: value union (string, int, float, bool, array, object, bare ident)
 type Val struct {
 	Pos      lexer.Position
-	Str      *string       `parser:"  @String"`
-	Float    *float64      `parser:"| @Float"`
-	Int      *int          `parser:"| @Int"`
-	Bool     *string       `parser:"| @('true' | 'false')"`
-	ArrayVal *ArrayVal     `parser:"| @@"`
-	Object   []*FieldEntry `parser:"| '{' @@* '}'"`
-	BareStr  *string       `parser:"| @Ident"`
+	Str      *string    `parser:"  @String"`
+	Float    *float64   `parser:"| @Float"`
+	Int      *int       `parser:"| @Int"`
+	Bool     *string    `parser:"| @('true' | 'false')"`
+	ArrayVal *ArrayVal  `parser:"| @@"`
+	Object   *ObjectVal `parser:"| @@"`
+	BareStr  *string    `parser:"| @Ident"`
+}
+
+// ObjectVal preserves the presence of an empty object independently of its fields.
+type ObjectVal struct {
+	Fields []*FieldEntry `parser:"'{' @@* '}'"`
 }
 
 // ArrayVal wraps array parsing to handle empty arrays.
@@ -275,6 +336,14 @@ type ArrayVal struct {
 
 // Program is the root AST node, representing a complete DSL file.
 type Program struct {
+	CandidateRequirements *config.CandidateRequirements
+	ModelBindings         map[string]config.ModelBinding
+	// RecipePlugins are ROUTING plugins: the plugins every decision of the
+	// scope's recipe defaults to.
+	RecipePlugins        []config.DecisionPlugin
+	Strategy             string
+	Entrypoints          []*EntrypointDecl
+	Recipes              []*RecipeDecl
 	Signals              []*SignalDecl
 	ProjectionPartitions []*ProjectionPartitionDecl
 	ProjectionScores     []*ProjectionScoreDecl
@@ -283,6 +352,26 @@ type Program struct {
 	Models               []*ModelDecl
 	Plugins              []*PluginDecl
 	TestBlocks           []*TestBlockDecl
+}
+
+// EntrypointDecl is the DSL form of one request-facing recipe binding.
+// Default marks the entrypoint of the default recipe.
+type EntrypointDecl struct {
+	API        string
+	ModelNames []string
+	Recipe     string
+	Default    bool
+	Pos        Position
+}
+
+// RecipeDecl is an isolated routing scope. Program contains only recipe-local
+// signals, projections, plugins, decisions, and tests; models are resolved
+// from the parent Program.
+type RecipeDecl struct {
+	Name        string
+	Description string
+	Program     *Program
+	Pos         Position
 }
 
 // ProjectionPartitionDecl declares a mutually exclusive partition of signals.
@@ -309,11 +398,9 @@ type ProjectionScoreDecl struct {
 type ProjectionScoreInputDecl struct {
 	SignalType  string
 	SignalName  string
-	KB          string
-	Metric      string
 	Weight      float64
 	ValueSource string
-	Match       float64
+	Match       *float64
 	Miss        float64
 }
 
@@ -370,6 +457,8 @@ type SignalDecl struct {
 type RouteDecl struct {
 	Name                string
 	Description         string
+	OnUnknown           string
+	Action              *ActionDecl
 	Priority            int
 	Tier                int
 	When                BoolExpr
@@ -377,32 +466,43 @@ type RouteDecl struct {
 	Algorithm           *AlgoSpec
 	Plugins             []*PluginRef
 	CandidateIterations []*CandidateIterationDecl
-	Emits               []*EmitDecl
+	Retention           *RetentionDecl
+	Output              *OutputDecl
 	Pos                 Position
 }
 
-// EmitDecl is the resolved AST node for an EMIT block. The Retention pointer
-// is populated when Kind == "retention". Future Kind values (e.g. "log",
-// "metric") will add their own typed payload fields here.
-type EmitDecl struct {
-	Kind      string
-	Retention *RetentionDirective
-	// RawFields preserves the parsed EMIT payload for validation. The typed
-	// Retention field intentionally drops unknown or wrong-typed entries; the
-	// validator/compiler still need the raw entries so authoring mistakes are
-	// reported instead of being silently treated as an empty directive.
+// OutputDecl is the resolved AST node for a route's OUTPUT block: the kinds
+// its answers carry and its action, as written.
+type OutputDecl struct {
+	Kind   []string
+	Action string
+	// RawFields keep the parsed entries, so the validator and compiler report
+	// an unknown or wrong-typed field instead of reading it as unset.
 	RawFields []*FieldEntry
 	Pos       Position
 }
 
-// RetentionDirective is the DSL-resolved form of an EMIT retention block.
+// ActionDecl is the resolved AST node for a route ACTION statement.
+type ActionDecl struct {
+	Type        string
+	Destination string
+	Pos         Position
+}
+
+// RetentionDecl is the resolved AST node for a route's RETENTION block.
 // Pointer fields preserve tri-state semantics so we can tell "unset" apart
 // from "explicitly false / 0".
-type RetentionDirective struct {
+type RetentionDecl struct {
 	Drop                  *bool
 	TTLTurns              *int
 	KeepCurrentModel      *bool
 	PreferPrefixRetention *bool
+	// RawFields preserves the parsed payload for validation. The typed fields
+	// drop unknown or wrong-typed entries; the validator and compiler still
+	// need the raw entries so authoring mistakes are reported instead of being
+	// silently treated as an empty block.
+	RawFields []*FieldEntry
+	Pos       Position
 }
 
 // CandidateIterationDecl represents a bounded FOR ... IN block over candidate
@@ -488,6 +588,7 @@ func (b *BoolNot) GetPos() Position { return b.Pos }
 type SignalRefExpr struct {
 	SignalType string
 	SignalName string
+	Fields     map[string]Value
 	Pos        Position
 }
 
@@ -500,6 +601,7 @@ func (s *SignalRefExpr) GetPos() Position { return s.Pos }
 type ModelRef struct {
 	Model     string
 	Reasoning *bool
+	Mode      string
 	Effort    string
 	LoRA      string
 	ParamSize string

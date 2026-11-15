@@ -1,28 +1,33 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"time"
 
+	"github.com/vllm-project/semantic-router/dashboard/backend/routerauth"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/startupstatus"
 )
 
-func resolveRouterRuntimeStatus(runtimePath, routerAPIURL string, routerHealthy bool) *RouterRuntimeStatus {
-	if routerAPIURL != "" {
-		if state := fetchStartupStatusFromAPI(routerAPIURL); state != nil {
+func resolveRouterRuntimeStatus(ctx context.Context, runtimePath, routerAPIURL string, routerHealthy bool, credentialProvider ...routerauth.CredentialProvider) *RouterRuntimeStatus {
+	if routerAPIURL != "" && routerHealthy {
+		if state := fetchStartupStatusFromAPI(ctx, routerAPIURL, credentialProvider...); state != nil {
 			return runtimeStatusFromState(state)
 		}
 	}
 
 	if state, err := loadRouterRuntimeState(runtimePath); err == nil && state != nil {
+		// The file outlives the Router that wrote it. Of a Router that does not
+		// answer, it still tells only why its startup failed.
+		if !routerHealthy && state.Phase != "error" {
+			return nil
+		}
 		runtime := runtimeStatusFromState(state)
 		if runtime.Ready && routerAPIURL != "" {
-			readyHealthy, _ := checkHTTPHealth(routerAPIURL + "/ready")
+			readyHealthy := checkRouterManagementHealth(ctx, routerAPIURL+"/ready", credentialProvider...)
 			if !readyHealthy {
 				runtime.Ready = false
 				runtime.Phase = "starting"
@@ -36,9 +41,8 @@ func resolveRouterRuntimeStatus(runtimePath, routerAPIURL string, routerHealthy 
 	return nil
 }
 
-func fetchStartupStatusFromAPI(routerAPIURL string) *startupstatus.State {
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(routerAPIURL + "/startup-status")
+func fetchStartupStatusFromAPI(ctx context.Context, routerAPIURL string, credentialProvider ...routerauth.CredentialProvider) *startupstatus.State {
+	resp, err := routerManagementGET(ctx, routerAPIURL+"/startup-status", 3*time.Second, credentialProvider...)
 	if err != nil {
 		return nil
 	}
@@ -63,14 +67,31 @@ func fetchStartupStatusFromAPI(routerAPIURL string) *startupstatus.State {
 
 func runtimeStatusFromState(state *startupstatus.State) *RouterRuntimeStatus {
 	return &RouterRuntimeStatus{
-		Phase:            state.Phase,
-		Ready:            state.Ready,
-		Message:          state.Message,
-		DownloadingModel: state.DownloadingModel,
-		PendingModels:    state.PendingModels,
-		ReadyModels:      state.ReadyModels,
-		TotalModels:      state.TotalModels,
+		Phase:             state.Phase,
+		Ready:             state.Ready,
+		Message:           state.Message,
+		DownloadingModel:  state.DownloadingModel,
+		PendingModels:     state.PendingModels,
+		ReadyModels:       state.ReadyModels,
+		TotalModels:       state.TotalModels,
+		EmbeddingProvider: cloneStartupEmbeddingProviderStatus(state.EmbeddingProvider),
 	}
+}
+
+func cloneStartupEmbeddingProviderStatus(status *startupstatus.EmbeddingProviderStatus) *startupstatus.EmbeddingProviderStatus {
+	if status == nil {
+		return nil
+	}
+	clone := *status
+	if status.APIKeyEnvSet != nil {
+		value := *status.APIKeyEnvSet
+		clone.APIKeyEnvSet = &value
+	}
+	if status.Healthy != nil {
+		value := *status.Healthy
+		clone.Healthy = &value
+	}
+	return &clone
 }
 
 func loadRouterRuntimeState(runtimePath string) (*startupstatus.State, error) {
@@ -86,15 +107,4 @@ func loadRouterRuntimeState(runtimePath string) (*startupstatus.State, error) {
 
 	fallbackPath := filepath.Join(parentDir, "router-runtime.json")
 	return startupstatus.Load(fallbackPath)
-}
-
-func getContainerLogsTailForContainer(containerName string, lines int) string {
-	// #nosec G204 -- containerName is repository-managed and lines is converted from int.
-	tailArg := strconv.Itoa(lines)
-	cmd := exec.Command("docker", "logs", "--tail", tailArg, containerName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	return string(output)
 }

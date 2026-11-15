@@ -1,20 +1,26 @@
 package handlers
 
-import "path/filepath"
+import (
+	"context"
+	"path/filepath"
 
-func detectSystemStatus(routerAPIURL, configDir string) SystemStatus {
+	"github.com/vllm-project/semantic-router/dashboard/backend/routerauth"
+)
+
+func detectSystemStatus(ctx context.Context, routerAPIURL, envoyURL, configDir string, stack StackState, credentialProvider ...routerauth.CredentialProvider) SystemStatus {
 	runtimePath := filepath.Join(configDir, ".vllm-sr", "router-runtime.json")
 	if isRunningInContainer() {
-		return collectInContainerStatus(runtimePath, routerAPIURL)
+		return collectInContainerStatus(ctx, runtimePath, stack, routerAPIURL, envoyURL, credentialProvider...)
 	}
 
-	return collectHostStatus(runtimePath, routerAPIURL)
+	return collectHostStatus(ctx, runtimePath, routerAPIURL, envoyURL, credentialProvider...)
 }
 
 func baseSystemStatus() SystemStatus {
 	return SystemStatus{
 		Overall:        "not_running",
 		DeploymentType: "none",
+		ServingMode:    servingModeUnknown,
 		Services:       []ServiceStatus{},
 		Version:        statusVersion(),
 	}

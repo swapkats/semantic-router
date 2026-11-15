@@ -2,17 +2,13 @@ package config
 
 import (
 	"fmt"
-	"net/url"
-	"os"
-	"slices"
+	"sort"
 	"strings"
+
+	modelcatalog "github.com/vllm-project/semantic-router/src/semantic-router/pkg/catalog"
 )
 
-const (
-	DefaultAutoModelName    = "MoM"
-	LegacyAutoModelAlias    = "auto"
-	DefaultVSRAutoModelName = "vllm-sr/auto"
-)
+const DefaultEntrypointModel = "vllm-sr/auto"
 
 // GetModelReasoningFamily returns the reasoning family configuration for a given model name
 func (rc *RouterConfig) GetModelReasoningFamily(modelName string) *ReasoningFamilyConfig {
@@ -75,38 +71,7 @@ func (c *RouterConfig) resolveModelConfigKey(modelName string) (string, bool) {
 	return "", false
 }
 
-// GetEffectiveAutoModelName returns the effective auto model name for automatic model selection
-// Returns the configured AutoModelName if set, otherwise defaults to "MoM"
-// This is the primary model name that triggers automatic routing
-func (c *RouterConfig) GetEffectiveAutoModelName() string {
-	if c.AutoModelName != "" {
-		return c.AutoModelName
-	}
-	return DefaultAutoModelName
-}
-
-func DefaultAutoModelNames() []string {
-	return []string{DefaultVSRAutoModelName, LegacyAutoModelAlias, DefaultAutoModelName}
-}
-
-// EffectiveAutoModelNames returns all request model names that trigger
-// automatic routing. auto_model_names is an explicit allow-list; when omitted,
-// vLLM-SR keeps the new namespaced alias plus legacy auto/MoM compatibility.
-func (c *RouterConfig) EffectiveAutoModelNames() []string {
-	if c == nil {
-		return DefaultAutoModelNames()
-	}
-	if names := normalizeAutoModelNames(c.AutoModelNames); len(names) > 0 {
-		return names
-	}
-	return normalizeAutoModelNames([]string{
-		DefaultVSRAutoModelName,
-		LegacyAutoModelAlias,
-		c.GetEffectiveAutoModelName(),
-	})
-}
-
-func normalizeAutoModelNames(names []string) []string {
+func normalizeEntrypointNames(names []string) []string {
 	seen := make(map[string]bool, len(names))
 	result := make([]string, 0, len(names))
 	for _, name := range names {
@@ -118,15 +83,6 @@ func normalizeAutoModelNames(names []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
-}
-
-// IsAutoModelName checks if the given model name should trigger automatic model selection.
-func (c *RouterConfig) IsAutoModelName(modelName string) bool {
-	normalized := strings.TrimSpace(modelName)
-	if normalized == "" {
-		return false
-	}
-	return slices.Contains(c.EffectiveAutoModelNames(), normalized)
 }
 
 // GetCategoryDescriptions returns all category descriptions for similarity matching
@@ -162,11 +118,22 @@ func (c *RouterConfig) GetModelForDecisionIndex(index int) string {
 // lookup through ExternalModelIDs (provider_model_id) when the name is not
 // a direct key in ModelConfig. This handles the case where the Envoy AI
 // Gateway rewrites the model field to the provider model ID.
+//
+// The fallback scans entries in sorted model-name order so a provider model
+// ID claimed by several entries (e.g. the same served model split across
+// endpoint groups) resolves to the same owner on every load instead of
+// following Go's randomized map iteration order.
 func (c *RouterConfig) resolveModelConfig(modelName string) (ModelParams, bool) {
 	if params, ok := c.ModelConfig[modelName]; ok {
 		return params, true
 	}
-	for _, params := range c.ModelConfig {
+	owners := make([]string, 0, len(c.ModelConfig))
+	for name := range c.ModelConfig {
+		owners = append(owners, name)
+	}
+	sort.Strings(owners)
+	for _, name := range owners {
+		params := c.ModelConfig[name]
 		for _, extID := range params.ExternalModelIDs {
 			if extID == modelName {
 				return params, true
@@ -181,176 +148,85 @@ func (c *RouterConfig) resolveModelConfig(modelName string) (ModelParams, bool) 
 // Accepts both short names ("claude-haiku-4-5") and provider model IDs
 // ("eu.anthropic.claude-haiku-4-5-20251001-v1:0").
 func (c *RouterConfig) GetModelPricing(modelName string) (promptPer1M float64, completionPer1M float64, currency string, ok bool) {
-	if modelConfig, okc := c.resolveModelConfig(modelName); okc {
-		p := modelConfig.Pricing
-		// Treat an explicit zero-price entry as configured pricing when a currency is
-		// present so self-hosted/free models still produce cost=0 and savings data.
-		if p.PromptPer1M != 0 || p.CompletionPer1M != 0 || p.Currency != "" {
-			cur := p.Currency
-			if cur == "" {
-				cur = "USD"
-			}
-			return p.PromptPer1M, p.CompletionPer1M, cur, true
-		}
+	pricing, ok := c.GetFullModelPricing(modelName)
+	if !ok {
+		return 0, 0, "", false
 	}
-	return 0, 0, "", false
+	return pricing.PromptPer1M, pricing.CompletionPer1M, pricing.Currency, true
 }
 
-// GetMostExpensivePricedModel returns the configured model with the highest combined
-// prompt+completion rate among models that define pricing.
+// GetMostExpensivePricedModel returns prompt and completion rates for the model
+// selected by GetMostExpensiveFullModelPricing.
 func (c *RouterConfig) GetMostExpensivePricedModel() (modelName string, promptPer1M float64, completionPer1M float64, currency string, ok bool) {
-	if c == nil || c.ModelConfig == nil {
+	modelName, pricing, ok := c.GetMostExpensiveFullModelPricing()
+	if !ok {
 		return "", 0, 0, "", false
 	}
-
-	bestScore := 0.0
-	for candidate := range c.ModelConfig {
-		promptRate, completionRate, candidateCurrency, found := c.GetModelPricing(candidate)
-		if !found {
-			continue
-		}
-
-		score := promptRate + completionRate
-		if !ok || score > bestScore {
-			modelName = candidate
-			promptPer1M = promptRate
-			completionPer1M = completionRate
-			currency = candidateCurrency
-			bestScore = score
-			ok = true
-		}
-	}
-
-	return modelName, promptPer1M, completionPer1M, currency, ok
+	return modelName, pricing.PromptPer1M, pricing.CompletionPer1M, pricing.Currency, true
 }
 
-// GetModelAPIFormat returns the API format for the given model.
-// Returns APIFormatAnthropic if configured, otherwise APIFormatOpenAI (default).
+// GetModelAPIFormat returns the API the model is reached on, by its canonical
+// name, or APIFormatChatCompletions when the model has no override.
 func (c *RouterConfig) GetModelAPIFormat(modelName string) string {
 	if c == nil || c.ModelConfig == nil {
-		return APIFormatOpenAI
+		return APIFormatChatCompletions
 	}
 	if modelConfig, ok := c.ModelConfig[modelName]; ok && modelConfig.APIFormat != "" {
-		return modelConfig.APIFormat
+		return CanonicalAPIFormat(modelConfig.APIFormat)
 	}
 	if _, baseConfig, ok := c.resolveLoRABaseModel(modelName); ok && baseConfig.APIFormat != "" {
-		return baseConfig.APIFormat
+		return CanonicalAPIFormat(baseConfig.APIFormat)
 	}
-	return APIFormatOpenAI
+	return APIFormatChatCompletions
 }
 
 // GetModelAccessKey returns the access key for the given model.
 func (c *RouterConfig) GetModelAccessKey(modelName string) string {
+	return c.GetModelAccessKeyForProvider(modelName, "")
+}
+
+// GetModelAccessKeyForProvider resolves a static credential for the selected
+// provider. This keeps multi-provider aliases from accidentally reusing the
+// first provider's secret.
+func (c *RouterConfig) GetModelAccessKeyForProvider(modelName, provider string) string {
 	if c == nil || c.ModelConfig == nil {
 		return ""
 	}
+	// The loader already expanded each key once; it is used as it stands.
 	if modelConfig, ok := c.ModelConfig[modelName]; ok {
-		rawKey := modelConfig.AccessKey
-		if rawKey != "" {
-			expandedKey := os.ExpandEnv(rawKey)
-			return expandedKey
+		if key := modelConfig.AccessKeys[provider]; key != "" {
+			return key
+		}
+		if provider == "" && modelConfig.AccessKey != "" {
+			return modelConfig.AccessKey
 		}
 	}
-	if _, baseConfig, ok := c.resolveLoRABaseModel(modelName); ok && baseConfig.AccessKey != "" {
-		return os.ExpandEnv(baseConfig.AccessKey)
+	if _, baseConfig, ok := c.resolveLoRABaseModel(modelName); ok {
+		if key := baseConfig.AccessKeys[provider]; key != "" {
+			return key
+		}
+		if provider == "" {
+			return baseConfig.AccessKey
+		}
 	}
 	return ""
 }
 
-// GetDecisionPIIPolicy returns the PII policy for a given decision by looking at
-// the PIIRule signals referenced in the decision's rules tree.
-// If the decision doesn't reference any PII signals, returns a default policy that allows all PII.
-func (d *Decision) GetDecisionPIIPolicy(piiRules []PIIRule) PIIPolicy {
-	// Collect PII signal names referenced in the decision's rules
-	piiSignalNames := collectSignalNames(&d.Rules, "pii")
-	if len(piiSignalNames) == 0 {
-		// No PII signals → allow all PII
-		return PIIPolicy{
-			AllowByDefault: true,
-			PIITypes:       []string{},
-		}
+// GetModelIndexResult returns a defensive copy of one evidence-backed model
+// index. An unavailable result is represented by Score == nil, never zero.
+func (c *RouterConfig) GetModelIndexResult(modelName, index string) (modelcatalog.IndexResult, bool) {
+	if c == nil || c.ModelConfig == nil {
+		return modelcatalog.IndexResult{}, false
 	}
-
-	// Build a lookup for PIIRules by name
-	rulesByName := make(map[string]*PIIRule, len(piiRules))
-	for i := range piiRules {
-		rulesByName[piiRules[i].Name] = &piiRules[i]
+	params, ok := c.resolveModelConfig(modelName)
+	if !ok {
+		return modelcatalog.IndexResult{}, false
 	}
-
-	// Aggregate PIITypesAllowed from all referenced PIIRules
-	var allAllowed []string
-	for _, name := range piiSignalNames {
-		if rule, ok := rulesByName[name]; ok {
-			allAllowed = append(allAllowed, rule.PIITypesAllowed...)
-		}
+	if index == "" {
+		index = c.DefaultQualityIndex
 	}
-
-	return PIIPolicy{
-		AllowByDefault: false,
-		PIITypes:       allAllowed,
-	}
-}
-
-// IsDecisionAllowedForPIIType checks if a decision is allowed to process a specific PII type
-func (d *Decision) IsDecisionAllowedForPIIType(piiType string, piiRules []PIIRule) bool {
-	policy := d.GetDecisionPIIPolicy(piiRules)
-
-	// If allow_by_default is true, all PII types are allowed unless explicitly denied
-	if policy.AllowByDefault {
-		return true
-	}
-
-	// If allow_by_default is false, only explicitly allowed PII types are permitted
-	return slices.Contains(policy.PIITypes, piiType)
-}
-
-// IsDecisionAllowedForPIITypes checks if a decision is allowed to process any of the given PII types
-func (d *Decision) IsDecisionAllowedForPIITypes(piiTypes []string, piiRules []PIIRule) bool {
-	for _, piiType := range piiTypes {
-		if !d.IsDecisionAllowedForPIIType(piiType, piiRules) {
-			return false
-		}
-	}
-	return true
-}
-
-// IsPIIClassifierEnabled checks if PII classification is enabled
-func (c *RouterConfig) IsPIIClassifierEnabled() bool {
-	return c.PIIModel.ModelID != "" && c.PIIMappingPath != ""
-}
-
-// IsCategoryClassifierEnabled checks if category classification is enabled
-func (c *RouterConfig) IsCategoryClassifierEnabled() bool {
-	return c.CategoryModel.ModelID != "" && c.CategoryMappingPath != ""
-}
-
-// IsMCPCategoryClassifierEnabled checks if MCP-based category classification is enabled
-func (c *RouterConfig) IsMCPCategoryClassifierEnabled() bool {
-	return c.Enabled && c.ToolName != ""
-}
-
-// GetPromptGuardConfig returns the prompt guard configuration
-func (c *RouterConfig) GetPromptGuardConfig() PromptGuardConfig {
-	return c.PromptGuard
-}
-
-// IsPromptGuardEnabled checks if prompt guard jailbreak detection is enabled
-func (c *RouterConfig) IsPromptGuardEnabled() bool {
-	if !c.PromptGuard.Enabled || c.PromptGuard.JailbreakMappingPath == "" {
-		return false
-	}
-
-	// Check configuration based on whether using vLLM or Candle
-	if c.PromptGuard.UseVLLM {
-		// For vLLM: need external model with role="guardrail"
-		externalCfg := c.FindExternalModelByRole(ModelRoleGuardrail)
-		return externalCfg != nil &&
-			externalCfg.ModelEndpoint.Address != "" &&
-			externalCfg.ModelName != ""
-	}
-
-	// For Candle: need model ID
-	return c.PromptGuard.ModelID != ""
+	result, ok := params.IndexResults[index]
+	return cloneCatalogIndexResult(result), ok
 }
 
 // GetEndpointsForModel returns all endpoints that can serve the specified model
@@ -445,25 +321,12 @@ func (c *RouterConfig) ValidateEndpoints() error {
 
 // IsSystemPromptEnabled returns whether system prompt injection is enabled for a decision
 func (d *Decision) IsSystemPromptEnabled() bool {
-	config := d.GetSystemPromptConfig()
-	if config == nil {
-		return false
-	}
-	// If Enabled is explicitly set, use that value
-	if config.Enabled != nil {
-		return *config.Enabled
-	}
-	// Default to true if SystemPrompt is not empty
-	return config.SystemPrompt != ""
+	return d.GetSystemPromptConfig().IsEnabled()
 }
 
-// GetSystemPromptMode returns the system prompt injection mode, defaulting to "replace"
+// GetSystemPromptMode returns the injection mode, defaulting to insert.
 func (d *Decision) GetSystemPromptMode() string {
-	config := d.GetSystemPromptConfig()
-	if config == nil || config.Mode == "" {
-		return "insert" // Default mode
-	}
-	return config.Mode
+	return d.GetSystemPromptConfig().EffectiveMode()
 }
 
 // GetCategoryByName returns a category by name
@@ -476,7 +339,9 @@ func (c *RouterConfig) GetCategoryByName(name string) *Category {
 	return nil
 }
 
-// GetDecisionByName returns a decision by name
+// GetDecisionByName returns a decision from the default routing profile. Names
+// are recipe-local; request-time callers should retain the selected Decision
+// object instead of performing a global bare-name lookup.
 func (c *RouterConfig) GetDecisionByName(name string) *Decision {
 	for i := range c.Decisions {
 		if c.Decisions[i].Name == name {
@@ -490,43 +355,36 @@ func (c *RouterConfig) GetDecisionByName(name string) *Decision {
 // Returns true only if the decision has an explicit semantic-cache plugin configured with enabled: true
 // This ensures per-decision scoping - decisions without semantic-cache plugin won't execute caching
 func (c *RouterConfig) IsCacheEnabledForDecision(decisionName string) bool {
-	decision := c.GetDecisionByName(decisionName)
-	if decision != nil {
-		config := decision.GetSemanticCacheConfig()
-		if config != nil {
-			return config.Enabled
-		}
-	}
-	// No explicit semantic-cache plugin configured for this decision
-	// Return false to respect per-decision plugin scoping
-	return false
+	return c.IsCacheEnabledForDecisionObject(c.GetDecisionByName(decisionName))
 }
 
-// GetCacheSimilarityThresholdForDecision returns the effective cache similarity threshold for a decision
-func (c *RouterConfig) GetCacheSimilarityThresholdForDecision(decisionName string) float32 {
-	decision := c.GetDecisionByName(decisionName)
-	if decision != nil {
-		config := decision.GetSemanticCacheConfig()
-		if config != nil && config.SimilarityThreshold != nil {
-			return *config.SimilarityThreshold
-		}
-	}
-	// Fall back to global cache threshold or bert threshold
-	return c.GetCacheSimilarityThreshold()
+// IsCacheEnabledForDecisionObject resolves response_cache policy from a
+// scoped decision: the response_cache plugin it runs (RequestPlugins).
+func (c *RouterConfig) IsCacheEnabledForDecisionObject(decision *Decision) bool {
+	config := c.ResponseCacheConfig(decision)
+	return config != nil && config.Enabled
+}
+
+// ResponseCacheMatch is the match block a request's semantic lookup runs: the
+// semantic.match of the response_cache plugin it runs, nil for the response
+// cache's default.
+func (c *RouterConfig) ResponseCacheMatch(decision *Decision) *MatchConfig {
+	return c.ResponseCacheConfig(decision).SemanticMatch()
 }
 
 // GetCacheTTLSecondsForDecision returns the effective TTL for a decision
 // Returns 0 if caching should be skipped for this decision
 // Returns -1 to use the global default TTL when not specified at decision level
 func (c *RouterConfig) GetCacheTTLSecondsForDecision(decisionName string) int {
-	decision := c.GetDecisionByName(decisionName)
-	if decision != nil {
-		config := decision.GetSemanticCacheConfig()
-		if config != nil && config.TTLSeconds != nil {
-			return *config.TTLSeconds
-		}
+	return c.GetCacheTTLSecondsForDecisionObject(c.GetDecisionByName(decisionName))
+}
+
+// GetCacheTTLSecondsForDecisionObject resolves TTL from a scoped decision:
+// the response_cache plugin it runs, -1 for the store's default TTL.
+func (c *RouterConfig) GetCacheTTLSecondsForDecisionObject(decision *Decision) int {
+	if config := c.ResponseCacheConfig(decision); config != nil && config.TTLSeconds != nil {
+		return *config.TTLSeconds
 	}
-	// Return -1 to indicate "use global default"
 	return -1
 }
 
@@ -584,210 +442,4 @@ func (c *RouterConfig) ResolvePrimaryBackendForModel(modelName string) (string, 
 		return "", "", false, fmt.Errorf("endpoint %q for model %q: %w", bestEndpoint.Name, modelName, err)
 	}
 	return addr, bestEndpoint.Name, true, nil
-}
-
-// ---------------------------------------------------------------------------
-// Provider profile helpers
-// ---------------------------------------------------------------------------
-
-// providerTypeInfo holds the per-type defaults for a cloud provider.
-// Every supported type MUST have an entry — no default/fallback branch.
-type providerTypeInfo struct {
-	AuthHeader string // HTTP header name for the API key
-	AuthPrefix string // value prefix ("Bearer", "" etc.)
-	ChatPath   string // path suffix appended after base_url path
-}
-
-// providerTypeRegistry is the single source of truth for type defaults.
-// To add a new provider, add one entry here and a matching LLMProvider
-// constant in pkg/authz/provider.go — nothing else needs a switch/default.
-var providerTypeRegistry = map[string]providerTypeInfo{
-	"openai":       {AuthHeader: "Authorization", AuthPrefix: "Bearer", ChatPath: "/chat/completions"},
-	"anthropic":    {AuthHeader: "x-api-key", AuthPrefix: "", ChatPath: "/v1/messages"},
-	"azure-openai": {AuthHeader: "api-key", AuthPrefix: "", ChatPath: "/chat/completions"},
-	"bedrock":      {AuthHeader: "Authorization", AuthPrefix: "Bearer", ChatPath: "/chat/completions"},
-	"gemini":       {AuthHeader: "Authorization", AuthPrefix: "Bearer", ChatPath: "/chat/completions"},
-	"vertex-ai":    {AuthHeader: "Authorization", AuthPrefix: "Bearer", ChatPath: "/chat/completions"},
-	"minimax":      {AuthHeader: "Authorization", AuthPrefix: "Bearer", ChatPath: "/v1/chat/completions"},
-}
-
-// ValidProviderTypes returns the set of recognised type strings (for error messages).
-func ValidProviderTypes() []string {
-	types := make([]string, 0, len(providerTypeRegistry))
-	for t := range providerTypeRegistry {
-		types = append(types, t)
-	}
-	return types
-}
-
-// GetProviderProfileForEndpoint resolves the ProviderProfile for a named endpoint.
-//
-// Returns (nil, nil) when the endpoint exists but has no provider_profile set
-// (legacy address:port endpoint — this is not an error).
-//
-// Returns a non-nil error when:
-//   - endpointName does not match any VLLMEndpoint
-//   - the endpoint references a provider_profile name that does not exist in the map
-func (c *RouterConfig) GetProviderProfileForEndpoint(endpointName string) (*ProviderProfile, error) {
-	if endpointName == "" {
-		return nil, nil // no backend metadata resolved (e.g., model has no preferred_endpoints)
-	}
-	ep, found := c.GetEndpointByName(endpointName)
-	if !found {
-		return nil, fmt.Errorf("endpoint %q not found in vllm_endpoints", endpointName)
-	}
-	if ep.ProviderProfileName == "" {
-		return nil, nil // legacy endpoint, no profile — not an error
-	}
-	if c.ProviderProfiles == nil {
-		return nil, fmt.Errorf("endpoint %q references provider_profile %q but no provider_profiles map is defined",
-			endpointName, ep.ProviderProfileName)
-	}
-	profile, ok := c.ProviderProfiles[ep.ProviderProfileName]
-	if !ok {
-		return nil, fmt.Errorf("endpoint %q references provider_profile %q which does not exist in provider_profiles (have: %v)",
-			endpointName, ep.ProviderProfileName, mapKeys(c.ProviderProfiles))
-	}
-	return &profile, nil
-}
-
-// mapKeys returns the keys of a map for diagnostic messages.
-func mapKeys(m map[string]ProviderProfile) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// ResolveAddress returns the host:port string for this endpoint.
-//
-// Two distinct modes — no silent fallback between them:
-//   - provider_profile set → host:port is extracted from the profile's base_url.
-//     Returns error if profile is missing, has no base_url, or base_url is unparsable.
-//   - provider_profile NOT set → uses address:port fields directly.
-func (ep *VLLMEndpoint) ResolveAddress(profiles map[string]ProviderProfile) (string, error) {
-	if ep.ProviderProfileName == "" {
-		// Legacy endpoint: address:port is the intended mode.
-		return fmt.Sprintf("%s:%d", ep.Address, ep.Port), nil
-	}
-
-	// Profile-based endpoint: MUST resolve from base_url.
-	if profiles == nil {
-		return "", fmt.Errorf("endpoint %q has provider_profile %q but no provider_profiles map is defined",
-			ep.Name, ep.ProviderProfileName)
-	}
-	profile, ok := profiles[ep.ProviderProfileName]
-	if !ok {
-		return "", fmt.Errorf("endpoint %q references provider_profile %q which does not exist",
-			ep.Name, ep.ProviderProfileName)
-	}
-	if profile.BaseURL == "" {
-		return "", fmt.Errorf("endpoint %q: provider_profile %q has no base_url",
-			ep.Name, ep.ProviderProfileName)
-	}
-
-	u, err := url.Parse(profile.BaseURL)
-	if err != nil {
-		return "", fmt.Errorf("endpoint %q: cannot parse base_url %q: %w",
-			ep.Name, profile.BaseURL, err)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("endpoint %q: base_url %q has no host",
-			ep.Name, profile.BaseURL)
-	}
-
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		switch u.Scheme {
-		case "https":
-			host += ":443"
-		case "http":
-			host += ":80"
-		default:
-			return "", fmt.Errorf("endpoint %q: base_url %q has unsupported scheme %q (expected http or https)",
-				ep.Name, profile.BaseURL, u.Scheme)
-		}
-	}
-	return host, nil
-}
-
-// ProviderType returns the provider type string, which matches authz.LLMProvider values.
-// Returns an error if the type is empty or not in providerTypeRegistry.
-func (p *ProviderProfile) ProviderType() (string, error) {
-	if p == nil {
-		return "", fmt.Errorf("provider profile is nil")
-	}
-	if p.Type == "" {
-		return "", fmt.Errorf("provider profile has empty type")
-	}
-	if _, ok := providerTypeRegistry[p.Type]; !ok {
-		return "", fmt.Errorf("unknown provider profile type %q (valid types: %v)", p.Type, ValidProviderTypes())
-	}
-	return p.Type, nil
-}
-
-// ResolveAuthHeader returns the (headerName, prefix) for the upstream auth header.
-// Explicit AuthHeader/AuthPrefix fields override the type defaults.
-// Returns error if the profile's type is not recognised.
-func (p *ProviderProfile) ResolveAuthHeader() (string, string, error) {
-	info, ok := providerTypeRegistry[p.Type]
-	if !ok {
-		return "", "", fmt.Errorf("unknown provider type %q — cannot determine auth header", p.Type)
-	}
-	headerName := info.AuthHeader
-	prefix := info.AuthPrefix
-	if p.AuthHeader != "" {
-		headerName = p.AuthHeader
-	}
-	if p.AuthPrefix != "" {
-		prefix = p.AuthPrefix
-	}
-	return headerName, prefix, nil
-}
-
-// ResolveChatPath returns the HTTP path for upstream requests.
-//
-// Resolution order (no silent fallback):
-//  1. Explicit ChatPath field on the profile (used as-is, plus ?api-version for azure-openai).
-//  2. base_url path + type-default suffix from providerTypeRegistry.
-//  3. Type-default suffix alone if base_url has no path component.
-//
-// Returns error if the type is not recognised or base_url is unparsable.
-func (p *ProviderProfile) ResolveChatPath() (string, error) {
-	if p == nil {
-		return "", fmt.Errorf("provider profile is nil")
-	}
-
-	info, ok := providerTypeRegistry[p.Type]
-	if !ok {
-		return "", fmt.Errorf("unknown provider type %q — cannot determine chat path", p.Type)
-	}
-
-	// Explicit override
-	if p.ChatPath != "" {
-		path := p.ChatPath
-		if p.Type == "azure-openai" && p.APIVersion != "" {
-			path += "?api-version=" + p.APIVersion
-		}
-		return path, nil
-	}
-
-	suffix := info.ChatPath
-	if p.Type == "azure-openai" && p.APIVersion != "" {
-		suffix += "?api-version=" + p.APIVersion
-	}
-
-	// Prepend base_url path component if present
-	if p.BaseURL != "" {
-		u, err := url.Parse(p.BaseURL)
-		if err != nil {
-			return "", fmt.Errorf("cannot parse base_url %q: %w", p.BaseURL, err)
-		}
-		if u.Path != "" && u.Path != "/" {
-			return strings.TrimRight(u.Path, "/") + suffix, nil
-		}
-	}
-
-	return suffix, nil
 }

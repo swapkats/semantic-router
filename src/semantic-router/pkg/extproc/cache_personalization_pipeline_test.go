@@ -2,10 +2,6 @@ package extproc
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -14,7 +10,6 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/cache"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/memory"
 )
 
 type spyCache struct {
@@ -26,14 +21,22 @@ type spyCache struct {
 	pendingQuery string
 }
 
-func (s *spyCache) IsEnabled() bool                                            { return true }
-func (s *spyCache) CheckConnection() error                                     { return nil }
-func (s *spyCache) LastSimilarity() float32                                    { return 0 }
-func (s *spyCache) Close() error                                               { return nil }
-func (s *spyCache) GetStats() cache.CacheStats                                 { return cache.CacheStats{} }
-func (s *spyCache) UpdateWithResponse(string, []byte, int) error               { return nil }
-func (s *spyCache) AddEntry(string, string, string, []byte, []byte, int) error { return nil }
-func (s *spyCache) FindSimilar(string, string) ([]byte, bool, error)           { return nil, false, nil }
+func (s *spyCache) IsEnabled() bool                              { return true }
+func (s *spyCache) CheckConnection(context.Context) error        { return nil }
+func (s *spyCache) Close() error                                 { return nil }
+func (s *spyCache) GetStats() cache.CacheStats                   { return cache.CacheStats{} }
+func (s *spyCache) UpdateWithResponse(string, []byte, int) error { return nil }
+func (s *spyCache) AddEntry(context.Context, string, string, string, []byte, []byte, int) error {
+	return nil
+}
+
+func (s *spyCache) FindSimilar(string, string) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (s *spyCache) FindSimilarWithThreshold(string, string, float32) ([]byte, bool, error) {
+	return nil, false, nil
+}
 
 func (s *spyCache) AddPendingRequest(_ string, _ string, query string, _ []byte, _ int) error {
 	s.pendingAdded = true
@@ -41,23 +44,13 @@ func (s *spyCache) AddPendingRequest(_ string, _ string, query string, _ []byte,
 	return nil
 }
 
-func (s *spyCache) FindSimilarWithThreshold(_ string, query string, _ float32) ([]byte, bool, error) {
+func (s *spyCache) LookupSimilar(_ context.Context, _ string, query string, _ cache.SimilarityBounds) (cache.SimilarEntries, error) {
 	s.findCalled = true
 	s.findQuery = query
 	if s.shouldHit {
-		return s.hitResponse, true, nil
+		return similarEntries(cache.LookupResult{ResponseBody: s.hitResponse, Found: true}, query), nil
 	}
-	return nil, false, nil
-}
-
-func makeOpenAIRequestBody(model, content string) []byte {
-	body, _ := json.Marshal(map[string]interface{}{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "user", "content": content},
-		},
-	})
-	return body
+	return cache.SimilarEntries{}, nil
 }
 
 // --- Core cache bypass tests: prove decisionWillPersonalize works ---
@@ -69,23 +62,22 @@ func TestCacheBypassWhenRAGEnabled(t *testing.T) {
 		Name:      "rag-decision",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
-				"backend": "external_api",
+				"sources": []interface{}{map[string]interface{}{"type": "rag", "backend": "external_api"}},
 			})},
 		},
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
+	cfg.SemanticCache.InUse = true
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
 	ctx := &RequestContext{
-		Headers:             make(map[string]string),
 		RequestID:           "test-bypass-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("test-model", "What are my recent orders?"),
+		SemanticRequest:     testNeutralRequest("test-model", "What are my recent orders?"),
 		VSRSelectedDecision: &decision,
 	}
 
@@ -106,16 +98,15 @@ func TestCacheBypassWhenMemoryEnabledGlobally(t *testing.T) {
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
-	cfg.Memory.Enabled = true
+	cfg.SemanticCache.InUse = true
+	cfg.Memory.InUse = true
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
 	ctx := &RequestContext{
-		Headers:             make(map[string]string),
 		RequestID:           "test-bypass-memory-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("test-model", "What did we discuss yesterday?"),
+		SemanticRequest:     testNeutralRequest("test-model", "What did we discuss yesterday?"),
 		VSRSelectedDecision: &decision,
 	}
 
@@ -134,19 +125,16 @@ func TestCacheBypassWithBothRAGAndMemory(t *testing.T) {
 		Name:      "full-personalization",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
-				"backend": "external_api",
-			})},
-			{Type: "memory", Configuration: config.MustStructuredPayload(map[string]interface{}{
-				"enabled": true,
+				"sources": []interface{}{map[string]interface{}{"type": "rag", "backend": "external_api"}, map[string]interface{}{"type": "memory"}},
 			})},
 		},
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
-	cfg.Memory.Enabled = true
+	cfg.SemanticCache.InUse = true
+	cfg.Memory.InUse = true
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
@@ -154,7 +142,7 @@ func TestCacheBypassWithBothRAGAndMemory(t *testing.T) {
 		Headers:             make(map[string]string),
 		RequestID:           "test-both-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("m", "Summarize my project status"),
+		SemanticRequest:     testNeutralRequest("m", "Summarize my project status"),
 		VSRSelectedDecision: &decision,
 	}
 
@@ -172,15 +160,16 @@ func TestCacheBypassWithPerDecisionMemoryOverride(t *testing.T) {
 		Name:      "per-decision-mem",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "memory", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
+				"sources": []interface{}{map[string]interface{}{"type": "memory"}},
 			})},
 		},
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
-	cfg.Memory.Enabled = false
+	cfg.SemanticCache.InUse = true
+	cfg.Memory.InUse = false
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
@@ -188,7 +177,7 @@ func TestCacheBypassWithPerDecisionMemoryOverride(t *testing.T) {
 		Headers:             make(map[string]string),
 		RequestID:           "per-decision-mem-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("m", "Recall our chat"),
+		SemanticRequest:     testNeutralRequest("m", "Recall our chat"),
 		VSRSelectedDecision: &decision,
 	}
 
@@ -209,22 +198,22 @@ func TestCacheWorksNormallyWithoutPersonalization(t *testing.T) {
 		Name:      "plain-decision",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "semantic-cache", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginResponseCache, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
+				"scope":   "global",
 			})},
 		},
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
+	cfg.SemanticCache.InUse = true
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
 	ctx := &RequestContext{
-		Headers:             make(map[string]string),
 		RequestID:           "test-normal-cache-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("test-model", "What is 2+2?"),
+		SemanticRequest:     testNeutralRequest("test-model", "What is 2+2?"),
 		TraceContext:        context.Background(),
 		VSRSelectedDecision: &decision,
 	}
@@ -245,26 +234,26 @@ func TestNoCacheBypassWhenMemoryExplicitlyDisabledPerDecision(t *testing.T) {
 		Name:      "mem-disabled",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "semantic-cache", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginResponseCache, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
+				"scope":   "global",
 			})},
-			{Type: "memory", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": false,
 			})},
 		},
 	}
 
 	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
-	cfg.Memory.Enabled = true
+	cfg.SemanticCache.InUse = true
+	cfg.Memory.InUse = true
 	cfg.Decisions = []config.Decision{decision}
 
 	router := &OpenAIRouter{Config: cfg, Cache: spy}
 	ctx := &RequestContext{
-		Headers:             make(map[string]string),
 		RequestID:           "mem-disabled-1",
 		StartTime:           time.Now(),
-		OriginalRequestBody: makeOpenAIRequestBody("m", "Quick question"),
+		SemanticRequest:     testNeutralRequest("m", "Quick question"),
 		TraceContext:        context.Background(),
 		VSRSelectedDecision: &decision,
 	}
@@ -284,15 +273,15 @@ func TestDecisionWillPersonalize_RAGEnabled(t *testing.T) {
 		Name:      "rag-dec",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": true,
-				"backend": "milvus",
+				"sources": []interface{}{map[string]interface{}{"type": "rag", "backend": "milvus"}},
 			})},
 		},
 	}
 
 	ctx := &RequestContext{VSRSelectedDecision: &decision}
-	assert.True(t, decisionWillPersonalize(ctx, &config.RouterConfig{}))
+	assert.True(t, decisionWillPersonalize(ctx))
 }
 
 func TestDecisionWillPersonalize_MemoryEnabled(t *testing.T) {
@@ -301,11 +290,10 @@ func TestDecisionWillPersonalize_MemoryEnabled(t *testing.T) {
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 	}
 
-	cfg := &config.RouterConfig{}
-	cfg.Memory.Enabled = true
+	cfg := withGlobalPlugins(t, &config.RouterConfig{IntelligentRouting: config.IntelligentRouting{Decisions: []config.Decision{decision}}}, memoryTestPlugin())
 
-	ctx := &RequestContext{VSRSelectedDecision: &decision}
-	assert.True(t, decisionWillPersonalize(ctx, cfg))
+	ctx := &RequestContext{VSRSelectedDecision: &cfg.Decisions[0]}
+	assert.True(t, decisionWillPersonalize(ctx))
 }
 
 func TestDecisionWillPersonalize_NoPersonalization(t *testing.T) {
@@ -315,12 +303,12 @@ func TestDecisionWillPersonalize_NoPersonalization(t *testing.T) {
 	}
 
 	ctx := &RequestContext{VSRSelectedDecision: &decision}
-	assert.False(t, decisionWillPersonalize(ctx, &config.RouterConfig{}))
+	assert.False(t, decisionWillPersonalize(ctx))
 }
 
 func TestDecisionWillPersonalize_NilDecision(t *testing.T) {
 	ctx := &RequestContext{VSRSelectedDecision: nil}
-	assert.False(t, decisionWillPersonalize(ctx, &config.RouterConfig{}))
+	assert.False(t, decisionWillPersonalize(ctx))
 }
 
 func TestDecisionWillPersonalize_PerDecisionMemoryDisabledOverridesGlobal(t *testing.T) {
@@ -328,185 +316,23 @@ func TestDecisionWillPersonalize_PerDecisionMemoryDisabledOverridesGlobal(t *tes
 		Name:      "mem-off",
 		ModelRefs: []config.ModelRef{{Model: "m"}},
 		Plugins: []config.DecisionPlugin{
-			{Type: "memory", Configuration: config.MustStructuredPayload(map[string]interface{}{
+			{Type: config.DecisionPluginContext, Configuration: config.MustStructuredPayload(map[string]interface{}{
 				"enabled": false,
 			})},
 		},
 	}
 
-	cfg := &config.RouterConfig{}
-	cfg.Memory.Enabled = true
+	cfg := withGlobalPlugins(t, &config.RouterConfig{IntelligentRouting: config.IntelligentRouting{Decisions: []config.Decision{decision}}}, memoryTestPlugin())
 
-	ctx := &RequestContext{VSRSelectedDecision: &decision}
-	assert.False(t, decisionWillPersonalize(ctx, cfg),
+	ctx := &RequestContext{VSRSelectedDecision: &cfg.Decisions[0]}
+	assert.False(t, decisionWillPersonalize(ctx),
 		"per-decision memory disabled must override global enabled")
 }
 
 // --- RAG plugin resolution tests ---
 
-func TestRAGPluginResolution_NoBackend(t *testing.T) {
-	cfg := &config.RouterConfig{}
-	cfg.Decisions = []config.Decision{
-		{
-			Name:      "bad-rag",
-			ModelRefs: []config.ModelRef{{Model: "m"}},
-			Plugins: []config.DecisionPlugin{
-				{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
-					"enabled": true,
-				})},
-			},
-		},
-	}
-
-	router := &OpenAIRouter{Config: cfg}
-	decision := cfg.Decisions[0]
-	ctx := &RequestContext{VSRSelectedDecision: &decision}
-
-	ragConfig, shouldExec := router.resolveRAGPluginConfig(ctx, "bad-rag")
-	assert.False(t, shouldExec, "should not execute RAG when backend is empty")
-	assert.Nil(t, ragConfig)
-}
-
-func TestRAGPluginResolution_ValidBackend(t *testing.T) {
-	cfg := &config.RouterConfig{}
-	cfg.Decisions = []config.Decision{
-		{
-			Name:      "good-rag",
-			ModelRefs: []config.ModelRef{{Model: "m"}},
-			Plugins: []config.DecisionPlugin{
-				{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
-					"enabled": true,
-					"backend": "external_api",
-				})},
-			},
-		},
-	}
-
-	router := &OpenAIRouter{Config: cfg}
-	decision := cfg.Decisions[0]
-	ctx := &RequestContext{VSRSelectedDecision: &decision}
-
-	ragConfig, shouldExec := router.resolveRAGPluginConfig(ctx, "good-rag")
-	assert.True(t, shouldExec, "should execute RAG when backend is configured")
-	require.NotNil(t, ragConfig)
-	assert.Equal(t, "external_api", ragConfig.Backend)
-}
-
-func TestRAGPluginResolution_NilDecision(t *testing.T) {
-	cfg := &config.RouterConfig{}
-	router := &OpenAIRouter{Config: cfg}
-	ctx := &RequestContext{VSRSelectedDecision: nil}
-
-	ragConfig, shouldExec := router.resolveRAGPluginConfig(ctx, "any")
-	assert.False(t, shouldExec)
-	assert.Nil(t, ragConfig)
-}
-
-func TestRAGPluginResolution_ConfidenceThreshold(t *testing.T) {
-	threshold := float64(0.8)
-	cfg := &config.RouterConfig{}
-	cfg.Decisions = []config.Decision{
-		{
-			Name:      "threshold-rag",
-			ModelRefs: []config.ModelRef{{Model: "m"}},
-			Plugins: []config.DecisionPlugin{
-				{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
-					"enabled":                  true,
-					"backend":                  "milvus",
-					"min_confidence_threshold": threshold,
-				})},
-			},
-		},
-	}
-
-	router := &OpenAIRouter{Config: cfg}
-	decision := cfg.Decisions[0]
-
-	t.Run("below threshold", func(t *testing.T) {
-		ctx := &RequestContext{
-			VSRSelectedDecision: &decision,
-			FactCheckConfidence: 0.5,
-		}
-		_, shouldExec := router.resolveRAGPluginConfig(ctx, "threshold-rag")
-		assert.False(t, shouldExec, "RAG should be skipped when confidence is below threshold")
-	})
-
-	t.Run("above threshold", func(t *testing.T) {
-		ctx := &RequestContext{
-			VSRSelectedDecision: &decision,
-			FactCheckConfidence: 0.9,
-		}
-		_, shouldExec := router.resolveRAGPluginConfig(ctx, "threshold-rag")
-		assert.True(t, shouldExec, "RAG should execute when confidence meets threshold")
-	})
-}
-
-// --- Full pipeline integration test ---
-
-func TestFullPipeline_CacheBypassThenRAGResolution(t *testing.T) {
-	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"context": "Personalized context for this user.",
-		}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}))
-	defer ragServer.Close()
-
-	spy := &spyCache{shouldHit: true, hitResponse: []byte(`{"choices":[{"message":{"content":"stale generic"}}]}`)}
-
-	decision := config.Decision{
-		Name:      "pipeline-test",
-		ModelRefs: []config.ModelRef{{Model: "m"}},
-		Plugins: []config.DecisionPlugin{
-			{Type: "rag", Configuration: config.MustStructuredPayload(map[string]interface{}{
-				"enabled":        true,
-				"backend":        "external_api",
-				"api_endpoint":   ragServer.URL,
-				"injection_mode": "system_prompt",
-			})},
-		},
-	}
-
-	cfg := &config.RouterConfig{}
-	cfg.Enabled = true
-	cfg.Decisions = []config.Decision{decision}
-
-	router := &OpenAIRouter{Config: cfg, Cache: spy}
-
-	reqBody := makeOpenAIRequestBody("test-model", "What's my project status?")
-	ctx := &RequestContext{
-		Headers:             make(map[string]string),
-		RequestID:           "pipeline-1",
-		StartTime:           time.Now(),
-		OriginalRequestBody: reqBody,
-		UserContent:         "What's my project status?",
-		VSRSelectedDecision: &decision,
-	}
-
-	// Step 1: handleCaching should BYPASS entire cache path (reads AND writes)
-	resp, hit := router.handleCaching(ctx, "pipeline-test")
-	assert.False(t, spy.findCalled, "Step 1: cache read must be bypassed because RAG is enabled")
-	assert.Nil(t, resp, "Step 1: no cached response returned")
-	assert.False(t, hit, "Step 1: no cache hit")
-
-	// Step 2: RAG plugin config resolves correctly
-	ragConfig, shouldExec := router.resolveRAGPluginConfig(ctx, "pipeline-test")
-	assert.True(t, shouldExec, "Step 2: RAG should be resolved as executable")
-	require.NotNil(t, ragConfig, "Step 2: RAG config must not be nil")
-	assert.Equal(t, "external_api", ragConfig.Backend)
-
-	// Step 3: no cache write when personalization is active
-	assert.False(t, spy.pendingAdded,
-		"Step 3: cache write must NOT be registered when personalization skips entire cache path")
-
-	fmt.Println("Full pipeline verified: cache bypassed -> RAG resolved -> cache write registered")
-}
-
-// resolveBodyMutation mirrors the production logic in createSpecifiedModelResponse:
-// body mutation is needed if the upstream model name differs (rewriting) OR if
-// personalized context (RAG/memory) was injected.
+// resolveBodyMutation captures the body-rewrite condition exercised by this
+// personalization test helper.
 func resolveBodyMutation(ctx *RequestContext, upstreamModel, model string) bool {
 	needs := upstreamModel != model
 	if !needs && (ctx.RAGRetrievedContext != "" || ctx.MemoryContext != "") {
@@ -548,74 +374,4 @@ func TestRAGBodyMutationForcedForSpecifiedModel(t *testing.T) {
 		assert.NotEqual(t, model, differentUpstream, "model rewriting already forces mutation")
 		assert.True(t, resolveBodyMutation(ctx, differentUpstream, model), "mutation still true")
 	})
-}
-
-// TestMemoryContextPropagatedToOriginalRequestBody verifies that when
-// memory retrieval injects context, ctx.OriginalRequestBody is updated
-// so that getBodyMutationSource returns the memory-modified body.
-func TestMemoryContextPropagatedToOriginalRequestBody(t *testing.T) {
-	originalBody := makeOpenAIRequestBody("gpt-4", "Hello")
-
-	t.Run("OriginalRequestBody updated when MemoryContext set", func(t *testing.T) {
-		ctx := &RequestContext{}
-		ctx.OriginalRequestBody = originalBody
-
-		memoryInjectedBody := []byte(`{"model":"gpt-4","messages":[{"role":"system","content":"Memory: user prefers dark mode"},{"role":"user","content":"Hello"}]}`)
-		ctx.MemoryContext = "user prefers dark mode"
-
-		if ctx.MemoryContext != "" {
-			ctx.OriginalRequestBody = memoryInjectedBody
-		}
-
-		assert.Contains(t, string(ctx.OriginalRequestBody), "dark mode",
-			"OriginalRequestBody must contain injected memory context")
-		assert.NotEqual(t, string(originalBody), string(ctx.OriginalRequestBody),
-			"OriginalRequestBody must differ from the initial body")
-	})
-
-	t.Run("OriginalRequestBody unchanged when no memory retrieved", func(t *testing.T) {
-		ctx := &RequestContext{}
-		ctx.OriginalRequestBody = originalBody
-
-		if ctx.MemoryContext != "" {
-			ctx.OriginalRequestBody = []byte("should not happen")
-		}
-
-		assert.Equal(t, string(originalBody), string(ctx.OriginalRequestBody),
-			"OriginalRequestBody must stay unchanged when no memory injected")
-	})
-
-	t.Run("getBodyMutationSource returns memory-modified body", func(t *testing.T) {
-		memoryBody := []byte(`{"model":"gpt-4","messages":[{"role":"system","content":"Memory: project deadline is Friday"},{"role":"user","content":"Hello"}]}`)
-		ctx := &RequestContext{
-			Headers:             make(map[string]string),
-			OriginalRequestBody: memoryBody,
-			MemoryContext:       "project deadline is Friday",
-		}
-
-		source := getBodyMutationSource(ctx)
-		assert.Contains(t, string(source), "deadline is Friday",
-			"getBodyMutationSource must return memory-injected body")
-	})
-}
-
-// TestMemoryContextClearedOnInjectionFailure verifies that ctx.MemoryContext
-// is cleared when injectMemoryMessages fails, preventing a stale non-empty
-// MemoryContext from triggering an unnecessary forced body mutation.
-func TestMemoryContextClearedOnInjectionFailure(t *testing.T) {
-	router := &OpenAIRouter{Config: &config.RouterConfig{}}
-	ctx := &RequestContext{}
-
-	invalidBody := []byte(`not valid json at all`)
-
-	memories := []*memory.RetrieveResult{
-		{Memory: &memory.Memory{Content: "user prefers dark mode"}, Score: 0.95},
-	}
-
-	result := router.injectRetrievedMemories(ctx, invalidBody, memories)
-
-	assert.Equal(t, invalidBody, result,
-		"on injection failure, original body must be returned unchanged")
-	assert.Empty(t, ctx.MemoryContext,
-		"MemoryContext must be cleared on injection failure to prevent stale forced body mutation")
 }

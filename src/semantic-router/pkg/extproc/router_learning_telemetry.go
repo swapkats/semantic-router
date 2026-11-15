@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelpricing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 )
 
@@ -35,11 +36,15 @@ func (r *OpenAIRouter) observeRouterLearningUsageTelemetry(
 	cacheObserved := promptTokens > 0
 	if promptTokens > 0 {
 		cacheHitRatio = float64(usage.cachedPromptTokens) / float64(promptTokens)
-		cacheWritePressure = float64(promptTokens-usage.cachedPromptTokens) / float64(promptTokens)
+		if usage.cacheWriteTokensReported {
+			cacheWritePressure = float64(usage.cacheWriteTokens) / float64(promptTokens)
+		} else {
+			cacheWritePressure = float64(promptTokens-usage.cachedPromptTokens) / float64(promptTokens)
+		}
 	}
 	inputCostMultiplier := r.learningInputCostMultiplier(ctx.RequestModel, usage)
 	r.routerLearningRuntimeState().recordModelTelemetry(
-		ctx.VSRSelectedDecisionName,
+		requestDecisionStateKey(ctx),
 		decisionTier(ctx),
 		ctx.RequestModel,
 		routerLearningTelemetryObservation{
@@ -58,15 +63,32 @@ func (r *OpenAIRouter) observeRouterLearningProviderStatus(ctx *RequestContext, 
 	if statusCode != 429 && statusCode < 500 {
 		return
 	}
-	if !r.shouldObserveRouterLearningTelemetry(ctx) {
+	if !r.shouldObserveRouterLearningProviderFailure(ctx) {
 		return
 	}
 	r.routerLearningRuntimeState().recordModelTelemetry(
-		ctx.VSRSelectedDecisionName,
+		requestDecisionStateKey(ctx),
 		decisionTier(ctx),
 		ctx.RequestModel,
 		routerLearningTelemetryObservation{ProviderFailureObserved: true},
 	)
+}
+
+func (r *OpenAIRouter) shouldObserveRouterLearningProviderFailure(ctx *RequestContext) bool {
+	if r.shouldObserveRouterLearningTelemetry(ctx) {
+		return true
+	}
+	// Reliability observations also serve protection-only rescue. Keep usage
+	// telemetry and adaptive model-choice updates behind their existing gate.
+	if r == nil || r.Config == nil || ctx == nil || ctx.RequestModel == "" || !r.Config.RouterLearning.Enabled {
+		return false
+	}
+	cfg := r.Config.RouterLearning.Protection
+	if !cfg.EffectiveEnabled() || protectionMode(ctx) == config.DecisionAdaptationModeBypass {
+		return false
+	}
+	_, identityOK := r.protectionIdentity(ctx, cfg)
+	return identityOK
 }
 
 func (r *OpenAIRouter) shouldObserveRouterLearningTelemetry(ctx *RequestContext) bool {
@@ -91,15 +113,7 @@ func (r *OpenAIRouter) learningInputCostMultiplier(model string, usage responseU
 	if !ok || pricing.PromptPer1M <= 0 {
 		return 0
 	}
-	cached := clampCachedPromptTokensInt(usage.promptTokens, usage.cachedPromptTokens)
-	uncached := usage.promptTokens - cached
-	actualPromptCost := float64(uncached)*pricing.PromptPer1M +
-		float64(cached)*pricing.CachedInputPer1M
-	fullPromptCost := float64(usage.promptTokens) * pricing.PromptPer1M
-	if fullPromptCost <= 0 {
-		return 0
-	}
-	return clamp01(actualPromptCost / fullPromptCost)
+	return clamp01(modelpricing.InputCostMultiplier(modelPricingUsage(usage), modelPricingRates(pricing)))
 }
 
 func (rt *routerLearningRuntime) recordModelTelemetry(
@@ -111,8 +125,8 @@ func (rt *routerLearningRuntime) recordModelTelemetry(
 	if rt == nil || model == "" {
 		return
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.shared.mu.Lock()
+	defer rt.shared.mu.Unlock()
 	rt.recordModelTelemetryLocked(decisionName, decisionTier, model, observation)
 	if decisionName != "" {
 		rt.recordModelTelemetryLocked("", decisionTier, model, observation)
@@ -129,13 +143,13 @@ func (rt *routerLearningRuntime) recordModelTelemetryLocked(
 	observation routerLearningTelemetryObservation,
 ) {
 	key := modelExperienceKey(decisionName, decisionTier, model)
-	exp := rt.experience[key]
+	exp := rt.shared.experience[key]
 	if exp == nil {
 		exp = &routerLearningModelExperience{
 			QualitySeed: 0.5,
 			SeedWeight:  2,
 		}
-		rt.experience[key] = exp
+		rt.shared.experience[key] = exp
 	}
 	if observation.LatencyObserved {
 		exp.LatencyEWMA = updateRouterLearningEWMA(exp.LatencyEWMA, observation.LatencySeconds)

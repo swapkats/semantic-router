@@ -20,6 +20,12 @@ func NewProfile() *Profile {
 			"Tests Response API endpoints using Redis storage backend",
 			valuesFile,
 			redisManifest,
+			"--for=condition=available", "deployment/redis",
 		),
 	}
+}
+
+// GetTestCases returns the test cases for response-api-redis, including workflow resume restart recovery.
+func (p *Profile) GetTestCases() []string {
+	return append(p.RedisProfile.GetTestCases(), "workflow-resume-restart-recovery")
 }

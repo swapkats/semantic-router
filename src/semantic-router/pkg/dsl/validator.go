@@ -121,13 +121,7 @@ func ValidateWithSymbols(input string) ([]Diagnostic, *SymbolTable, []error) {
 		}
 	}
 
-	v := &Validator{
-		prog:        prog,
-		signalNames: make(map[string]map[string]bool),
-		modelNames:  make(map[string]bool),
-		modelLoRAs:  make(map[string]map[string]bool),
-		pluginNames: make(map[string]bool),
-	}
+	v := newValidator(prog)
 
 	// Level 1: Parser errors become Error diagnostics
 	for _, e := range parseErrors {
@@ -149,6 +143,7 @@ func ValidateWithSymbols(input string) ([]Diagnostic, *SymbolTable, []error) {
 
 	// Level 4: Conflict detection
 	v.checkConflicts()
+	v.checkRoutingScopes()
 
 	// Extract symbol table for editor completions
 	symbols := v.extractSymbolTable()
@@ -158,18 +153,23 @@ func ValidateWithSymbols(input string) ([]Diagnostic, *SymbolTable, []error) {
 
 // ValidateAST performs Level 2 and Level 3 validation on an existing AST.
 func ValidateAST(prog *Program) []Diagnostic {
-	v := &Validator{
+	v := newValidator(prog)
+	v.buildSymbolTable()
+	v.checkReferences()
+	v.checkConstraints()
+	v.checkConflicts()
+	v.checkRoutingScopes()
+	return v.diagnostics
+}
+
+func newValidator(prog *Program) *Validator {
+	return &Validator{
 		prog:        prog,
 		signalNames: make(map[string]map[string]bool),
 		modelNames:  make(map[string]bool),
 		modelLoRAs:  make(map[string]map[string]bool),
 		pluginNames: make(map[string]bool),
 	}
-	v.buildSymbolTable()
-	v.checkReferences()
-	v.checkConstraints()
-	v.checkConflicts()
-	return v.diagnostics
 }
 
 // ---------- Symbol Table ----------
@@ -179,7 +179,9 @@ func (v *Validator) buildSymbolTable() {
 		if v.signalNames[s.SignalType] == nil {
 			v.signalNames[s.SignalType] = make(map[string]bool)
 		}
-		v.signalNames[s.SignalType][s.Name] = true
+		if name := signalReferenceName(s); name != "" {
+			v.signalNames[s.SignalType][name] = true
+		}
 	}
 	if v.signalNames[config.SignalTypeProjection] == nil {
 		v.signalNames[config.SignalTypeProjection] = make(map[string]bool)
@@ -246,6 +248,23 @@ func (v *Validator) extractSymbolTable() *SymbolTable {
 
 // ---------- Level 2: Reference Checks ----------
 
+// routeAnswersWithFastResponse reports whether a route replies with the
+// fast_response plugin, inline or through a template: it calls no model, so
+// it needs no MODEL.
+func (v *Validator) routeAnswersWithFastResponse(route *RouteDecl) bool {
+	for _, ref := range route.Plugins {
+		if ref.Name == config.DecisionPluginFastResponse {
+			return true
+		}
+		for _, template := range v.prog.Plugins {
+			if template.Name == ref.Name && template.PluginType == config.DecisionPluginFastResponse {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (v *Validator) checkReferences() {
 	for _, route := range v.prog.Routes {
 		v.checkRouteReferences(route)
@@ -261,7 +280,7 @@ func (v *Validator) checkRouteReferences(route *RouteDecl) {
 		if !v.pluginNames[pr.Name] && !isInlinePluginType(pr.Name) {
 			fix := v.suggestPlugin(pr.Name)
 			v.addDiag(DiagWarning, pr.Pos,
-				fmt.Sprintf("Plugin %q is not defined as a template and is not a recognized inline plugin type. Supported inline types: system_prompt, semantic_cache, hallucination, memory, rag, tools, image_gen, fast_response, request_params, router_replay, header_mutation, response_jailbreak. Define a template with PLUGIN %s <type> { ... } or use a supported type", pr.Name, pr.Name),
+				fmt.Sprintf("Plugin %q is not defined as a template and is not a recognized inline plugin type. Supported inline types: %s. Define a template with PLUGIN %s <type> { ... } or use a supported type", pr.Name, strings.Join(config.SupportedDecisionPluginTypes(), ", "), pr.Name),
 				fix,
 			)
 		}
@@ -272,6 +291,9 @@ func (v *Validator) checkRouteReferences(route *RouteDecl) {
 	}
 
 	if !routeHasModelCandidates(route) {
+		if v.routeAnswersWithFastResponse(route) {
+			return
+		}
 		v.addDiag(DiagWarning, route.Pos,
 			fmt.Sprintf("Route %q has no MODEL specified. Add MODEL \"<model_name>\" inside the route body", route.Name),
 			nil,
@@ -334,12 +356,42 @@ func (v *Validator) walkBoolExpr(expr BoolExpr) {
 	case *SignalRefExpr:
 		if !v.isSignalDefined(e.SignalType, e.SignalName) {
 			fix := v.suggestSignal(e.SignalType, e.SignalName)
-			v.addDiag(DiagWarning, e.Pos,
-				fmt.Sprintf("Signal %s(\"%s\") referenced in WHEN clause is not defined. Add SIGNAL %s %s { ... } as a top-level declaration", e.SignalType, e.SignalName, e.SignalType, e.SignalName),
-				fix,
-			)
+			v.addDiag(DiagWarning, e.Pos, undefinedSignalRefMessage(e), fix)
 		}
 	}
+}
+
+func undefinedSignalRefMessage(e *SignalRefExpr) string {
+	if e.SignalType == config.SignalTypeAuthz {
+		return fmt.Sprintf("Signal authz(\"%s\") referenced in WHEN clause is not defined. An authz reference names a role: declare a SIGNAL authz with role: \"%s\"", e.SignalName, e.SignalName)
+	}
+	return fmt.Sprintf("Signal %s(\"%s\") referenced in WHEN clause is not defined. Add SIGNAL %s %s { ... } as a top-level declaration", e.SignalType, e.SignalName, e.SignalType, e.SignalName)
+}
+
+// signalReferenceName is the name WHEN clauses and projection inputs use for a
+// declared signal. The Router's authz signal emits the role a binding grants,
+// never the binding's own name.
+func signalReferenceName(s *SignalDecl) string {
+	if s.SignalType == config.SignalTypeAuthz {
+		role, _ := getStringField(s.Fields, "role")
+		return role
+	}
+	return s.Name
+}
+
+func boolExprSetsOnError(expr BoolExpr) bool {
+	switch e := expr.(type) {
+	case *BoolAnd:
+		return boolExprSetsOnError(e.Left) || boolExprSetsOnError(e.Right)
+	case *BoolOr:
+		return boolExprSetsOnError(e.Left) || boolExprSetsOnError(e.Right)
+	case *BoolNot:
+		return boolExprSetsOnError(e.Expr)
+	case *SignalRefExpr:
+		onError, _ := getStringField(e.Fields, "on_error")
+		return onError != ""
+	}
+	return false
 }
 
 func signalReferenceDefined(names map[string]bool, signalType, name string) bool {
@@ -398,12 +450,19 @@ var constraintRules = []constraintRule{
 	{field: "port", min: &floatMinPort, max: &floatMaxPort},
 	{field: "fuzzy_threshold", min: &floatZero},
 	{field: "ngram_arity", min: &floatOne},
+	{field: "minimum_candidates", min: &floatOne},
 }
 
 func (v *Validator) checkConstraints() {
 	// Check signals
 	for _, s := range v.prog.Signals {
 		v.checkSignalConstraints(s)
+	}
+
+	for _, plugin := range v.prog.Plugins {
+		if config.NormalizeDecisionPluginType(plugin.PluginType) == config.DecisionPluginPromptCache {
+			v.checkPromptCachePluginConstraints(plugin.Pos, plugin.Fields)
+		}
 	}
 
 	// Check routes
@@ -435,52 +494,49 @@ func (v *Validator) checkSignalConstraints(s *SignalDecl) {
 				nil,
 			)
 		}
-	case "embedding":
-		if _, ok := s.Fields["threshold"]; !ok {
-			v.addDiag(DiagConstraint, s.Pos,
-				fmt.Sprintf("%s: 'threshold' field is recommended", context),
-				nil,
-			)
-		}
-		if _, ok := s.Fields["candidates"]; !ok {
-			v.addDiag(DiagConstraint, s.Pos,
-				fmt.Sprintf("%s: 'candidates' field is recommended", context),
-				nil,
-			)
-		}
+		v.checkKeywordSignalConstraints(s, context)
 	case "domain":
 		v.checkDomainSignalConstraints(s, context)
-	case "structure":
-		v.checkStructureSignalConstraints(s)
+	case "context":
+		v.checkContextSignalConstraints(s, context)
 	case "conversation":
 		v.checkConversationSignalConstraints(s)
 	}
 }
 
-func (v *Validator) checkStructureSignalConstraints(s *SignalDecl) {
+// checkContextSignalConstraints rejects token bands the runtime would refuse:
+// neither limit set, unparsable or negative values, or min_tokens above
+// max_tokens. Equal values are an exact-match band, omitting max_tokens makes
+// the band open-ended, and omitting min_tokens means 0.
+func (v *Validator) checkContextSignalConstraints(s *SignalDecl, context string) {
+	if _, err := contextSignalBounds(s); err != nil {
+		v.addDiag(DiagConstraint, s.Pos, fmt.Sprintf("%s: %v", context, err), nil)
+	}
+}
+
+func (v *Validator) checkKeywordSignalConstraints(s *SignalDecl, context string) {
 	payload := dslFieldObjectFromValues(s.Fields)
 	payload.setString("name", s.Name)
 
 	raw, err := payload.marshalYAML()
 	if err != nil {
 		v.addDiag(DiagConstraint, s.Pos,
-			fmt.Sprintf("failed to encode structure signal %q: %v", s.Name, err),
+			fmt.Sprintf("failed to encode keyword signal %q: %v", s.Name, err),
 			nil,
 		)
 		return
 	}
 
-	var rule config.StructureRule
+	var rule config.KeywordRule
 	if err := yaml.Unmarshal(raw, &rule); err != nil {
 		v.addDiag(DiagConstraint, s.Pos,
-			fmt.Sprintf("failed to decode structure signal %q: %v", s.Name, err),
+			fmt.Sprintf("failed to decode keyword signal %q: %v", s.Name, err),
 			nil,
 		)
 		return
 	}
-	rule.Name = s.Name
-	if err := config.ValidateStructureRuleContract(rule); err != nil {
-		v.addDiag(DiagConstraint, s.Pos, err.Error(), nil)
+	if err := config.ValidateKeywordRuleContract(rule); err != nil {
+		v.addDiag(DiagConstraint, s.Pos, fmt.Sprintf("%s: %v", context, err), nil)
 	}
 }
 
@@ -522,16 +578,33 @@ func (v *Validator) checkRouteConstraints(r *RouteDecl) {
 		)
 	}
 
+	if r.OnUnknown != "" && !config.UnknownPolicy(r.OnUnknown).IsValid() {
+		v.addDiag(DiagConstraint, r.Pos,
+			fmt.Sprintf("%s: on_unknown must be %s, got %q", context, config.UnknownPolicyChoices(), r.OnUnknown),
+			nil,
+		)
+	}
+	if r.OnUnknown != "" && boolExprSetsOnError(r.When) {
+		v.addDiag(DiagConstraint, r.Pos, fmt.Sprintf("%s: %s", context, config.OnUnknownOnErrorConflictMessage), nil)
+	}
+
+	v.checkRouteAction(r, context)
+
 	// Check algorithm constraints
 	if r.Algorithm != nil {
 		v.checkAlgorithmConstraints(r.Algorithm, context)
+	}
+
+	for _, plugin := range r.Plugins {
+		v.checkPromptCachePluginRefConstraints(plugin)
 	}
 
 	for _, iter := range r.CandidateIterations {
 		v.checkCandidateIterationConstraints(r, iter, context)
 	}
 
-	v.checkRouteEmits(r)
+	v.checkRouteRetention(r)
+	v.checkRouteOutput(r)
 }
 
 func (v *Validator) checkAlgorithmConstraints(algo *AlgoSpec, parentContext string) {

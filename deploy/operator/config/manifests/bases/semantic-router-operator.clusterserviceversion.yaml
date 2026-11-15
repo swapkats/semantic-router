@@ -133,11 +133,12 @@ spec:
     * **Autoscaling**: Enable HPA with custom metrics
     * **Ingress**: Expose via ingress with TLS
 
-    See the [documentation](https://vllm-semantic-router.com) for detailed configuration options.
+    See the [documentation](https://vllm-sr.ai) for detailed configuration options.
 
     ### Architecture
 
-    The Semantic Router runs as an Envoy ExtProc filter, processing requests through:
+    The Semantic Router serves the OpenAI-compatible API itself (standalone mode), or runs as the
+    ExtProc filter of an existing Gateway, processing requests through:
 
     1. Prompt guard (jailbreak detection)
     2. PII detection and redaction
@@ -150,7 +151,7 @@ spec:
 
     For issues, feature requests, and contributions:
     * GitHub: https://github.com/vllm-project/semantic-router
-    * Documentation: https://vllm-semantic-router.com
+    * Documentation: https://vllm-sr.ai
   displayName: Semantic Router Operator
   icon:
   - base64data: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==
@@ -177,7 +178,7 @@ spec:
   - model-router
   links:
   - name: Semantic Router Documentation
-    url: https://vllm-semantic-router.com
+    url: https://vllm-sr.ai
   - name: GitHub Repository
     url: https://github.com/vllm-project/semantic-router
   maintainers:

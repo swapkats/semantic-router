@@ -1,7 +1,9 @@
 package classification
 
 import (
-	nlp_binding "github.com/vllm-project/semantic-router/nlp-binding"
+	"unicode/utf8"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification/lexical"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
 
@@ -11,21 +13,19 @@ type ruleMatch struct {
 	keywords      []string
 	matchCount    int
 	totalKeywords int
+	// value is a counting rule's count or density; measured marks one.
+	value    float64
+	measured bool
 }
 
-// classifyState holds per-call lazy caches so the BM25 / N-gram classifiers
-// are invoked at most once per ClassifyWithKeywordsAndCount call, regardless
-// of how many BM25 / N-gram rule refs appear in ruleOrder.
-//
-// Without this cache, an outer loop with N BM25 refs invokes the full BM25
-// classify N times, and each call internally iterates all rules until first
-// match, yielding O(N^2) work plus N CString allocations of the full prompt.
-type classifyState struct {
-	regexIdx    int
-	bm25Cached  bool
-	bm25Result  nlp_binding.MatchResult
-	ngramCached bool
-	ngramResult nlp_binding.MatchResult
+// KeywordRuleMatch describes one matching keyword rule. MatchAll returns these
+// in configuration order so callers can compose rule signals without changing
+// the legacy first-match classification APIs.
+type KeywordRuleMatch struct {
+	RuleName      string
+	Keywords      []string
+	MatchCount    int
+	TotalKeywords int
 }
 
 // ClassifyWithKeywordsAndCount performs keyword-based classification and returns:
@@ -35,91 +35,137 @@ type classifyState struct {
 // - totalKeywords: total number of keywords in the matched rule
 // - error: any error that occurred
 //
-// Rules are evaluated in the order they were defined in the config (first-match semantics),
-// regardless of method. Each rule is dispatched to its respective engine.
+// Rules are evaluated in the order they were defined in the config (first-match semantics).
 func (c *KeywordClassifier) ClassifyWithKeywordsAndCount(text string) (string, []string, int, int, error) {
 	if c == nil {
 		return "", nil, 0, 0, nil
 	}
-	state := classifyState{}
-
-	for _, ref := range c.ruleOrder {
-		match, err := c.classifyRule(text, ref, &state)
+	analysis := lexical.NewText(text)
+	for _, rule := range c.rules {
+		match, err := c.matchRule(text, analysis, rule)
 		if err != nil {
 			return "", nil, 0, 0, err
 		}
 		if match.matched {
-			logRuleMatch(ref.method, match.ruleName, match.keywords, match.matchCount, match.totalKeywords)
+			logRuleMatch(rule.method, match)
 			return match.ruleName, match.keywords, match.matchCount, match.totalKeywords, nil
 		}
 	}
 	return "", nil, 0, 0, nil
 }
 
-func (c *KeywordClassifier) classifyRule(text string, ref ruleRef, state *classifyState) (ruleMatch, error) {
-	switch ref.method {
-	case "bm25":
-		if !state.bm25Cached {
-			state.bm25Result = c.bm25Classifier.Classify(text)
-			state.bm25Cached = true
-		}
-		result := state.bm25Result
-		if !result.Matched || result.RuleName != ref.name {
-			return ruleMatch{}, nil
-		}
-		return ruleMatch{
-			matched:       true,
-			ruleName:      result.RuleName,
-			keywords:      result.MatchedKeywords,
-			matchCount:    result.MatchCount,
-			totalKeywords: result.TotalKeywords,
-		}, nil
-	case "ngram":
-		if !state.ngramCached {
-			state.ngramResult = c.ngramClassifier.Classify(text)
-			state.ngramCached = true
-		}
-		result := state.ngramResult
-		if !result.Matched || result.RuleName != ref.name {
-			return ruleMatch{}, nil
-		}
-		return ruleMatch{
-			matched:       true,
-			ruleName:      result.RuleName,
-			keywords:      result.MatchedKeywords,
-			matchCount:    result.MatchCount,
-			totalKeywords: result.TotalKeywords,
-		}, nil
-	case "regex":
-		return c.classifyRegexRule(text, &state.regexIdx)
-	default:
-		return ruleMatch{}, nil
-	}
+// MatchAll evaluates every keyword rule and returns all matches in declaration
+// order. Decision evaluation must use this method because a request can
+// satisfy multiple named signals that participate in AND, OR, and NOT
+// expressions.
+func (c *KeywordClassifier) MatchAll(text string) ([]KeywordRuleMatch, error) {
+	matches, _, err := c.MatchAllWithHistory(text, "")
+	return matches, err
 }
 
-func (c *KeywordClassifier) classifyRegexRule(text string, regexIdx *int) (ruleMatch, error) {
-	if *regexIdx >= len(c.regexRules) {
-		return ruleMatch{}, nil
+// MatchAllWithHistory is MatchAll with an optional conversation history.
+// Rules with includeHistory match against historyText (prior user messages
+// plus the current message) when it is non-empty; every other rule matches
+// against currentText only. It also returns, by rule name, the count or
+// density each counting rule measured, whether or not the rule matched.
+func (c *KeywordClassifier) MatchAllWithHistory(currentText, historyText string) ([]KeywordRuleMatch, map[string]float64, error) {
+	if c == nil {
+		return nil, nil, nil
 	}
-	rule := c.regexRules[*regexIdx]
-	*regexIdx++
-	matched, keywords, matchCount, err := c.matchesWithCount(text, rule)
-	if err != nil {
+	analysis := lexical.NewText(currentText)
+	// historyAnalysis is built lazily, only if some rule opts into history.
+	var historyAnalysis *lexical.Text
+	matches := make([]KeywordRuleMatch, 0)
+	var values map[string]float64
+
+	for _, rule := range c.rules {
+		text, ruleAnalysis := currentText, analysis
+		if rule.includeHistory && historyText != "" {
+			if historyAnalysis == nil {
+				historyAnalysis = lexical.NewText(historyText)
+			}
+			text, ruleAnalysis = historyText, historyAnalysis
+		}
+		match, err := c.matchRule(text, ruleAnalysis, rule)
+		if err != nil {
+			return nil, nil, err
+		}
+		if match.measured {
+			if values == nil {
+				values = make(map[string]float64)
+			}
+			values[rule.name] = match.value
+		}
+		if !match.matched {
+			continue
+		}
+		logRuleMatch(rule.method, match)
+		matches = append(matches, KeywordRuleMatch{
+			RuleName:      match.ruleName,
+			Keywords:      match.keywords,
+			MatchCount:    match.matchCount,
+			TotalKeywords: match.totalKeywords,
+		})
+	}
+	return matches, values, nil
+}
+
+// matchRule evaluates one rule. analysis shares tokenization between the
+// BM25 and n-gram rules of one call.
+func (c *KeywordClassifier) matchRule(text string, analysis *lexical.Text, rule keywordRule) (ruleMatch, error) {
+	if rule.measure != nil {
+		return rule.measureMatch(text), nil
+	}
+	if rule.scored != nil {
+		match, ok := rule.scored.Match(analysis)
+		if !ok {
+			return ruleMatch{}, nil
+		}
+		return ruleMatch{
+			matched:       true,
+			ruleName:      rule.name,
+			keywords:      match.Keywords,
+			matchCount:    match.MatchCount,
+			totalKeywords: match.TotalKeywords,
+		}, nil
+	}
+	matched, keywords, matchCount, err := c.matchesWithCount(text, *rule.regex)
+	if err != nil || !matched {
 		return ruleMatch{}, err
-	}
-	if !matched {
-		return ruleMatch{}, nil
 	}
 	return ruleMatch{
 		matched:       true,
-		ruleName:      rule.Name,
+		ruleName:      rule.name,
 		keywords:      keywords,
 		matchCount:    matchCount,
-		totalKeywords: len(rule.OriginalKeywords),
+		totalKeywords: len(rule.regex.OriginalKeywords),
 	}, nil
 }
 
-func logRuleMatch(method, ruleName string, keywords []string, matchCount, totalKeywords int) {
+// measureMatch counts the rule's keyword occurrences in text and matches
+// when the count, or the density per 1,000 characters, satisfies the rule's
+// predicate; an empty text has a density of zero.
+func (r keywordRule) measureMatch(text string) ruleMatch {
+	count, keywords := r.regex.occurrences(text)
+	value := float64(count)
+	if r.measure.density {
+		value = 0
+		if characters := utf8.RuneCountInString(text); characters > 0 {
+			value = 1000 * float64(count) / float64(characters)
+		}
+	}
+	return ruleMatch{
+		matched:       predicateMatches(value, r.measure.predicate),
+		ruleName:      r.name,
+		keywords:      keywords,
+		matchCount:    len(keywords),
+		totalKeywords: len(r.regex.OriginalKeywords),
+		value:         value,
+		measured:      true,
+	}
+}
+
+func logRuleMatch(method string, match ruleMatch) {
 	prefix := "Keyword-based"
 	switch method {
 	case "bm25":
@@ -127,10 +173,14 @@ func logRuleMatch(method, ruleName string, keywords []string, matchCount, totalK
 	case "ngram":
 		prefix = "N-gram keyword"
 	}
-	if len(keywords) > 0 {
+	switch {
+	case match.measured:
+		logging.Infof("%s classification matched rule %q on its count or density %g, with keywords: %v",
+			prefix, match.ruleName, match.value, match.keywords)
+	case len(match.keywords) > 0:
 		logging.Infof("%s classification matched rule %q with keywords: %v (%d/%d matched)",
-			prefix, ruleName, keywords, matchCount, totalKeywords)
-		return
+			prefix, match.ruleName, match.keywords, match.matchCount, match.totalKeywords)
+	default:
+		logging.Infof("%s classification matched rule %q with a NOR rule.", prefix, match.ruleName)
 	}
-	logging.Infof("%s classification matched rule %q with a NOR rule.", prefix, ruleName)
 }

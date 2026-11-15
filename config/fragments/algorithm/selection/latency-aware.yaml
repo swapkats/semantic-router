@@ -1,0 +1,6 @@
+algorithm:
+  type: multi_factor
+  multi_factor:
+    weights:
+      latency: 1
+    latency_percentile: 90

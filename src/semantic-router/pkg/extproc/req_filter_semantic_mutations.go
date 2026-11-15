@@ -1,0 +1,231 @@
+package extproc
+
+import (
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/pluginruntime"
+)
+
+func (r *OpenAIRouter) applySemanticReasoningMode(
+	request *llmprotocol.Request,
+	model string,
+	targetFormat llmprotocol.WireFormat,
+	enabled bool,
+	decision *config.Decision,
+) bool {
+	if request == nil {
+		return false
+	}
+	if preserveExplicitAnthropicReasoningOff(request, targetFormat) {
+		return false
+	}
+	family := r.getModelReasoningFamily(model)
+	if family == nil {
+		return false
+	}
+	effort, mode := semanticReasoningControls(r, family, decision, model, targetFormat, enabled)
+	mode, budget := messagesThinkingBudget(targetFormat, mode, request.ReasoningBudgetTokens)
+	if request.ReasoningEffort == effort && request.ReasoningMode == mode && request.ReasoningBudgetTokens == budget {
+		return false
+	}
+	request.ReasoningMode = mode
+	request.ReasoningEffort = effort
+	request.ReasoningBudgetTokens = budget
+	logging.Infof("Applied reasoning controls to model %q", model)
+	return true
+}
+
+// messagesThinkingBudget keeps a client's thinking budget only where the
+// Messages wire carries one. Messages has no enabled thinking without a
+// budget, so a family's enabled mode without one is sent as adaptive thinking
+// at the selected effort.
+func messagesThinkingBudget(
+	targetFormat llmprotocol.WireFormat,
+	mode llmprotocol.ReasoningMode,
+	budget *int64,
+) (llmprotocol.ReasoningMode, *int64) {
+	if targetFormat != llmprotocol.AnthropicMessagesV1 || mode != llmprotocol.ReasoningModeEnabled {
+		return mode, nil
+	}
+	if budget == nil {
+		return llmprotocol.ReasoningModeAdaptive, nil
+	}
+	return mode, budget
+}
+
+func semanticReasoningControls(
+	router *OpenAIRouter,
+	family *config.ReasoningFamilyConfig,
+	decision *config.Decision,
+	model string,
+	targetFormat llmprotocol.WireFormat,
+	enabled bool,
+) (string, llmprotocol.ReasoningMode) {
+	if targetFormat == llmprotocol.AnthropicMessagesV1 {
+		return semanticAnthropicReasoningControls(router, family, decision, model, enabled)
+	}
+	if targetFormat != llmprotocol.OpenAIResponsesV1 && targetFormat != llmprotocol.OpenAIChatV1 {
+		return "", ""
+	}
+	return semanticOpenAIReasoningControls(router, family, decision, model, enabled)
+}
+
+func semanticAnthropicReasoningControls(
+	router *OpenAIRouter,
+	family *config.ReasoningFamilyConfig,
+	decision *config.Decision,
+	model string,
+	enabled bool,
+) (string, llmprotocol.ReasoningMode) {
+	if enabled {
+		return router.getReasoningEffort(decision, model), llmprotocol.ReasoningMode(router.getReasoningMode(decision, model, true))
+	}
+	if reasoningFamilySupportsMode(family, string(llmprotocol.ReasoningModeDisabled)) {
+		return "", llmprotocol.ReasoningModeDisabled
+	}
+	return "", ""
+}
+
+func semanticOpenAIReasoningControls(
+	router *OpenAIRouter,
+	family *config.ReasoningFamilyConfig,
+	decision *config.Decision,
+	model string,
+	enabled bool,
+) (string, llmprotocol.ReasoningMode) {
+	if enabled {
+		return semanticEnabledOpenAIReasoningControls(router, family, decision, model)
+	}
+	return semanticDisabledOpenAIReasoningControls(family)
+}
+
+func semanticEnabledOpenAIReasoningControls(
+	router *OpenAIRouter,
+	family *config.ReasoningFamilyConfig,
+	decision *config.Decision,
+	model string,
+) (string, llmprotocol.ReasoningMode) {
+	switch family.Type {
+	case config.ReasoningFamilyTypeReasoningEffort,
+		config.ReasoningFamilyTypeTopLevelReasoningEffort:
+		return router.getReasoningEffort(decision, model), ""
+	case config.ReasoningFamilyTypeChatTemplateKwargs:
+		// vLLM's OpenAI-compatible Responses surface maps a standard effort
+		// to enable_thinking for boolean template controls.
+		return "high", ""
+	default:
+		// Provider adaptation owns non-standard string modes such as
+		// MiniMax's adaptive thinking_mode.
+		return "", ""
+	}
+}
+
+func semanticDisabledOpenAIReasoningControls(
+	family *config.ReasoningFamilyConfig,
+) (string, llmprotocol.ReasoningMode) {
+	switch family.Type {
+	case config.ReasoningFamilyTypeReasoningEffort,
+		config.ReasoningFamilyTypeTopLevelReasoningEffort:
+		if family.Disabled != "" ||
+			reasoningFamilySupportsMode(family, string(llmprotocol.ReasoningModeDisabled)) {
+			// The neutral OpenAI-compatible contract has one portable disabled
+			// effort value. Provider-native sentinels such as Hunyuan's
+			// "no_think" are projected only after encoding, at the final
+			// provider adapter boundary.
+			return "none", ""
+		}
+	case config.ReasoningFamilyTypeChatTemplateKwargs:
+		if family.Disabled != "" {
+			return "none", ""
+		}
+	}
+	return "", ""
+}
+
+func reasoningFamilySupportsMode(family *config.ReasoningFamilyConfig, mode string) bool {
+	if family == nil {
+		return false
+	}
+	for _, supported := range family.Modes {
+		if supported == mode {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *OpenAIRouter) addSemanticSystemPromptIfConfigured(
+	request *llmprotocol.Request,
+	decisionName string,
+	model string,
+	ctx *RequestContext,
+) (bool, error) {
+	if request == nil || ctx == nil {
+		return false, nil
+	}
+	promptConfig := config.SystemPromptPluginOf(requestPlugins(r.Config, ctx))
+	if promptConfig == nil || promptConfig.SystemPrompt == "" || !promptConfig.IsEnabled() {
+		return false, nil
+	}
+	start := time.Now()
+	_, span := tracing.StartPluginSpan(ctx.TraceContext, "system_prompt", decisionName)
+	mode := promptConfig.EffectiveMode()
+	routerContext := contextPromptBlocks(ctx, request, mode)
+	injected := llmprotocol.SetSystemInstruction(request, promptConfig.SystemPrompt, mode)
+	if len(routerContext) > 0 {
+		request.Instructions[0].Content = append(request.Instructions[0].Content, routerContext...)
+	}
+	latency := time.Since(start).Milliseconds()
+	tracing.SetSpanAttributes(span,
+		attribute.Bool("system_prompt.injected", injected),
+		attribute.String("system_prompt.mode", mode),
+		attribute.String(tracing.AttrDecisionName, decisionName),
+	)
+	tracing.EndPluginSpan(span, "success", latency, "prompt_injected")
+	ctx.VSRInjectedSystemPrompt = true
+	logging.Infof("Applied system instruction for decision %q to model %q", decisionName, model)
+	return true, nil
+}
+
+// contextPromptBlocks are the blocks the context plugin put at the front of
+// the first system instruction. replace keeps them after its prompt: it drops
+// what the caller sent, not the context the Router retrieved.
+func contextPromptBlocks(ctx *RequestContext, request *llmprotocol.Request, mode string) []llmprotocol.Content {
+	if mode == config.SystemPromptModeInsert {
+		return nil
+	}
+	for _, instruction := range request.Instructions {
+		if instruction.Role == llmprotocol.RoleSystem {
+			return instruction.Content[:min(ctx.contextPrefixBlocks, len(instruction.Content))]
+		}
+	}
+	return nil
+}
+
+func (r *OpenAIRouter) applySemanticRequestParams(
+	params *config.RequestParamsPluginConfig,
+	request *llmprotocol.Request,
+	decisionKey string,
+) (bool, error) {
+	if params == nil || request == nil {
+		return false, nil
+	}
+	result, err := pluginruntime.ApplyRequestParams(request, params)
+	for _, field := range result.Blocked {
+		metrics.RecordBlockedParam(decisionKey, field)
+	}
+	if result.CappedOutputTokens {
+		metrics.RecordMaxTokensCapped(decisionKey)
+	}
+	if result.CappedCandidateCount {
+		metrics.RecordMaxNCapped(decisionKey)
+	}
+	return result.Changed, err
+}

@@ -2,49 +2,64 @@ package config
 
 import (
 	"fmt"
+	"reflect"
 
 	"gopkg.in/yaml.v2"
 )
 
-type routingFragmentDocument struct {
-	Routing CanonicalRouting `yaml:"routing"`
-}
-
-// ParseRoutingYAMLBytes parses a routing-only YAML fragment containing the DSL-owned
-// canonical surface under `routing:`. This intentionally skips provider/global
-// cross-reference checks so DSL compile/decompile flows can round-trip fragments.
+// ParseRoutingYAMLBytes parses a routing fragment: a document holding only the
+// DSL-owned surface, its recipes and entrypoints and the providers.models[]
+// entries that state model facts. It intentionally skips provider and global
+// cross-reference checks so DSL compile/decompile flows can round-trip
+// fragments.
 func ParseRoutingYAMLBytes(data []byte) (*RouterConfig, error) {
+	data, formWarnings, err := applyConfigForms(data, configForms)
+	if err != nil {
+		return nil, err
+	}
 	raw, err := parseRawConfigMap(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse routing fragment: %w", err)
 	}
-	if rejectErr := rejectRemovedStructureFields(raw); rejectErr != nil {
-		return nil, rejectErr
+
+	// Fragments share the canonical routing vocabulary while omitting only
+	// infrastructure cross-reference validation.
+	if err := validateKnownFields(raw, reflect.TypeOf(CanonicalConfig{})); err != nil {
+		return nil, err
 	}
 
-	doc := &routingFragmentDocument{}
+	doc := &CanonicalConfig{}
 	if err := yaml.Unmarshal(data, doc); err != nil {
 		return nil, fmt.Errorf("failed to parse routing fragment: %w", err)
 	}
-
+	if err := validateCanonicalFallback(doc); err != nil {
+		return nil, err
+	}
 	cfg := DefaultGlobalConfig()
-	cfg.Decisions = copyDecisions(doc.Routing.Decisions)
-	ensureModelRefDefaults(cfg.Decisions)
-	cfg.Signals = normalizeSignals(doc.Routing.Signals, cfg.Decisions)
-	cfg.Projections = normalizeProjections(doc.Routing.Projections)
+	cfg.RoutingFragmentOnly = true
+	cfg.FormWarnings = formWarnings
+	routing := &CanonicalConfig{Recipes: doc.Recipes, Entrypoints: doc.Entrypoints}
+	if err := applyCanonicalRecipeState(&cfg, routing); err != nil {
+		return nil, err
+	}
 	cfg.ModelConfig = make(map[string]ModelParams)
-
-	for _, model := range canonicalRoutingModels(doc.Routing) {
-		cfg.ModelConfig[model.Name] = ModelParams{
+	for _, model := range doc.Providers.Models {
+		if !model.ModelFacts.declared() {
+			continue
+		}
+		params := ModelParams{
 			ParamSize:         model.ParamSize,
 			ContextWindowSize: model.ContextWindowSize,
+			MaxOutputTokens:   model.MaxOutputTokens,
 			Description:       model.Description,
 			Capabilities:      append([]string(nil), model.Capabilities...),
 			LoRAs:             copyLoRAAdapters(model.LoRAs),
 			Tags:              append([]string(nil), model.Tags...),
-			QualityScore:      model.QualityScore,
-			Modality:          model.Modality,
 		}
+		if model.Modalities != nil {
+			params.Modalities = cloneModalities(*model.Modalities)
+		}
+		cfg.ModelConfig[model.Name] = params
 	}
 
 	if cfg.VectorStore != nil {
@@ -60,7 +75,10 @@ func ParseRoutingYAMLBytes(data []byte) (*RouterConfig, error) {
 	if err := validateDecisionContracts(&cfg); err != nil {
 		return nil, err
 	}
-	if err := validateModalityContracts(&cfg); err != nil {
+	if err := validateApplicationSignalContracts(&cfg); err != nil {
+		return nil, err
+	}
+	if err := visitRoutingProfileConfigs(&cfg, validateDecisionOutputContracts); err != nil {
 		return nil, err
 	}
 

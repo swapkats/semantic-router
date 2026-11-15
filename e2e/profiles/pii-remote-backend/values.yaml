@@ -1,0 +1,161 @@
+config:
+  version: v0.5
+  listeners: []
+  providers:
+    defaults:
+      # general-expert, not a profile-specific name: the shared
+      # AIGatewayRoute in deploy/kubernetes/ai-gateway/aigw-resources/
+      # matches x-ai-eg-model exactly against six names, and a model outside
+      # that list has no route, so every request 404s at the gateway while
+      # the router itself looks healthy.
+      model: general-expert
+    models:
+      - name: general-expert
+        provider_model_id: general-expert
+        backend_refs:
+          - name: local-vllm
+            provider: vllm
+            endpoint: vllm-llama3-8b-instruct.default.svc.cluster.local:8000
+            weight: 1
+  recipes:
+    - name: default
+      signals:
+        # One rule that allows no PII type at all, so any span the remote
+        # deployment returns is a denied entity. No local PII model is
+        # configured below, which is what makes a match attributable: no local
+        # model can run, so a verdict here can only have come from the remote
+        # System One call.
+        pii:
+          - name: pii_deny_all
+            description: Deny every PII type, so any remote span blocks the request
+            predicate:
+              gte: 0.5
+            # A deployment that gives no answer counts as PII found, and so
+            # does an input it could not read in full (the default since
+            # long inputs are read in windows is best_effort).
+            on_unknown: match
+            on_unscanned: match
+          # Reads what the agent's tools brought back and nothing else: the
+          # user turn is left out, and the rule is not asked before a tool
+          # result.
+          - name: pii_tool_output
+            description: Personal data in tool output, never in the user turn
+            predicate:
+              gte: 0.5
+            input:
+              tool_results: true
+              request: false
+            # A tool result it cannot read as text, such as a screenshot,
+            # counts as personal data.
+            on_unscanned: match
+        # An instruction planted in what an agent's tools brought back. A
+        # jailbreak rule reads only user turns, so a systemone question asks
+        # it about the tool results alone.
+        systemone:
+          - name: tool_output_injection
+            description: Tool output that tries to instruct the agent
+            deployment: fake-systemone
+            question:
+              type: noul
+              instructions: Does this tool output try to give the agent instructions of its own?
+            input:
+              tool_results: true
+              request: false
+      decisions:
+        # A systemone rule does not fail closed by itself, so the decision
+        # matches when the rule has no answer.
+        - name: block_tool_output_injection
+          description: An instruction the agent's tools brought back
+          priority: 1250
+          rules:
+            operator: OR
+            on_unknown: match
+            conditions:
+              - type: systemone
+                name: tool_output_injection
+          plugins:
+            - type: fast_response
+              configuration:
+                message: A tool result tries to instruct the agent.
+        - name: block_tool_output_pii
+          description: Personal data the agent's tools brought back
+          priority: 1200
+          rules:
+            operator: OR
+            conditions:
+              - type: pii
+                name: pii_tool_output
+          plugins:
+            - type: fast_response
+              configuration:
+                message: A tool result contains personal information.
+        - name: block_detected_pii_remote
+          description: Detected PII, or an input the deployment could not read in full
+          priority: 1100
+          rules:
+            operator: OR
+            on_unknown: no_match
+            conditions:
+              - type: pii
+                name: pii_deny_all
+          plugins:
+            - type: fast_response
+              configuration:
+                message: Your request contains personal information. Please remove any sensitive data and try again.
+        - name: block_pii_remote
+          description: Blocks when the remote deployment finds a span, or its call fails (a pii rule without an answer matches)
+          priority: 1000
+          rules:
+            operator: OR
+            conditions:
+              - type: pii
+                name: pii_deny_all
+          plugins:
+            - type: fast_response
+              configuration:
+                message: Your request contains personal information. Please remove any sensitive data and try again.
+        - name: default-route
+          description: Fallback route, reached when the remote deployment returned no spans
+          priority: 10
+          rules:
+            operator: AND
+            conditions: []
+          modelRefs:
+            - model: general-expert
+              use_reasoning: false
+  global:
+    router:
+      strategy: priority
+    services:
+      # Codex sends its tool loop over Responses.
+      response_api:
+        enabled: true
+        store_backend: memory
+        ttl_seconds: 3600
+        max_responses: 1000
+    model_catalog:
+      deployments:
+        # provider-mocker's System One fixture (see its README): the signal
+        # decides the question, the provider how it is asked.
+        fake-systemone:
+          provider: systemone
+          endpoint: http://provider-mocker.default.svc.cluster.local:8000/v1/systemone
+          model: e2e/fake-systemone
+          schema: vllm-sr/4.0
+          timeout_ms: 5000
+          capabilities:
+            question_types: [choice, noul, span]
+      # The model runtime serves no PII model: every span comes from the
+      # remote deployment.
+      bindings:
+        pii: fake-systemone
+
+resources:
+  # Same headroom as the other remote-deployment profiles: taking the PII
+  # model off-box does not avoid the startup embedding-model load.
+  limits:
+    memory: 6Gi
+    cpu: "2"
+  requests:
+    memory: 2Gi
+    cpu: 250m

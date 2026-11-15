@@ -45,7 +45,7 @@ var builtinPresets = []PresetInfo{
 			{Name: "openai/gpt5.4", Role: "reasoning"},
 			{Name: "anthropic/claude-opus-4.6", Role: "premium"},
 		},
-		RecipeURL: "https://raw.githubusercontent.com/vllm-project/semantic-router/main/deploy/recipes/balance.yaml",
+		RecipeURL: "https://raw.githubusercontent.com/vllm-project/semantic-router/main/config/recipes/balance/config.yaml",
 	},
 	{
 		ID:      "security",
@@ -55,13 +55,13 @@ var builtinPresets = []PresetInfo{
 			{Name: "local/private-qwen", Role: "local-private"},
 			{Name: "cloud/frontier-reasoning", Role: "cloud-reasoning"},
 		},
-		RecipeURL: "https://raw.githubusercontent.com/vllm-project/semantic-router/main/deploy/recipes/privacy/privacy-router.yaml",
+		RecipeURL: "https://raw.githubusercontent.com/vllm-project/semantic-router/main/config/recipes/privacy/config.yaml",
 	},
 }
 
 func PresetsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}

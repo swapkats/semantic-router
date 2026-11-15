@@ -1,15 +1,13 @@
 package extproc
 
 import (
-	"fmt"
+	"bytes"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/anthropic"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
 
 // handleResponseBody processes the response body.
@@ -19,85 +17,75 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	}
 
 	completionLatency := time.Since(ctx.StartTime)
-
-	// Decrement active request count for queue depth estimation.
-	defer metrics.DecrementModelActiveRequests(ctx.RequestModel)
-
-	if looperResponse := r.handleLooperResponseBody(v.ResponseBody.Body, ctx); looperResponse != nil {
-		return looperResponse, nil
+	if !ctx.IsStreamingResponse || v.ResponseBody.GetEndOfStream() {
+		defer recordSessionTurnOutcome(ctx, responseUsageMetrics{})
 	}
 
-	// Anthropic clients on the streaming path always go through the
-	// outbound emitter so the client sees Anthropic-shape SSE,
-	// regardless of upstream APIFormat. The dispatcher branch order
-	// matters: this check precedes the older
-	// handleAnthropicStreamingResponseBody branch because the
-	// double-Anthropic cell (Anthropic client + Anthropic backend)
-	// would otherwise match the legacy branch and the client would
-	// receive OpenAI SSE.
-	if ctx.IsStreamingResponse && ctx.ClientProtocol == config.ClientProtocolAnthropic {
-		return r.handleAnthropicClientStreamingResponseBody(v.ResponseBody.Body, ctx), nil
+	responseBody, decoded, failure := r.decodeUpstreamResponseBody(v.ResponseBody.Body, ctx)
+	if failure != nil {
+		return failure, nil
+	}
+	response := r.handleDecodedResponseBody(responseBody, v.ResponseBody.GetEndOfStream(), completionLatency, ctx)
+	deliverUpstreamResponseBody(response, ctx, responseBody, decoded)
+	return response, nil
+}
+
+// handleDecodedResponseBody runs the response phases on the upstream body as
+// the router reads it, after any content coding is removed.
+func (r *OpenAIRouter) handleDecodedResponseBody(
+	responseBody []byte,
+	endOfStream bool,
+	completionLatency time.Duration,
+	ctx *RequestContext,
+) *ext_proc.ProcessingResponse {
+	if looperResponse := r.handleLooperResponseBody(responseBody, endOfStream, ctx); looperResponse != nil {
+		return looperResponse
 	}
 
-	// Legacy branch: OpenAI client hitting an Anthropic backend. The
-	// extra ClientProtocol guard prevents the new Anthropic-client
-	// branch from being shadowed by this one.
-	if ctx.IsStreamingResponse && ctx.APIFormat == config.APIFormatAnthropic &&
-		ctx.ClientProtocol != config.ClientProtocolAnthropic {
-		return r.handleAnthropicStreamingResponseBody(v.ResponseBody.Body, ctx), nil
-	}
-
-	responseBody, anthropicTransformed, err := r.normalizeProviderResponseBody(v.ResponseBody.Body, ctx)
-	if err != nil {
-		return r.createErrorResponse(502, fmt.Sprintf("Response transformation error: %v", err)), nil
+	if isUpstreamTransportError(ctx) {
+		return r.handleUpstreamTransportError(responseBody, ctx)
 	}
 
 	if ctx.IsStreamingResponse {
-		return r.handleStreamingResponseBody(responseBody, ctx), nil
+		return r.handleSemanticStreamingResponseBody(responseBody, endOfStream, ctx)
 	}
-
-	return r.handleNonStreamingResponseBody(responseBody, ctx, completionLatency, anthropicTransformed), nil
-}
-
-func (r *OpenAIRouter) handleLooperResponseBody(
-	responseBody []byte,
-	ctx *RequestContext,
-) *ext_proc.ProcessingResponse {
-	if !ctx.LooperRequest {
-		return nil
-	}
-
-	logging.Debugf("[Looper] Capturing response body for router replay")
-	r.attachRouterReplayResponse(ctx, responseBody, true)
-	return buildResponseBodyContinueResponse(nil, nil)
-}
-
-func (r *OpenAIRouter) normalizeProviderResponseBody(
-	responseBody []byte,
-	ctx *RequestContext,
-) ([]byte, bool, error) {
-	if ctx.APIFormat != config.APIFormatAnthropic {
-		return responseBody, false, nil
-	}
-
-	// Pass IRExtensions through so the Anthropic-only stop reason, cache
-	// usage counters, server-tool counts, and thinking-block signatures
-	// land on the per-request sidecar. The Anthropic outbound emitter
-	// (translateResponseBodyForClient → EmitAnthropicResponse) replays
-	// them on the response body so an Anthropic client sees the same
-	// fields the upstream actually produced.
-	transformedBody, err := anthropic.ToOpenAIResponseBodyWithExt(responseBody, ctx.RequestModel, ctx.IRExtensions)
-	if err != nil {
-		logging.Errorf("Failed to transform Anthropic response to OpenAI format: %v", err)
-		return nil, false, err
-	}
-
-	logging.Infof(
-		"Transformed Anthropic response to OpenAI format, original size: %d, transformed size: %d",
-		len(responseBody),
-		len(transformedBody),
+	// Recovery and redaction replace this slice before the pipeline copies
+	// it. Compare with the decoded upstream body so same-format Chat still
+	// emits BodyMutation. Gzip replacement stays in deliverUpstreamResponseBody.
+	incomingBody := responseBody
+	recoveredBody, recoveryErr := r.handleContextRecoveryFollowup(
+		ctx.TraceContext,
+		responseBody,
+		ctx,
 	)
-	return transformedBody, true, nil
+	if recoveryErr != nil {
+		logging.ComponentWarnEvent("extproc", "context_recovery_followup_failed", map[string]interface{}{
+			"request_id": ctx.RequestID,
+			"error":      recoveryErr.Error(),
+		})
+		if contextRecoveryFailClosed(r.Config, ctx) {
+			return r.createErrorResponse(502, "Context recovery followup failed")
+		}
+		responseBody = r.redactContextRecoveryToolCalls(responseBody, ctx)
+	} else {
+		responseBody = recoveredBody
+	}
+
+	return r.handleNonStreamingResponseBody(
+		responseBody,
+		ctx,
+		completionLatency,
+		!bytes.Equal(responseBody, incomingBody),
+	)
+}
+
+func contextRecoveryFailClosed(cfg *config.RouterConfig, ctx *RequestContext) bool {
+	if ctx == nil {
+		return false
+	}
+	plugin := contextCompression(requestPlugins(cfg, ctx))
+	return plugin != nil &&
+		plugin.Compress.EffectiveFailureMode() == config.ContextCompressionFailureClosed
 }
 
 func buildResponseBodyContinueResponse(

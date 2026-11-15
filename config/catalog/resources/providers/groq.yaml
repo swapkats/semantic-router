@@ -1,0 +1,66 @@
+id: groq
+display_name: Groq
+description: Low-latency hosted inference.
+category: model_api
+support_tier: compatible
+default_base_url: https://api.groq.com/openai/v1
+protocols:
+- openai/chat-completions@1
+default_protocol: openai/chat-completions@1
+supported_operations:
+- openai/chat-completions@1#create
+- openai/chat-completions@1#list_models
+auth:
+  strategy: bearer
+  header: Authorization
+  prefix: Bearer
+presentation:
+  logo: package:groq
+  monogram: G
+  monochrome: true
+conformance:
+  status: live_verified
+  verified_at: 2026-09-22
+models:
+- catalog: openai/gpt-oss-120b
+  relationship: managed_cloud
+  id: openai/gpt-oss-120b
+  protocols:
+  - openai/chat-completions@1
+  pricing:
+    currency: USD
+    prompt_per_1m: 0.15
+    completion_per_1m: 0.60
+  lifecycle: active
+  verification:
+    status: reproduced
+    verified_at: 2026-09-22
+    source: https://console.groq.com/docs/models
+- catalog: openai/gpt-oss-20b
+  relationship: managed_cloud
+  id: openai/gpt-oss-20b
+  protocols:
+  - openai/chat-completions@1
+  pricing:
+    currency: USD
+    prompt_per_1m: 0.075
+    completion_per_1m: 0.30
+  lifecycle: active
+  verification:
+    status: reproduced
+    verified_at: 2026-09-22
+    source: https://console.groq.com/docs/models
+- catalog: qwen/qwen3.8-27b
+  relationship: managed_cloud
+  id: qwen/qwen3.8-27b
+  protocols:
+  - openai/chat-completions@1
+  pricing:
+    currency: USD
+    prompt_per_1m: 0.80
+    completion_per_1m: 4.00
+  lifecycle: experimental
+  verification:
+    status: reproduced
+    verified_at: 2026-09-22
+    source: https://console.groq.com/docs/models

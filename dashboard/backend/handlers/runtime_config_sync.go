@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	managedContainerSourceConfigPath = "/app/config.yaml"
+	legacyManagedContainerConfigPath = "/app/config.yaml"
 	dashboardVenvPythonPath          = "/opt/vllm-sr-dashboard-venv/bin/python3"
 )
 
@@ -23,12 +23,11 @@ func configuredRuntimeConfigPath(configPath string) string {
 }
 
 func syncRuntimeConfigForCurrentRuntime(configPath string) (string, error) {
+	if isExplicitRuntimeConfigPath(configPath) {
+		return filepath.Clean(configPath), nil
+	}
 	if isRunningInContainer() && isManagedContainerConfigPath(configPath) {
 		return syncRuntimeConfigLocally(configPath)
-	}
-
-	if getDockerContainerStatus(managedRuntimeSyncContainerName()) == "running" {
-		return syncRuntimeConfigInManagedContainer()
 	}
 
 	return filepath.Clean(configPath), nil
@@ -36,7 +35,7 @@ func syncRuntimeConfigForCurrentRuntime(configPath string) (string, error) {
 
 func syncRuntimeConfigLocally(configPath string) (string, error) {
 	targetPath := configuredRuntimeConfigPath(configPath)
-	if targetPath == filepath.Clean(configPath) && !hasRuntimeOverrideEnv() {
+	if targetPath == filepath.Clean(configPath) && (!hasRuntimeOverrideEnv() || isExplicitRuntimeConfigPath(configPath)) {
 		return targetPath, nil
 	}
 
@@ -61,30 +60,14 @@ func syncRuntimeConfigLocally(configPath string) (string, error) {
 	return parseRuntimeSyncOutput(output, targetPath), nil
 }
 
-func syncRuntimeConfigInManagedContainer() (string, error) {
-	containerName := managedRuntimeSyncContainerName()
-	pythonBinary := "python3"
-	if managedRuntimeUsesSplitContainers() {
-		pythonBinary = dashboardVenvPythonPath
-	}
-	output, err := execInManagedContainer(
-		containerName,
-		30*time.Second,
-		pythonBinary,
-		"-c",
-		buildRuntimeSyncPythonScript("/app", managedContainerSourceConfigPath),
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to sync runtime config in %s: %w (output: %s)", containerName, err, strings.TrimSpace(output))
-	}
-	return parseRuntimeSyncOutput(output, configuredRuntimeConfigPath(managedContainerSourceConfigPath)), nil
+func isExplicitRuntimeConfigPath(configPath string) bool {
+	runtimePath := strings.TrimSpace(os.Getenv("VLLM_SR_RUNTIME_CONFIG_PATH"))
+	return runtimePath != "" && filepath.Clean(configPath) == filepath.Clean(runtimePath)
 }
 
 func hasRuntimeOverrideEnv() bool {
 	return strings.TrimSpace(os.Getenv("VLLM_SR_RUNTIME_CONFIG_PATH")) != "" ||
-		strings.TrimSpace(os.Getenv("VLLM_SR_ALGORITHM_OVERRIDE")) != "" ||
-		strings.TrimSpace(os.Getenv("VLLM_SR_PLATFORM")) != "" ||
-		strings.TrimSpace(os.Getenv("DASHBOARD_PLATFORM")) != ""
+		strings.TrimSpace(os.Getenv("VLLM_SR_ALGORITHM_OVERRIDE")) != ""
 }
 
 func runRuntimeSyncPython(timeout time.Duration, cliRoot string, configPath string, workDir string) (string, error) {
@@ -160,8 +143,7 @@ from cli.commands.runtime_support import sync_runtime_config
 
 config_path = Path(%q)
 algorithm = (os.getenv("VLLM_SR_ALGORITHM_OVERRIDE") or "").strip() or None
-platform = (os.getenv("VLLM_SR_PLATFORM") or os.getenv("DASHBOARD_PLATFORM") or "").strip() or None
-effective = sync_runtime_config(config_path, algorithm=algorithm, platform=platform)
+effective = sync_runtime_config(config_path, algorithm=algorithm)
 print(str(effective))
 `, cliRoot, configPath)
 }

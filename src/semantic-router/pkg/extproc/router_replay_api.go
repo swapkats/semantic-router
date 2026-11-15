@@ -8,20 +8,19 @@ import (
 	"strings"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 )
 
 const (
-	routerReplayAggregatePath          = routerReplayAPIBasePath + "/aggregate"
-	routerReplayDefaultListLimit       = 20
-	routerReplayMaxListLimit           = 100
-	routerReplayMaxImmediateResponseMB = 4 * 1024 * 1024
+	routerReplayAggregatePath    = routerReplayAPIBasePath + "/aggregate"
+	routerReplayDefaultListLimit = 20
+	routerReplayMaxListLimit     = 100
 )
 
 type routerReplayFilters struct {
 	search      string
+	recipe      string
 	decision    string
 	model       string
 	cacheStatus string
@@ -35,16 +34,7 @@ type routerReplayListQuery struct {
 	showDetails bool
 }
 
-type routerReplayListResponse struct {
-	Object     string                       `json:"object"`
-	Count      int                          `json:"count"`
-	Total      int                          `json:"total"`
-	Limit      int                          `json:"limit"`
-	Offset     int                          `json:"offset"`
-	HasMore    bool                         `json:"has_more"`
-	NextOffset *int                         `json:"next_offset,omitempty"`
-	Data       []routerreplay.RoutingRecord `json:"data"`
-}
+type routerReplayListResponse = routerreplay.ListResponse
 
 // handleRouterReplayAPI serves read-only endpoints for router replay records.
 func (r *OpenAIRouter) handleRouterReplayAPI(method string, path string) *ext_proc.ProcessingResponse {
@@ -64,6 +54,10 @@ func (r *OpenAIRouter) handleRouterReplayAPI(method string, path string) *ext_pr
 		return r.handleRouterReplayAggregateAPI(method, rawQuery)
 	case normalizedPath == routerReplayTrajectoryPath:
 		return r.handleRouterReplayTrajectoryAPI(method, rawQuery)
+	case normalizedPath == routerReplayDatasetPath:
+		return r.handleRouterReplayDatasetAPI(method, rawQuery)
+	case normalizedPath == routerReplayJudgeTasksPath:
+		return r.handleRouterReplayJudgeTasksAPI(method, rawQuery)
 	case strings.HasPrefix(normalizedPath, routerReplayAPIBasePath+"/"):
 		replayID := strings.TrimPrefix(normalizedPath, routerReplayAPIBasePath+"/")
 		return r.handleRouterReplayRecordAPI(method, replayID)
@@ -104,25 +98,11 @@ func (r *OpenAIRouter) handleRouterReplayListAPI(method string, rawQuery string)
 		return r.createErrorResponse(400, err.Error())
 	}
 
-	records := filterRouterReplayRecords(r.collectRouterReplayRecords(), query.filters)
-	payload := buildRouterReplayListPayload(records, query)
-	return r.createRouterReplayJSONResponse(200, payload)
-}
-
-func (r *OpenAIRouter) collectRouterReplayRecords() []routerreplay.RoutingRecord {
-	if r.ReplayStoreShared && r.ReplayRecorder != nil {
-		return sortRouterReplayRecords(r.ReplayRecorder.ListAllRecords())
+	payload, err := r.queryRouterReplayPage(query)
+	if err != nil {
+		return r.createErrorResponse(500, "router replay storage query failed")
 	}
-
-	var records []routerreplay.RoutingRecord
-	for _, recorder := range r.ReplayRecorders {
-		records = append(records, recorder.ListAllRecords()...)
-	}
-	if len(records) == 0 && r.ReplayRecorder != nil {
-		records = r.ReplayRecorder.ListAllRecords()
-	}
-
-	return sortRouterReplayRecords(records)
+	return r.createJSONResponse(200, payload)
 }
 
 func sortRouterReplayRecords(records []routerreplay.RoutingRecord) []routerreplay.RoutingRecord {
@@ -147,7 +127,7 @@ func (r *OpenAIRouter) handleRouterReplayRecordAPI(method string, replayID strin
 	if !ok {
 		return r.createErrorResponse(404, "replay record not found")
 	}
-	return r.createRouterReplayJSONResponse(200, record)
+	return r.createJSONResponse(200, record)
 }
 
 func (r *OpenAIRouter) findRouterReplayRecord(replayID string) (routerreplay.RoutingRecord, bool) {
@@ -169,7 +149,7 @@ func (r *OpenAIRouter) findRouterReplayRecord(replayID string) (routerreplay.Rou
 func parseRouterReplayListQuery(rawQuery string) (routerReplayListQuery, error) {
 	query := routerReplayListQuery{
 		limit:       routerReplayDefaultListLimit,
-		showDetails: true,
+		showDetails: false,
 	}
 	values, err := url.ParseQuery(rawQuery)
 	if err != nil {
@@ -215,6 +195,7 @@ func parseRouterReplayListQuery(rawQuery string) (routerReplayListQuery, error) 
 func parseRouterReplayFilters(values url.Values) (routerReplayFilters, error) {
 	filters := routerReplayFilters{
 		search:    strings.TrimSpace(values.Get("search")),
+		recipe:    strings.TrimSpace(values.Get("recipe")),
 		decision:  strings.TrimSpace(values.Get("decision")),
 		model:     strings.TrimSpace(values.Get("model")),
 		sessionID: strings.TrimSpace(values.Get("session_id")),
@@ -271,22 +252,41 @@ func doesRouterReplayRecordMatchFilters(
 	filters routerReplayFilters,
 	search string,
 ) bool {
-	if filters.cacheStatus != "" && !hasMatchingCacheStatus(record, filters.cacheStatus) {
-		return false
+	matches := [...]bool{
+		matchesOptionalCacheStatus(record, filters.cacheStatus),
+		matchesOptionalValue(record.Decision, filters.decision),
+		matchesOptionalValue(record.Recipe, filters.recipe),
+		matchesOptionalModel(record, filters.model),
+		matchesOptionalValue(record.SessionID, filters.sessionID),
+		matchesReplaySearch(record, search),
 	}
-	if filters.decision != "" && record.Decision != filters.decision {
-		return false
-	}
-	if filters.model != "" && !doesModelMatch(record, filters.model) {
-		return false
-	}
-	if filters.sessionID != "" && record.SessionID != filters.sessionID {
-		return false
-	}
-	if search != "" && !strings.Contains(strings.ToLower(record.RequestID), search) {
-		return false
+	for _, match := range matches {
+		if !match {
+			return false
+		}
 	}
 	return true
+}
+
+func matchesOptionalCacheStatus(record routerreplay.RoutingRecord, cacheStatus string) bool {
+	return cacheStatus == "" || hasMatchingCacheStatus(record, cacheStatus)
+}
+
+func matchesOptionalValue(value, filter string) bool {
+	return filter == "" || value == filter
+}
+
+func matchesOptionalModel(record routerreplay.RoutingRecord, model string) bool {
+	return model == "" || doesModelMatch(record, model)
+}
+
+func matchesReplaySearch(record routerreplay.RoutingRecord, search string) bool {
+	if search == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(record.RequestID), search) ||
+		strings.Contains(strings.ToLower(record.Recipe), search) ||
+		strings.Contains(strings.ToLower(record.SessionID), search)
 }
 
 func hasMatchingCacheStatus(record routerreplay.RoutingRecord, cacheStatus string) bool {
@@ -341,21 +341,4 @@ func buildRouterReplayListPayload(
 		payload.NextOffset = &nextOffset
 	}
 	return payload
-}
-
-func (r *OpenAIRouter) createRouterReplayJSONResponse(
-	statusCode int,
-	data interface{},
-) *ext_proc.ProcessingResponse {
-	response := r.createJSONResponse(statusCode, data)
-	if response == nil {
-		return nil
-	}
-	if proto.Size(response) <= routerReplayMaxImmediateResponseMB {
-		return response
-	}
-	return r.createErrorResponse(
-		413,
-		"router replay response exceeds the ext-proc message size limit; retry with a smaller page or reduce captured replay body bytes",
-	)
 }

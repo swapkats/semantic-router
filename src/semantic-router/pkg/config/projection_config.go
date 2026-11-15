@@ -9,7 +9,7 @@ type Projections struct {
 }
 
 // ProjectionPartition declares a mutually exclusive partition over existing
-// domain or embedding signals.
+// domain signals.
 type ProjectionPartition struct {
 	Name        string   `yaml:"name"`
 	Semantics   string   `yaml:"semantics"`
@@ -29,13 +29,76 @@ type ProjectionScore struct {
 type ProjectionScoreInput struct {
 	Type        string  `yaml:"type"`
 	Name        string  `yaml:"name,omitempty"`
-	KB          string  `yaml:"kb,omitempty"`
-	Metric      string  `yaml:"metric,omitempty"`
 	Weight      float64 `yaml:"weight"`
 	ValueSource string  `yaml:"value_source,omitempty"`
-	Match       float64 `yaml:"match,omitempty"`
-	Miss        float64 `yaml:"miss,omitempty"`
+	// Match is the binary value of a matched signal; omitted means 1, so an
+	// explicit 0 stays 0.
+	Match *float64 `yaml:"match,omitempty"`
+	Miss  float64  `yaml:"miss,omitempty"`
 }
+
+// ProjectionCatalogEntry is the canonical public identity for one projection
+// collection under routing.projections.
+type ProjectionCatalogEntry struct {
+	Collection  string `json:"collection"`
+	DisplayName string `json:"display_name"`
+}
+
+var projectionCatalog = []ProjectionCatalogEntry{
+	{Collection: "partitions", DisplayName: "Partitions"},
+	{Collection: "scores", DisplayName: "Scores"},
+	{Collection: "mappings", DisplayName: "Mappings"},
+}
+
+// ProjectionCatalog returns every supported derived-routing collection.
+func ProjectionCatalog() []ProjectionCatalogEntry {
+	return append([]ProjectionCatalogEntry(nil), projectionCatalog...)
+}
+
+var supportedProjectionInputTypes = []string{
+	SignalTypeKeyword,
+	SignalTypeDomain,
+	SignalTypeFactCheck,
+	SignalTypeUserFeedback,
+	SignalTypeLanguage,
+	SignalTypeContext,
+	SignalTypeComplexity,
+	SignalTypeModality,
+	SignalTypeAuthz,
+	SignalTypeJailbreak,
+	SignalTypeSafety,
+	SignalTypePII,
+	SignalTypeTurnRelation,
+	SignalTypeConversation,
+	SignalTypeInputModality,
+	SignalTypeSystemOne,
+	SignalTypeProjection,
+}
+
+// SupportedProjectionInputTypes returns the exact signal and derived-value
+// vocabulary accepted by projection score inputs.
+func SupportedProjectionInputTypes() []string {
+	return append([]string(nil), supportedProjectionInputTypes...)
+}
+
+func isProjectionInputTypeSupported(signalType string) bool {
+	for _, supported := range supportedProjectionInputTypes {
+		if signalType == supported {
+			return true
+		}
+	}
+	return false
+}
+
+// Projection input value sources are shared by runtime validation, DSL
+// validation, and projection execution. Keeping the vocabulary here prevents
+// those surfaces from drifting as new signal types are introduced.
+const (
+	ProjectionValueSourceScore      = "score"
+	ProjectionValueSourceBinary     = "binary"
+	ProjectionValueSourceConfidence = "confidence"
+	ProjectionValueSourceRaw        = "raw"
+)
 
 // Projection mapping methods control how matching output bands are selected
 // when a score is projected into named outputs.

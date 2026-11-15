@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
@@ -10,16 +10,25 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/configsnapshot"
 )
 
 const (
-	runtimeConfigPathEnv = "VLLM_SR_RUNTIME_CONFIG_PATH"
-	sourceConfigPathEnv  = "VLLM_SR_SOURCE_CONFIG_PATH"
+	runtimeConfigPathEnv = configsnapshot.RuntimeConfigPathEnv
+	sourceConfigPathEnv  = configsnapshot.SourceConfigPathEnv
 	runtimeAlgorithmEnv  = "VLLM_SR_ALGORITHM_OVERRIDE"
-	runtimePlatformEnv   = "VLLM_SR_PLATFORM"
-	dashboardPlatformEnv = "DASHBOARD_PLATFORM"
+	configBaseDirEnv     = config.ConfigBaseDirEnv
+	configBackupDirEnv   = configsnapshot.HistoryDirEnv
 	defaultPythonCLIPath = "/app"
 )
+
+// configBackupDir is the configuration history directory, which keeps the
+// backups this API writes beside the snapshots the Router records.
+func configBackupDir(sourceConfigPath string) string {
+	return configsnapshot.HistoryDir(sourceConfigPath)
+}
 
 type configPersistencePaths struct {
 	activePath  string
@@ -30,42 +39,12 @@ type configPersistencePaths struct {
 var runtimeConfigSyncRunner = syncRuntimeConfigForCurrentRuntime
 
 func resolveConfigPersistencePaths(activeConfigPath string) configPersistencePaths {
-	activePath := filepath.Clean(activeConfigPath)
-	sourcePath := strings.TrimSpace(os.Getenv(sourceConfigPathEnv))
-	if sourcePath == "" {
-		sourcePath = deriveSourceConfigPath(activePath)
-	}
-	if sourcePath == "" {
-		sourcePath = activePath
-	}
-	sourcePath = filepath.Clean(sourcePath)
-
-	runtimePath := strings.TrimSpace(os.Getenv(runtimeConfigPathEnv))
-	if runtimePath == "" {
-		runtimePath = activePath
-	}
-	runtimePath = filepath.Clean(runtimePath)
-
+	persistence := configsnapshot.ResolvePersistence(activeConfigPath)
 	return configPersistencePaths{
-		activePath:  activePath,
-		sourcePath:  sourcePath,
-		runtimePath: runtimePath,
+		activePath:  filepath.Clean(activeConfigPath),
+		sourcePath:  persistence.Source,
+		runtimePath: persistence.Runtime,
 	}
-}
-
-func deriveSourceConfigPath(activeConfigPath string) string {
-	activePath := filepath.Clean(activeConfigPath)
-	if filepath.Base(activePath) == "config.yaml" {
-		return activePath
-	}
-
-	parent := filepath.Base(filepath.Dir(activePath))
-	base := filepath.Base(activePath)
-	if parent == ".vllm-sr" && strings.HasPrefix(base, "runtime-config") && strings.HasSuffix(base, ".yaml") {
-		return filepath.Join(filepath.Dir(filepath.Dir(activePath)), "config.yaml")
-	}
-
-	return ""
 }
 
 func (p configPersistencePaths) usesRuntimeOverride() bool {
@@ -81,9 +60,7 @@ func configuredRuntimeConfigPath(sourceConfigPath string) string {
 
 func hasRuntimeOverrideEnv() bool {
 	return strings.TrimSpace(os.Getenv(runtimeConfigPathEnv)) != "" ||
-		strings.TrimSpace(os.Getenv(runtimeAlgorithmEnv)) != "" ||
-		strings.TrimSpace(os.Getenv(runtimePlatformEnv)) != "" ||
-		strings.TrimSpace(os.Getenv(dashboardPlatformEnv)) != ""
+		strings.TrimSpace(os.Getenv(runtimeAlgorithmEnv)) != ""
 }
 
 func syncRuntimeConfigForCurrentRuntime(sourceConfigPath string) (string, error) {
@@ -115,12 +92,21 @@ func syncRuntimeConfigForCurrentRuntime(sourceConfigPath string) (string, error)
 
 func detectPythonCLIRoot() string {
 	if configured := strings.TrimSpace(os.Getenv("VLLM_SR_CLI_PATH")); configured != "" {
-		return configured
+		if hasRuntimeSyncModule(configured) {
+			return configured
+		}
+		return ""
 	}
-	if info, err := os.Stat(defaultPythonCLIPath); err == nil && info.IsDir() {
+	if hasRuntimeSyncModule(defaultPythonCLIPath) {
 		return defaultPythonCLIPath
 	}
 	return ""
+}
+
+func hasRuntimeSyncModule(cliRoot string) bool {
+	modulePath := filepath.Join(cliRoot, "cli", "commands", "runtime_support.py")
+	info, err := os.Stat(modulePath)
+	return err == nil && !info.IsDir()
 }
 
 func runRuntimeSyncPython(timeout time.Duration, cliRoot string, configPath string, workDir string) (string, error) {
@@ -151,10 +137,9 @@ from cli.commands.runtime_support import sync_runtime_config
 
 config_path = Path(%q)
 algorithm = (os.getenv(%q) or "").strip() or None
-platform = (os.getenv(%q) or os.getenv(%q) or "").strip() or None
-effective = sync_runtime_config(config_path, algorithm=algorithm, platform=platform)
+effective = sync_runtime_config(config_path, algorithm=algorithm)
 print(str(effective))
-`, cliRoot, configPath, runtimeAlgorithmEnv, runtimePlatformEnv, dashboardPlatformEnv)
+`, cliRoot, configPath, runtimeAlgorithmEnv)
 }
 
 func parseRuntimeSyncOutput(output string, fallback string) string {

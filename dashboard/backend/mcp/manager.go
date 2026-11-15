@@ -3,28 +3,40 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/vllm-project/semantic-router/dashboard/backend/workflowstore"
 )
 
+var errManagerClosed = errors.New("MCP manager is closed")
+
 // Manager is the MCP client manager. Server configs are persisted in workflowstore;
 // active client connections remain in memory only.
 type Manager struct {
-	mu      sync.RWMutex
-	clients map[string]*Client
-	configs map[string]*ServerConfig
-	store   *workflowstore.Store
+	mu                 sync.RWMutex
+	clients            map[string]*Client
+	connectAttempts    map[string]*clientConnectAttempt
+	testConnections    map[*Client]context.CancelFunc
+	configs            map[string]*ServerConfig
+	store              *workflowstore.Store
+	closed             bool
+	connectWG          sync.WaitGroup
+	connectClientFn    func(context.Context, *Client) error
+	disconnectClientFn func(*Client) error
 }
 
 // NewManager loads persisted server configs from store and returns a new manager.
 func NewManager(store *workflowstore.Store) (*Manager, error) {
 	m := &Manager{
-		clients: make(map[string]*Client),
-		configs: make(map[string]*ServerConfig),
-		store:   store,
+		clients:         make(map[string]*Client),
+		connectAttempts: make(map[string]*clientConnectAttempt),
+		testConnections: make(map[*Client]context.CancelFunc),
+		configs:         make(map[string]*ServerConfig),
+		store:           store,
 	}
 	if store == nil {
 		return m, nil
@@ -95,11 +107,10 @@ func (m *Manager) AddServer(config *ServerConfig) error {
 	if _, exists := m.configs[config.ID]; exists {
 		return fmt.Errorf("server with ID %s already exists", config.ID)
 	}
-	m.configs[config.ID] = config
 	if err := m.persistConfig(config); err != nil {
-		delete(m.configs, config.ID)
 		return err
 	}
+	m.configs[config.ID] = config
 	return nil
 }
 
@@ -108,31 +119,37 @@ func (m *Manager) UpsertServer(config *ServerConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if client, ok := m.clients[config.ID]; ok {
-		_ = client.Disconnect()
-		delete(m.clients, config.ID)
+	if err := m.persistConfig(config); err != nil {
+		return err
 	}
+	_ = m.disconnectClientLocked(config.ID)
 
 	m.configs[config.ID] = config
-	return m.persistConfig(config)
+	return nil
 }
 
 // UpdateServer updates a server configuration and persists it.
+
 func (m *Manager) UpdateServer(config *ServerConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.configs[config.ID]; !exists {
+	existing, exists := m.configs[config.ID]
+	if !exists {
 		return fmt.Errorf("server with ID %s not found", config.ID)
 	}
-
-	if client, ok := m.clients[config.ID]; ok {
-		_ = client.Disconnect()
-		delete(m.clients, config.ID)
+	merged, err := mergeRedactedServerConfig(existing, config)
+	if err != nil {
+		return fmt.Errorf("update server config: %w", err)
 	}
 
-	m.configs[config.ID] = config
-	return m.persistConfig(config)
+	if err := m.persistConfig(merged); err != nil {
+		return err
+	}
+	_ = m.disconnectClientLocked(config.ID)
+
+	m.configs[config.ID] = merged
+	return nil
 }
 
 // DeleteServer deletes a server configuration and removes it from the store.
@@ -140,69 +157,19 @@ func (m *Manager) DeleteServer(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	config, exists := m.configs[id]
+	_, exists := m.configs[id]
 	if !exists {
 		return fmt.Errorf("server with ID %s not found", id)
 	}
 
-	if client, ok := m.clients[id]; ok {
-		_ = client.Disconnect()
-		delete(m.clients, id)
+	if m.store != nil {
+		if err := m.store.DeleteMCPServer(id); err != nil {
+			return err
+		}
 	}
-
+	_ = m.disconnectClientLocked(id)
 	delete(m.configs, id)
-	if m.store == nil {
-		return nil
-	}
-	if err := m.store.DeleteMCPServer(id); err != nil {
-		m.configs[id] = config
-		return err
-	}
 	return nil
-}
-
-// Connect establishes connection to the specified server
-func (m *Manager) Connect(ctx context.Context, id string) error {
-	m.mu.Lock()
-	config, ok := m.configs[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("server with ID %s not found", id)
-	}
-
-	// Disconnect existing client if any
-	if client, ok := m.clients[id]; ok {
-		_ = client.Disconnect()
-	}
-
-	// Create new client
-	client, err := NewClient(config)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-
-	m.clients[id] = client
-	m.mu.Unlock()
-
-	// Connect
-	return client.Connect(ctx)
-}
-
-// Disconnect disconnects from the specified server
-func (m *Manager) Disconnect(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	client, ok := m.clients[id]
-	if !ok {
-		return nil
-	}
-
-	err := client.Disconnect()
-	delete(m.clients, id)
-
-	return err
 }
 
 // GetServerStatus returns the server status
@@ -289,26 +256,12 @@ func (m *Manager) ExecuteTool(ctx context.Context, serverID, toolName string, ar
 	elapsed := time.Since(start)
 
 	if err != nil {
-		return &ToolResult{
-			Success:         false,
-			Error:           err.Error(),
-			ExecutionTimeMs: elapsed.Milliseconds(),
-		}, nil
-	}
-
-	// Convert content
-	var content interface{}
-	if len(result.Content) > 0 {
-		if len(result.Content) == 1 && result.Content[0].Type == "text" {
-			content = result.Content[0].Text
-		} else {
-			content = result.Content
-		}
+		return nil, fmt.Errorf("execute MCP tool: %w", err)
 	}
 
 	return &ToolResult{
 		Success:         !result.IsError,
-		Result:          content,
+		Result:          contentPayload(result),
 		ExecutionTimeMs: elapsed.Milliseconds(),
 	}, nil
 }
@@ -330,20 +283,67 @@ func (m *Manager) ExecuteToolStreaming(ctx context.Context, serverID, toolName s
 	return client.CallToolStreaming(ctx, toolName, arguments, onChunk)
 }
 
-// TestConnection tests the connection
+func (m *Manager) resolveConnectionTestConfig(config *ServerConfig) (*ServerConfig, error) {
+	if config == nil {
+		return nil, fmt.Errorf("MCP server config is required")
+	}
+
+	m.mu.RLock()
+	existing, exists := m.configs[config.ID]
+	if !exists {
+		existing = &ServerConfig{}
+	}
+	resolved, err := mergeRedactedServerConfig(existing, config)
+	m.mu.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("resolve connection test config: %w", err)
+	}
+	return resolved, nil
+}
+
+// TestConnection tests the connection without persisting the submitted config.
+// Redacted placeholders from the edit dialog are resolved against the stored
+// server before the temporary client is created.
 func (m *Manager) TestConnection(ctx context.Context, config *ServerConfig) error {
-	client, err := NewClient(config)
+	resolved, err := m.resolveConnectionTestConfig(config)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = client.Disconnect() }()
+	client, err := NewClient(resolved)
+	if err != nil {
+		return err
+	}
+	testCtx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		cancel()
+		return errManagerClosed
+	}
+	// Tests do not replace published clients, and multiple tests of the same
+	// server must each be canceled and joined during shutdown.
+	m.testConnections[client] = cancel
+	m.connectWG.Add(1)
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		_ = m.disconnectClient(client)
+		m.mu.Lock()
+		delete(m.testConnections, client)
+		m.mu.Unlock()
+		m.connectWG.Done()
+	}()
 
-	return client.Connect(ctx)
+	return m.connectClient(testCtx, client)
 }
 
 // ConnectEnabled connects to all enabled servers
 func (m *Manager) ConnectEnabled(ctx context.Context) {
 	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return
+	}
 	configs := make([]*ServerConfig, 0)
 	for _, config := range m.configs {
 		if config.Enabled {
@@ -354,13 +354,38 @@ func (m *Manager) ConnectEnabled(ctx context.Context) {
 
 	for _, config := range configs {
 		go func(c *ServerConfig) {
-			if err := m.Connect(ctx, c.ID); err != nil {
-				fmt.Printf("Failed to connect to MCP server %s: %v\n", c.Name, err)
-			} else {
-				fmt.Printf("Connected to MCP server %s\n", c.Name)
+			err := m.Connect(ctx, c.ID)
+			if err == nil {
+				log.Printf("[MCP-Manager] ConnectEnabled succeeded")
+				return
+			}
+			if !errors.Is(err, errManagerClosed) {
+				log.Printf("[MCP-Manager] ConnectEnabled failed: error_class=%T", err)
 			}
 		}(config)
 	}
+}
+
+// Close permanently stops new connections, cancels active connection attempts,
+// disconnects published clients, and waits for all connection goroutines to
+// finish their cleanup before returning.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	if !m.closed {
+		m.closed = true
+		for _, cancel := range m.testConnections {
+			cancel()
+		}
+		for id := range m.clients {
+			_ = m.disconnectClientLocked(id)
+		}
+	}
+	m.mu.Unlock()
+
+	// Connect and TestConnection add to connectWG while holding m.mu, and
+	// reject work after m.closed is set. Release the lock so in-flight calls
+	// can finish their cleanup before the wait completes.
+	m.connectWG.Wait()
 }
 
 // DisconnectAll disconnects all connections
@@ -368,8 +393,7 @@ func (m *Manager) DisconnectAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for id, client := range m.clients {
-		_ = client.Disconnect()
-		delete(m.clients, id)
+	for id := range m.clients {
+		_ = m.disconnectClientLocked(id)
 	}
 }

@@ -1,182 +1,227 @@
-name: Publish Helm Chart
+name: Helm Publisher
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches:
-      - main
-    paths:
-      - "deploy/helm/**"
-      - ".github/workflows/helm-publish.yml"
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
-    paths:
-      - "deploy/helm/**"
-      - ".github/workflows/helm-publish.yml"
-  workflow_dispatch:
-  # Called from nightly-build.yml to publish a nightly chart version.
   workflow_call:
     inputs:
-      is_nightly:
-        description: "Publish a nightly chart (version 0.0.0-nightly.YYYYMMDD)"
-        required: false
+      build-only:
+        description: Package the chart for a later gated publisher in this run.
         type: boolean
         default: false
-      nightly_date:
-        description: "Override date (YYYYMMDD) for nightly version. Defaults to today."
-        required: false
+      prebuilt-chart:
+        description: Promote the chart already packaged in this run.
+        type: boolean
+        default: false
+      mode:
+        description: One of main, nightly, or release.
+        required: true
         type: string
+      version:
+        description: Release version without a leading v.
+        required: false
         default: ""
+        type: string
+      tag:
+        description: Release image tag with a leading v.
+        required: false
+        default: ""
+        type: string
+      date:
+        description: The nightly run's publication date (YYYYMMDD), shared with its images.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
 
 env:
   HELM_VERSION: v3.14.0
   CHART_PATH: deploy/helm/semantic-router
   REGISTRY: ghcr.io
-  CHART_NAME: semantic-router
 
 jobs:
-  validate-and-package:
-    name: Validate and Package
-    if: ${{ !github.event.pull_request.draft }}
+  package:
+    name: Helm Package
+    if: ${{ !inputs.prebuilt-chart }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
-      chart-name: ${{ steps.package.outputs.name }}
-      chart-version: ${{ steps.versions.outputs.chart_version }}
-      chart-app-version: ${{ steps.versions.outputs.app_version }}
+      chart: ${{ steps.package.outputs.chart }}
+      version: ${{ steps.versions.outputs.chart_version }}
+      app_version: ${{ steps.versions.outputs.app_version }}
+      current: ${{ steps.current.outputs.current }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: azure/setup-helm@v4
         with:
           version: ${{ env.HELM_VERSION }}
 
-      - name: Lint chart
-        run: helm lint ${{ env.CHART_PATH }}
+      # Chart.lock pins the dependency charts, so its hash keys their archives
+      # and a hit downloads nothing.
+      - name: Cache dependency charts
+        id: dependency-cache
+        uses: actions/cache@v4
+        with:
+          path: deploy/helm/semantic-router/charts/*.tgz
+          key: helm-dependencies-${{ hashFiles('deploy/helm/semantic-router/Chart.lock') }}
+
+      - name: Fetch dependency charts
+        env:
+          HELM_DEPENDENCIES_CACHED: ${{ steps.dependency-cache.outputs.cache-hit }}
+        run: deploy/helm/fetch-dependencies.sh "$CHART_PATH"
 
       - name: Resolve chart versions
         id: versions
+        env:
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_DATE: ${{ inputs.date }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            # Tagged release — chart version mirrors the semver tag (without leading v)
-            CHART_VERSION="${GITHUB_REF#refs/tags/v}"
-            APP_VERSION="${GITHUB_REF#refs/tags/}"
-            echo "is_release=true" >> $GITHUB_OUTPUT
-          elif [[ "${{ inputs.is_nightly }}" == "true" ]]; then
-            # Nightly — use the supplied date or today's UTC date
-            if [[ -n "${{ inputs.nightly_date }}" ]]; then
-              DATE="${{ inputs.nightly_date }}"
-            else
-              DATE="$(date -u +'%Y%m%d')"
-            fi
-            # 0.0.0-nightly.YYYYMMDD is valid semver (pre-release identifier)
-            CHART_VERSION="0.0.0-nightly.${DATE}"
-            APP_VERSION="nightly-${DATE}"
-            echo "is_release=false" >> $GITHUB_OUTPUT
-          elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            CHART_VERSION="0.0.0-pr.${{ github.event.number }}"
-            APP_VERSION="pr-${{ github.event.number }}"
-            echo "is_release=false" >> $GITHUB_OUTPUT
-          else
-            # Push to main without a tag
-            CHART_VERSION="0.0.0-latest"
-            APP_VERSION="latest"
-            echo "is_release=false" >> $GITHUB_OUTPUT
-          fi
-          echo "chart_version=${CHART_VERSION}" >> $GITHUB_OUTPUT
-          echo "app_version=${APP_VERSION}"     >> $GITHUB_OUTPUT
+          case "$MODE" in
+            release)
+              if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] ||
+                 [[ "$RELEASE_TAG" != "v${RELEASE_VERSION}" ]]; then
+                echo "::error::Release Helm inputs do not match"
+                exit 1
+              fi
+              CHART_VERSION="$RELEASE_VERSION"
+              APP_VERSION="$RELEASE_TAG"
+              ;;
+            nightly)
+              if [[ ! "$RUN_DATE" =~ ^[0-9]{8}$ ]]; then
+                echo "::error::A nightly chart needs its run's date, the one its images carry"
+                exit 1
+              fi
+              CHART_VERSION="0.0.0-nightly.${RUN_DATE}"
+              APP_VERSION="nightly-${RUN_DATE}"
+              ;;
+            main)
+              CHART_VERSION="0.0.0-latest"
+              APP_VERSION="latest"
+              ;;
+            *)
+              echo "::error::Unsupported Helm publication mode '$MODE'"
+              exit 1
+              ;;
+          esac
+          {
+            echo "chart_version=$CHART_VERSION"
+            echo "app_version=$APP_VERSION"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Package chart
         id: package
         run: |
-          helm package -u ${{ env.CHART_PATH }} \
+          # The locked dependency charts are in charts/; -u would re-resolve
+          # them to their newest versions instead.
+          helm package "${{ env.CHART_PATH }}" \
             --version "${{ steps.versions.outputs.chart_version }}" \
             --app-version "${{ steps.versions.outputs.app_version }}" \
             --destination .
-          echo "name=$(ls *.tgz)" >> $GITHUB_OUTPUT
+          echo "chart=$(ls semantic-router-*.tgz)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload packaged chart
-        uses: actions/upload-artifact@v4
-        with:
-          name: helm-chart
-          path: "*.tgz"
-          retention-days: 1
-
-      - name: Create package summary
+      - name: Lint and render development chart
+        if: inputs.mode != 'release'
+        env:
+          CHART: ${{ steps.package.outputs.chart }}
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## Helm Chart Package
+          helm lint "$CHART"
+          helm template qualification "$CHART" > "$RUNNER_TEMP/rendered-chart.yaml"
+          test -s "$RUNNER_TEMP/rendered-chart.yaml"
 
-          - Chart: \`${{ env.CHART_NAME }}\`
-          - Version: \`${{ steps.versions.outputs.chart_version }}\`
-          - App Version: \`${{ steps.versions.outputs.app_version }}\`
-          - Package: \`${{ steps.package.outputs.name }}\`
-          - Event: \`${{ github.event_name }}\`
-          EOF
+      - name: Record chart archive identity
+        env:
+          CHART: ${{ steps.package.outputs.chart }}
+          VERSION: ${{ steps.versions.outputs.chart_version }}
+          APP_VERSION: ${{ steps.versions.outputs.app_version }}
+        run: |
+          python3 -m pip install PyYAML==6.0.3
+          helm show chart "$CHART" > "$RUNNER_TEMP/chart-metadata.yaml"
+          python3 - <<'PY_METADATA'
+          import os
+          from pathlib import Path
+          import yaml
+          chart = yaml.safe_load((Path(os.environ['RUNNER_TEMP']) / 'chart-metadata.yaml').read_text())
+          assert chart['version'] == os.environ['VERSION']
+          assert chart['appVersion'] == os.environ['APP_VERSION']
+          PY_METADATA
+          sha256sum "$CHART" > qualified-chart.sha256
+          printf '%s\n' "$GITHUB_SHA" > chart-source.txt
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << EOF
-
-          This PR run uploads the packaged chart as the \`helm-chart\` workflow artifact.
-          EOF
+      - name: Publish only the chart main's head carries
+        id: current
+        if: inputs.mode == 'main'
+        run: |
+          # Overlapping runs share the one mutable 0.0.0-latest version, so each
+          # may push only the chart main holds, whichever run finishes last.
+          git fetch --quiet --depth=1 origin main
+          if git diff --quiet HEAD FETCH_HEAD -- "$CHART_PATH"; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::A newer main commit changed the chart; its run publishes 0.0.0-latest."
           fi
 
-  publish-chart:
-    name: Publish to GHCR
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: helm-chart-${{ github.run_id }}
+          path: |
+            ${{ steps.package.outputs.chart }}
+            qualified-chart.sha256
+            chart-source.txt
+          retention-days: 1
+
+  publish:
+    name: Publish Helm Chart
+    needs: package
+    if: >-
+      always() && !cancelled() && !failure()
+      && !inputs.build-only
+      && (inputs.prebuilt-chart || needs.package.result == 'success')
+      && needs.package.outputs.current != 'false'
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    needs: validate-and-package
     permissions:
+      contents: read
       packages: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: helm-chart
+          name: helm-chart-${{ github.run_id }}
 
       - uses: azure/setup-helm@v4
         with:
           version: ${{ env.HELM_VERSION }}
 
-      - name: Publish chart
+      - name: Verify the qualified archive
         run: |
-          CHART="${{ needs.validate-and-package.outputs.chart-name }}"
-          REPO="${{ env.REGISTRY }}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/charts"
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-          helm push "$CHART" "oci://$REPO"
-          helm registry logout ${{ env.REGISTRY }}
+          test "$(cat chart-source.txt)" = "$GITHUB_SHA"
+          sha256sum --check qualified-chart.sha256
 
-      - name: Create release summary
+      - name: Publish chart
+        env:
+          CHART: ${{ inputs.prebuilt-chart && format('semantic-router-{0}.tgz', inputs.version) || needs.package.outputs.chart }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ needs.package.outputs.version }}
         run: |
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          CHART_VERSION="${{ needs.validate-and-package.outputs.chart-version }}"
-          REPO="${{ env.REGISTRY }}/${OWNER}/charts/${{ env.CHART_NAME }}"
-
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## Helm Chart Published
-
-          **Chart:** \`${{ env.CHART_NAME }}\`
-          **Version:** \`${CHART_VERSION}\`
-          **App Version:** \`${{ needs.validate-and-package.outputs.chart-app-version }}\`
-          **Registry:** \`${{ env.REGISTRY }}/${OWNER}/charts\`
-
-          ### Installation
-
-          \`\`\`bash
-          helm install semantic-router oci://${REPO} \\
-            --version ${CHART_VERSION} \\
-            --namespace vllm-semantic-router-system \\
-            --create-namespace
-          \`\`\`
-
-          ### Upgrade
-
-          \`\`\`bash
-          helm upgrade semantic-router oci://${REPO} \\
-            --version ${CHART_VERSION} \\
-            --namespace vllm-semantic-router-system \\
-            --reuse-values
-          \`\`\`
-          EOF
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            helm registry login "${{ env.REGISTRY }}" \
+              -u "${{ github.actor }}" --password-stdin
+          # A nightly chart version is published once; a re-run finds its own.
+          if [[ "$MODE" == nightly ]]; then
+            if helm show chart "oci://${{ env.REGISTRY }}/${OWNER}/charts/semantic-router" \
+              --version "$VERSION" > /dev/null 2> "$RUNNER_TEMP/published-chart.err"; then
+              echo "::notice::semantic-router $VERSION is already published; leaving it unchanged."
+              helm registry logout "${{ env.REGISTRY }}"
+              exit 0
+            fi
+            if ! grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/published-chart.err"; then
+              cat "$RUNNER_TEMP/published-chart.err" >&2
+              exit 1
+            fi
+          fi
+          helm push "$CHART" \
+            "oci://${{ env.REGISTRY }}/${OWNER}/charts"
+          helm registry logout "${{ env.REGISTRY }}"

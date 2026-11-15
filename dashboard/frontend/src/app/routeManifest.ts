@@ -1,18 +1,17 @@
 export type ShellRoutePage =
   | 'builder'
-  | 'clawos'
+  | 'config-reference'
   | 'dashboard'
+  | 'decision-model'
+  | 'decision-model-playground'
+  | 'decision-model-monitoring'
   | 'evaluation'
-  | 'fleet-sim'
-  | 'fleet-sim-fleets'
-  | 'fleet-sim-runs'
-  | 'fleet-sim-workloads'
   | 'insights'
   | 'insights-record'
   | 'logs'
+  | 'models'
   | 'monitoring'
   | 'playground'
-  | 'security'
   | 'status'
   | 'topology'
   | 'tracing'
@@ -25,13 +24,11 @@ export interface ShellRouteDefinition {
   hideAccountControl?: boolean
 }
 
-export interface RedirectRouteDefinition {
-  path: string
-  to: string
-}
-
 export const shellRouteDefinitions: readonly ShellRouteDefinition[] = [
   { path: '/dashboard', page: 'dashboard' },
+  { path: '/decision-model', page: 'decision-model' },
+  { path: '/decision-model/playground', page: 'decision-model-playground' },
+  { path: '/decision-model/monitoring', page: 'decision-model-monitoring' },
   { path: '/monitoring', page: 'monitoring' },
   {
     path: '/playground',
@@ -46,22 +43,11 @@ export const shellRouteDefinitions: readonly ShellRouteDefinition[] = [
   { path: '/insights', page: 'insights' },
   { path: '/insights/:recordId', page: 'insights-record' },
   { path: '/evaluation', page: 'evaluation' },
-  { path: '/fleet-sim', page: 'fleet-sim' },
-  { path: '/fleet-sim/workloads', page: 'fleet-sim-workloads' },
-  { path: '/fleet-sim/fleets', page: 'fleet-sim-fleets' },
-  { path: '/fleet-sim/runs', page: 'fleet-sim-runs' },
+  { path: '/models', page: 'models' },
   { path: '/builder', page: 'builder' },
-  { path: '/clawos', page: 'clawos' },
+  { path: '/config/reference', page: 'config-reference' },
   { path: '/users', page: 'users' },
-  { path: '/security', page: 'security' },
 ]
 
-export const redirectRouteDefinitions: readonly RedirectRouteDefinition[] = [
-  { path: '/knowledge-bases', to: '/knowledge-bases/bases' },
-  { path: '/taxonomy', to: '/knowledge-bases/bases' },
-  { path: '/openclaw', to: '/clawos' },
-]
-
-export const fallbackRouteTarget = (setupMode: boolean): string => (
+export const fallbackRouteTarget = (setupMode: boolean): string =>
   setupMode ? '/setup' : '/dashboard'
-)

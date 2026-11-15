@@ -58,6 +58,11 @@ global:
 `global` is broadest and can propose deployed models that do not appear in the
 matched decision's `modelRefs`, so it uses stricter cost and reliability guards.
 
+The resolved candidate set is a hard boundary. Protection does not reintroduce
+a previous session model that is outside it, and candidates with a known
+insufficient context window are removed before adaptation. This keeps learned
+continuity from overriding the matched decision or a model capability contract.
+
 ## Routing Sampling
 
 `routing_sampling` scores each candidate from model experience:
@@ -78,12 +83,10 @@ clear the switch guard before it becomes the final model.
 
 ## Diagnostics
 
-Headers stay compact:
+The `learning` member of `x-vsr-trace` stays compact:
 
 ```http
-x-vsr-learning-methods: adaptation,protection
-x-vsr-learning-actions: adaptation=keep_base,protection=hold_current
-x-vsr-learning-reasons: adaptation=base_best,protection=cache_cost_high
+x-vsr-trace: learning=(adaptation;action=keep_base;reason=base_best protection;action=hold_current;reason=cache_cost_high)
 ```
 
 Router Replay stores candidate scores, posterior mean, sampled value, base

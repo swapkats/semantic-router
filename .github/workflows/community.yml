@@ -1,0 +1,160 @@
+name: Community
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, ready_for_review, converted_to_draft]
+    branches: [main]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issues:
+    types: [opened, reopened, closed, edited, labeled, unlabeled, assigned, unassigned, milestoned, demilestoned]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  title-format:
+    name: Check title format
+    # An issue's title can only change when it is opened, reopened or edited;
+    # labels, assignees and milestones leave it as it was.
+    if: >-
+      (github.event_name == 'issues'
+      && github.event.issue.user.type != 'Bot'
+      && (github.event.action == 'opened' || github.event.action == 'reopened'
+      || (github.event.action == 'edited' && github.event.changes.title != null)))
+      || (github.event_name == 'pull_request'
+      && !github.event.pull_request.draft
+      && github.event.pull_request.user.type != 'Bot')
+    concurrency:
+      group: community-title-format-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Verify one bracketed title category
+        run: python3 tools/ci/community_lifecycle.py validate-title --event "$GITHUB_EVENT_PATH"
+
+  linked-issue:
+    name: Check linked accepted issue
+    # Review events only signal the trusted label-sync workflow.
+    if: >-
+      github.event_name == 'pull_request'
+      && !github.event.pull_request.draft
+      && github.event.pull_request.user.type != 'Bot'
+    concurrency:
+      group: community-linked-issue-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+
+      - name: Verify the linked issue is accepted and owned
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/ci/community_lifecycle.py validate-pr --event "$GITHUB_EVENT_PATH"
+
+  issue-lifecycle:
+    name: Enforce issue lifecycle
+    if: >-
+      github.event_name == 'issues'
+      && !(github.event.action == 'edited'
+      && github.event.changes.title != null
+      && github.event.changes.body == null)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Synchronize acceptance and delivery labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/ci/community_lifecycle.py sync-issue --event "$GITHUB_EVENT_PATH"
+
+  issue-kind:
+    name: Enforce issue kind label
+    if: >-
+      github.event_name == 'issues'
+      && github.event.action == 'edited'
+      && github.event.changes.title != null
+      && github.event.changes.body == null
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Synchronize structural issue kind
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/ci/community_lifecycle.py sync-issue-kind --event "$GITHUB_EVENT_PATH"
+
+  issue-acceptance:
+    name: Reconcile accepted issues
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request == null
+      && github.event.comment.body == '/accept'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Reconcile the commented issue and its linked pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/ci/community_lifecycle.py accept-issue --event "$GITHUB_EVENT_PATH"
+
+  issue-manager:
+    name: Issue commands
+    if: >-
+      github.event_name == 'issue_comment'
+      && startsWith(github.event.comment.body, '/')
+      && github.event.comment.body != '/accept'
+      && github.event.comment.body != '/netlify'
+      && !startsWith(github.event.comment.body, '/ci ')
+      && github.event.comment.body != '/ci'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: jpmcb/prow-github-actions@c44ac3a57d67639e39e4a4988b52049ef45b80dd
+        with:
+          prow-commands: '/assign
+            /unassign
+            /lgtm
+            /approve
+            /priority
+            /remove
+            /close
+            /reopen
+            /lock
+            /milestone
+            /hold
+            /cc
+            /uncc'
+          github-token: ${{ secrets.GITHUB_TOKEN }}

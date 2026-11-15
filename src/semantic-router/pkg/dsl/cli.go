@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
@@ -19,12 +21,19 @@ func CLICompile(inputPath, outputPath, format, crdName, crdNamespace, basePath s
 		return fmt.Errorf("failed to read input file: %w", err)
 	}
 
-	cfg, errs := Compile(string(data))
+	input := string(data)
+	cfg, errs := Compile(input)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			fmt.Fprintf(os.Stderr, "  %s\n", e)
 		}
 		return fmt.Errorf("%d compilation error(s)", len(errs))
+	}
+
+	// Refuse to write output on blocking validation diagnostics; parsing twice keeps Compile byte-identical.
+	if diags, _ := Validate(input); hasBlockingDiagnostics(diags) {
+		blocking := writeValidationDiagnostics(os.Stderr, diags)
+		return fmt.Errorf("%d blocking validation diagnostic(s); no output written", blocking)
 	}
 
 	output, err := emitFormat(cfg, format, crdName, crdNamespace, basePath)
@@ -64,22 +73,28 @@ func emitMergedConfig(cfg *config.RouterConfig, basePath string) ([]byte, error)
 	return MergeRoutingIntoBase(cfg, baseData)
 }
 
-// CLIDecompile reads a YAML config file and converts its routing surface to DSL text.
+// CLIDecompile reads a YAML config file and converts its default routing
+// profile plus entrypoint and recipe scopes to DSL text.
 func CLIDecompile(inputPath, outputPath string) error {
 	data, err := os.ReadFile(inputPath)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
 	}
 
-	cfg, err := config.ParseYAMLBytes(data)
+	// Decompilation is an offline source operation. Preserve environment
+	// references and do not require locally installed inference assets.
+	cfg, err := config.ParseYAMLBytesWithoutEnvExpansion(data)
 	if err != nil {
+		if !isRoutingOnlyFragment(data) {
+			return fmt.Errorf("failed to parse YAML: %w", err)
+		}
 		cfg, err = config.ParseRoutingYAMLBytes(data)
 		if err != nil {
 			return fmt.Errorf("failed to parse YAML: %w", err)
 		}
 	}
 
-	dslText, err := DecompileRouting(cfg)
+	dslText, err := Decompile(cfg)
 	if err != nil {
 		return fmt.Errorf("decompilation failed: %w", err)
 	}
@@ -87,17 +102,89 @@ func CLIDecompile(inputPath, outputPath string) error {
 	return writeOutput([]byte(dslText), outputPath)
 }
 
+// A routing-only fallback intentionally skips provider validation. Never use
+// it for a complete document: a fragment holds recipes, entrypoints and
+// providers.models[] entries that state only model facts, nothing else.
+func isRoutingOnlyFragment(data []byte) bool {
+	var fields map[string]interface{}
+	if err := yaml.Unmarshal(data, &fields); err != nil || fields["recipes"] == nil {
+		return false
+	}
+	for key, value := range fields {
+		switch key {
+		case "recipes", "entrypoints":
+		case "version":
+			if value != config.CanonicalConfigVersion {
+				return false
+			}
+		case "providers":
+			if !factOnlyProviders(value) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func factOnlyProviders(value interface{}) bool {
+	providers, ok := stringKeyed(value)
+	if !ok || len(providers) != 1 {
+		return false
+	}
+	models, ok := providers["models"].([]interface{})
+	if !ok {
+		return false
+	}
+	facts := map[string]bool{"name": true}
+	for _, field := range config.ModelFactFields() {
+		facts[field] = true
+	}
+	for _, raw := range models {
+		model, ok := stringKeyed(raw)
+		if !ok {
+			return false
+		}
+		for field := range model {
+			if !facts[field] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// stringKeyed reads a YAML mapping, which yaml.v2 decodes with interface keys
+// below the top level.
+func stringKeyed(value interface{}) (map[string]interface{}, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		return typed, true
+	case map[interface{}]interface{}:
+		mapping := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			name, ok := key.(string)
+			if !ok {
+				return nil, false
+			}
+			mapping[name] = item
+		}
+		return mapping, true
+	default:
+		return nil, false
+	}
+}
+
 // TestBlockRunnerFactory constructs a TEST block runner for a parsed program.
 type TestBlockRunnerFactory func(prog *Program) (TestBlockRunner, error)
 
-// CLIValidate reads a DSL file and reports diagnostics.
-// Returns the number of errors found.
+// CLIValidate reports diagnostics for a DSL file and returns the blocking count (errors and constraints, not warnings).
 func CLIValidate(inputPath string, w io.Writer) int {
 	return cliValidate(inputPath, w, nil)
 }
 
-// CLIValidateWithRunner reads a DSL file, reports diagnostics, and executes TEST blocks
-// using a runner factory when the parsed program contains them.
+// CLIValidateWithRunner is CLIValidate plus TEST-block runtime checks via the given runner factory.
 func CLIValidateWithRunner(inputPath string, w io.Writer, factory TestBlockRunnerFactory) int {
 	return cliValidate(inputPath, w, factory)
 }
@@ -126,7 +213,7 @@ func appendRuntimeValidationDiagnostics(input string, diags []Diagnostic, factor
 	}
 
 	prog, parseErrs := Parse(input)
-	if len(parseErrs) != 0 || prog == nil || !programNeedsRuntimeValidation(prog) {
+	if len(parseErrs) != 0 || prog == nil || len(prog.TestBlocks) == 0 {
 		return diags
 	}
 
@@ -135,38 +222,13 @@ func appendRuntimeValidationDiagnostics(input string, diags []Diagnostic, factor
 		return append(diags, Diagnostic{
 			Level:   DiagError,
 			Message: fmt.Sprintf("native runtime validation initialization failed: %v", err),
-			Pos:     runtimeValidationPos(prog),
+			Pos:     prog.TestBlocks[0].Pos,
 		})
 	}
-	return append(diags, collectRuntimeValidationDiagnostics(prog, runner)...)
+	return append(diags, ValidateTestBlocks(prog, runner)...)
 }
 
-func collectRuntimeValidationDiagnostics(prog *Program, runner TestBlockRunner) []Diagnostic {
-	diags := make([]Diagnostic, 0)
-	if len(prog.TestBlocks) > 0 {
-		diags = append(diags, ValidateTestBlocks(prog, runner)...)
-	}
-	if validator, ok := runner.(ProjectionPartitionRuntimeValidator); ok {
-		diags = append(diags, validator.ValidateProjectionPartitions(prog)...)
-	}
-	return diags
-}
-
-func runtimeValidationPos(prog *Program) Position {
-	if prog == nil {
-		return Position{}
-	}
-	if len(prog.TestBlocks) > 0 {
-		return prog.TestBlocks[0].Pos
-	}
-	for _, partition := range prog.ProjectionPartitions {
-		if programNeedsRuntimeValidation(&Program{ProjectionPartitions: []*ProjectionPartitionDecl{partition}}) {
-			return partition.Pos
-		}
-	}
-	return Position{}
-}
-
+// writeValidationDiagnostics prints diagnostics with a summary and returns the blocking (error + constraint) count.
 func writeValidationDiagnostics(w io.Writer, diags []Diagnostic) int {
 	var errCount, warnCount, constraintCount int
 	for _, d := range diags {
@@ -184,7 +246,7 @@ func writeValidationDiagnostics(w io.Writer, diags []Diagnostic) int {
 	_, _ = fmt.Fprintf(w, "\nSummary: 🔴 %d error(s)  🟡 %d warning(s)  🟠 %d constraint(s)\n",
 		errCount, warnCount, constraintCount)
 
-	return errCount
+	return errCount + constraintCount
 }
 
 func hasBlockingDiagnostics(diags []Diagnostic) bool {

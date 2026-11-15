@@ -967,10 +967,19 @@ spec:
                     type: object
                 type: object
               args:
-                description: Container arguments
+                description: |-
+                  Router arguments, after the gateway mode flags the Operator passes
+                  (-gateway=standalone -listener-address=0.0.0.0, or -gateway=extproc).
+                  The gateway mode follows spec.gateway, so args may not set those flags.
                 items:
+                  maxLength: 4096
                   type: string
+                maxItems: 64
                 type: array
+                x-kubernetes-validations:
+                - message: 'spec.args must not set -gateway or -listener-address:
+                    the gateway mode follows spec.gateway'
+                  rule: self.all(a, !a.matches('^--?(gateway|listener-address)(=|$)'))
               autoscaling:
                 description: Autoscaling configuration
                 properties:
@@ -1002,10 +1011,10 @@ spec:
                 type: object
               config:
                 description: |-
-                  Configuration overrides merged into the canonical v0.3 config.yaml.
+                  Configuration overrides merged into the canonical v0.5 config.yaml.
                   Router-wide runtime overrides land under config.global.router/services/stores/
-                  integrations/model_catalog, with model-backed modules nested under
-                  config.global.model_catalog.modules. Provider defaults land under
+                  integrations/model_catalog, and the default plugins under
+                  config.global.plugins. Provider defaults land under
                   config.providers.defaults.
                 properties:
                   api:
@@ -1015,14 +1024,8 @@ spec:
                         description: BatchClassificationConfig defines batch classification
                           configuration
                         properties:
-                          concurrency_threshold:
-                            default: 5
-                            type: integer
                           max_batch_size:
                             default: 100
-                            type: integer
-                          max_concurrency:
-                            default: 8
                             type: integer
                           metrics:
                             description: BatchMetricsConfig defines batch classification
@@ -1058,48 +1061,30 @@ spec:
                         type: object
                     type: object
                   classifier:
-                    description: Classifier configuration
-                    properties:
-                      category_model:
-                        description: CategoryModelConfig defines category model configuration
-                        properties:
-                          category_mapping_path:
-                            type: string
-                          model_id:
-                            type: string
-                          threshold:
-                            description: Classification threshold (0.0-1.0). Stored
-                              as string to avoid float precision issues.
-                            pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
-                            type: string
-                          use_cpu:
-                            type: boolean
-                          use_modernbert:
-                            type: boolean
-                        type: object
-                      pii_model:
-                        description: PIIModelConfig defines PII model configuration
-                        properties:
-                          model_id:
-                            type: string
-                          pii_mapping_path:
-                            type: string
-                          threshold:
-                            description: Detection threshold (0.0-1.0). Stored as
-                              string to avoid float precision issues.
-                            pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
-                            type: string
-                          use_cpu:
-                            type: boolean
-                          use_modernbert:
-                            type: boolean
-                        type: object
+                    description: |-
+                      Classifier is removed: the decision model answers domain and pii rules,
+                      and a threshold is the rule's predicate. A resource that sets it is
+                      refused.
                     type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  complexity_model:
+                    description: |-
+                      ComplexityModel is removed: the decision model answers complexity
+                      rules. A resource that sets it is refused.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   complexity_rules:
                     description: Complexity rules for complexity-aware routing
                     items:
-                      description: ComplexityRulesConfig defines complexity-based
-                        signal classification
+                      description: |-
+                        ComplexityRulesConfig defines complexity-based signal classification.
+
+                        The CEL rules below reject at admission the boundary combinations the Router
+                        refuses at config load. Without them the API server accepts the object and
+                        the Router crashloops on it, which turns a typo into an outage instead of a
+                        rejected write. They are per-object and static; anything needing the model
+                        catalog - whether backend.model resolves, for instance - stays with the
+                        Router's validator, which remains the single source of truth for the rest.
                       properties:
                         composer:
                           description: Composer allows filtering based on other signals
@@ -1141,7 +1126,9 @@ spec:
                           description: Description of what this rule classifies
                           type: string
                         easy:
-                          description: Easy candidates represent simple/easy examples
+                          description: |-
+                            Easy candidates represent simple/easy examples. Read only by the local
+                            path; a remote backend never consults them, so they are optional.
                           properties:
                             candidates:
                               description: List of candidate phrases or examples
@@ -1151,9 +1138,24 @@ spec:
                           required:
                           - candidates
                           type: object
+                        easy_above:
+                          description: |-
+                            EasyAbove is the upper cut point of the harder-when-lower pair: a score
+                            above it is "easy", and anything between HardBelow and EasyAbove is
+                            "medium". It must be above HardBelow, and both are required together.
+                          pattern: ^-?[0-9]+(\.[0-9]+)?$
+                          type: string
+                        easy_below:
+                          description: |-
+                            EasyBelow is the lower cut point of the harder-when-higher pair: a score
+                            below it is "easy", and anything between EasyBelow and HardAbove is
+                            "medium". It must be below HardAbove, and both are required together.
+                          pattern: ^-?[0-9]+(\.[0-9]+)?$
+                          type: string
                         hard:
-                          description: Hard candidates represent complex/difficult
-                            examples
+                          description: |-
+                            Hard candidates represent complex/difficult examples. Read only by the
+                            local path; a remote backend never consults them, so they are optional.
                           properties:
                             candidates:
                               description: List of candidate phrases or examples
@@ -1163,22 +1165,116 @@ spec:
                           required:
                           - candidates
                           type: object
+                        hard_above:
+                          description: |-
+                            HardAbove and EasyBelow are the two cut points for a score where a
+                            higher value is harder, in the scoring model's own units - so no [0,1]
+                            pattern applies and negative values are valid. Both are required
+                            together, and the pair is mutually exclusive with Threshold and with
+                            HardBelow/EasyAbove. Stored as strings to avoid float precision issues.
+                          pattern: ^-?[0-9]+(\.[0-9]+)?$
+                          type: string
+                        hard_below:
+                          description: |-
+                            HardBelow and EasyAbove are the pair for a score where a lower value is
+                            harder - a model predicting the chance of a correct answer, say. They
+                            require a score.v1 backend: the local margin is harder-when-higher by
+                            construction, and inverting it locally means swapping the candidate
+                            lists. Stored as strings to avoid float precision issues.
+                          pattern: ^-?[0-9]+(\.[0-9]+)?$
+                          type: string
                         name:
                           description: Name of the complexity rule (e.g., "code-complexity",
                             "reasoning-complexity")
                           type: string
+                        prototype_scoring:
+                          description: |-
+                            PrototypeScoring replaces the family prototype-scoring configuration for
+                            this rule. Absence inherits the family; a present object is a complete
+                            override, including an empty object. Defaults remain Router-owned.
+                          properties:
+                            best_weight:
+                              description: BestWeight weights the best prototype against
+                                the top-M mean.
+                              pattern: ^-?[0-9]+(\.[0-9]+)?$
+                              type: string
+                            cluster_similarity_threshold:
+                              description: |-
+                                ClusterSimilarityThreshold is the clustering similarity threshold.
+                                Stored as a numeric string, like other fractional operator config fields.
+                              pattern: ^-?[0-9]+(\.[0-9]+)?$
+                              type: string
+                            enabled:
+                              description: Enabled controls prototype clustering.
+                                False retains every candidate.
+                              type: boolean
+                            margin_threshold:
+                              description: MarginThreshold is the minimum winner-versus-runner-up
+                                score margin.
+                              pattern: ^-?[0-9]+(\.[0-9]+)?$
+                              type: string
+                            max_prototypes:
+                              description: MaxPrototypes caps the number of cluster
+                                representatives.
+                              type: integer
+                            top_m:
+                              description: TopM is the number of highest-scoring prototypes
+                                included in the mean.
+                              type: integer
+                          type: object
                         threshold:
                           description: |-
-                            Threshold for difficulty classification (0.0-1.0). Stored as string to avoid float precision issues.
-                            Queries scoring above this threshold are classified as "hard"
+                            Threshold for the local prototype-scoring path (0.0-1.0), stored as a
+                            string to avoid float precision issues. The local margin is
+                            hard-minus-easy and centred on zero, so the threshold is symmetric: a
+                            margin above it is "hard", below its negative is "easy", and in between
+                            is "medium". It does not apply under a score.v1 backend, whose score is
+                            in the model's own units; state a boundary pair instead.
                           pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
                           type: string
                       required:
-                      - easy
-                      - hard
                       - name
                       type: object
+                      x-kubernetes-validations:
+                      - message: threshold and an explicit boundary pair are mutually
+                          exclusive; keep one
+                        rule: '!(has(self.threshold) && (has(self.hard_above) || has(self.easy_below)
+                          || has(self.hard_below) || has(self.easy_above)))'
+                      - message: 'a rule states one direction: use hard_above with
+                          easy_below, or hard_below with easy_above'
+                        rule: '!((has(self.hard_above) || has(self.easy_below)) &&
+                          (has(self.hard_below) || has(self.easy_above)))'
+                      - message: hard_above and easy_below are required together
+                        rule: has(self.hard_above) == has(self.easy_below)
+                      - message: hard_below and easy_above are required together
+                        rule: has(self.hard_below) == has(self.easy_above)
+                      - message: easy_below must be below hard_above; the band between
+                          them is medium
+                        rule: '!(has(self.hard_above) && has(self.easy_below)) ||
+                          double(self.easy_below) < double(self.hard_above)'
+                      - message: hard_below must be below easy_above; the band between
+                          them is medium
+                        rule: '!(has(self.hard_below) && has(self.easy_above)) ||
+                          double(self.hard_below) < double(self.easy_above)'
                     type: array
+                  decision_model:
+                    description: |-
+                      DecisionModel selects the declared deployment that answers default judgment
+                      tasks: a model_runtime deployment, or a systemone deployment that a remote
+                      System One API serves. Every built-in signal that no binding names follows
+                      it. A module threshold the resource does not set comes from the deployment
+                      that answers the module: calibrated for a built-in model, 0.5 for a
+                      systemone one. Omitted uses the Router's primary deployment. Artifact
+                      identity belongs in model_deployments; the reference never infers a model
+                      family or alias.
+                    properties:
+                      deployment:
+                        description: Deployment is an exact key in model_deployments.
+                        minLength: 1
+                        type: string
+                    required:
+                    - deployment
+                    type: object
                   decisions:
                     description: Routing decisions based on signals (domain, complexity,
                       etc.)
@@ -1196,6 +1292,41 @@ spec:
                           description: Description provides information about what
                             this decision handles
                           type: string
+                        fallback:
+                          description: |-
+                            Fallback overrides the cross-model fallback policy for this decision's
+                            requests, over the recipe's and the router's
+                          properties:
+                            enabled:
+                              description: Enabled turns cross-model fallback on or
+                                off for this decision
+                              type: boolean
+                            max_attempts:
+                              description: MaxAttempts bounds the candidates tried,
+                                the first one included
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            per_attempt_timeout:
+                              description: PerAttemptTimeout bounds each candidate's
+                                attempt
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            retryable_status_codes:
+                              description: RetryableStatusCodes are the statuses that
+                                move on to the next candidate
+                              items:
+                                format: int32
+                                maximum: 599
+                                minimum: 100
+                                type: integer
+                              type: array
+                            total_timeout:
+                              description: TotalTimeout bounds the whole fallback
+                                chain
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                          type: object
                         modelRefs:
                           description: ModelRefs contains model references for this
                             decision
@@ -1211,8 +1342,17 @@ spec:
                                 description: Model name to route to
                                 type: string
                               reasoning_effort:
-                                description: ReasoningEffort specifies the reasoning
-                                  effort level (low, medium, high)
+                                description: ReasoningEffort selects one of the model
+                                  family's declared effort levels.
+                                type: string
+                              reasoning_mode:
+                                description: |-
+                                  ReasoningMode selects the model's reasoning activation mode when the
+                                  family supports more than a boolean switch.
+                                enum:
+                                - enabled
+                                - disabled
+                                - adaptive
                                 type: string
                               use_reasoning:
                                 description: UseReasoning enables reasoning mode for
@@ -1225,6 +1365,14 @@ spec:
                         name:
                           description: Name is the unique identifier for this decision
                           type: string
+                        output:
+                          description: |-
+                            Output declares the media this decision's answers carry, such as
+                            {kind: image, action: generate}; without it the decision answers in
+                            text. The router checks it against the referenced models when it loads
+                            the configuration.
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
                         plugins:
                           description: Plugins contains policy configurations applied
                             after rule matching
@@ -1242,6 +1390,71 @@ spec:
                           description: Priority is used for decision ordering - higher
                             priority decisions are evaluated first
                           type: integer
+                        reliability:
+                          description: |-
+                            Reliability overrides the timeouts and retries of the provider model
+                            that serves this decision's requests
+                          properties:
+                            first_byte_timeout:
+                              description: |-
+                                FirstByteTimeout bounds the wait for the first response byte
+                                (standalone mode only)
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            idle_timeout:
+                              description: |-
+                                IdleTimeout bounds the wait for more of a streamed response
+                                (standalone mode only)
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            per_try_timeout:
+                              description: PerTryTimeout bounds each attempt until
+                                its response starts
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            retriable_status_codes:
+                              description: RetriableStatusCodes adds statuses retried
+                                under retriable-status-codes
+                              items:
+                                format: int32
+                                maximum: 599
+                                minimum: 100
+                                type: integer
+                              type: array
+                            retry_after_max:
+                              description: |-
+                                RetryAfterMax honors a response's Retry-After up to this bound
+                                (standalone mode only)
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            retry_back_off_base:
+                              description: |-
+                                RetryBackOffBase is the base of the randomized exponential wait between
+                                retries (standalone mode only)
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            retry_back_off_max:
+                              description: RetryBackOffMax caps that wait (standalone
+                                mode only)
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                            retry_count:
+                              description: RetryCount is the number of retries after
+                                the first attempt
+                              format: int32
+                              maximum: 5
+                              minimum: 0
+                              type: integer
+                            retry_on:
+                              description: RetryOn adds retry conditions, with Envoy's
+                                names (5xx, reset, ...)
+                              type: string
+                            total_timeout:
+                              description: 'TotalTimeout bounds the whole call: every
+                                attempt and the response'
+                              pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                              type: string
+                          type: object
                         rules:
                           description: Rules defines the combination of conditions
                             using AND/OR logic
@@ -1250,41 +1463,84 @@ spec:
                               description: Conditions is the list of rule references
                                 to evaluate
                               items:
-                                description: RuleConditionConfig references a specific
-                                  rule by type and name
+                                description: |-
+                                  RuleConditionConfig is one condition of a decision's rules: a leaf that
+                                  references a rule by type and name, or a subtree that combines its own
+                                  conditions with an operator.
                                 properties:
-                                  name:
-                                    description: Name is the name of the rule to reference
+                                  conditions:
+                                    description: |-
+                                      Conditions are a subtree's conditions, each of this same shape. They
+                                      are preserved as router-owned objects, since a CRD schema cannot
+                                      recurse; the router validates them when it loads the configuration.
+                                    items:
+                                      type: object
+                                      x-kubernetes-preserve-unknown-fields: true
+                                    type: array
+                                  label:
+                                    description: |-
+                                      Label matches one label of the referenced rule (systemone and
+                                      application signal conditions)
                                     type: string
-                                  type:
-                                    description: Type specifies the signal or projection
-                                      type referenced by this condition.
+                                  name:
+                                    description: Name is the name of the rule a leaf
+                                      references
+                                    type: string
+                                  on_error:
+                                    description: OnError resolves a systemone leaf
+                                      whose model backend fails
                                     enum:
-                                    - keyword
-                                    - embedding
+                                    - no_match
+                                    - match
+                                    type: string
+                                  operator:
+                                    description: 'Operator combines a subtree''s conditions:
+                                      "AND", "OR", or "NOT" (unary)'
+                                    enum:
+                                    - AND
+                                    - OR
+                                    - NOT
+                                    type: string
+                                  predicate:
+                                    description: |-
+                                      Predicate bounds the referenced rule's score, as {gt, gte, lt, lte}.
+                                      The router checks it when it loads the configuration.
+                                    type: object
+                                    x-kubernetes-preserve-unknown-fields: true
+                                  type:
+                                    description: |-
+                                      Type specifies the signal or projection type a leaf references: a type
+                                      the router accepts in decision rules.
+                                    enum:
+                                    - authz
+                                    - complexity
+                                    - context
+                                    - conversation
                                     - domain
                                     - fact_check
-                                    - user_feedback
-                                    - reask
-                                    - preference
-                                    - language
-                                    - context
-                                    - structure
-                                    - complexity
-                                    - modality
-                                    - authz
+                                    - input_modality
                                     - jailbreak
+                                    - keyword
+                                    - language
+                                    - metadata
+                                    - modality
                                     - pii
-                                    - kb
-                                    - conversation
-                                    - event
                                     - projection
+                                    - safety
+                                    - systemone
+                                    - turn_relation
+                                    - user_feedback
                                     type: string
-                                required:
-                                - name
-                                - type
                                 type: object
                               type: array
+                            on_unknown:
+                              description: OnUnknown resolves a terminal unknown result
+                                after the rule tree is evaluated.
+                              enum:
+                              - no_match
+                              - match
+                              - fail_request
+                              type: string
                             operator:
                               description: |-
                                 Operator specifies how to combine conditions: "AND", "OR", or "NOT". NOT is strictly unary: it takes
@@ -1303,124 +1559,61 @@ spec:
                       - rules
                       type: object
                     type: array
-                  default_reasoning_effort:
-                    description: Default reasoning effort
-                    enum:
-                    - low
-                    - medium
-                    - high
-                    type: string
                   embedding_models:
-                    description: Embedding models configuration (qwen3, gemma, mmbert)
-                    properties:
-                      embedding_config:
-                        description: Embedding configuration for embedding-based classification
-                        properties:
-                          backend:
-                            description: Backend selects the embedding provider backend.
-                            enum:
-                            - candle
-                            - openvino
-                            - openai_compatible
-                            type: string
-                          enable_soft_matching:
-                            default: true
-                            description: EnableSoftMatching enables soft matching
-                              mode
-                            type: boolean
-                          min_score_threshold:
-                            default: "0.5"
-                            description: MinScoreThreshold for matching (0.0-1.0).
-                              Stored as string to avoid float precision issues.
-                            pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
-                            type: string
-                          model_type:
-                            description: |-
-                              ModelType specifies which embedding model to use
-                              Options: "qwen3" (1024-dim, 32K context), "gemma" (768-dim, 8K context), "mmbert" (64-768-dim, multilingual), "remote" (external provider)
-                            enum:
-                            - qwen3
-                            - gemma
-                            - mmbert
-                            - remote
-                            type: string
-                          preload_embeddings:
-                            default: true
-                            description: PreloadEmbeddings enables precomputing candidate
-                              embeddings at startup
-                            type: boolean
-                          target_dimension:
-                            description: |-
-                              TargetDimension is the embedding dimension to use (default: 768)
-                              For mmBERT, supported local dimensions are 64, 128, 256, 512, 768.
-                              External providers may use other positive dimensions such as 1024, 1536, or 3072.
-                            minimum: 1
-                            type: integer
-                          target_layer:
-                            description: |-
-                              TargetLayer is the layer for mmBERT early exit (only used when ModelType is "mmbert")
-                              Layer 3: ~7x speedup, Layer 6: ~3.6x speedup, Layer 11: ~2x speedup, Layer 22: full accuracy
-                            enum:
-                            - 3
-                            - 6
-                            - 11
-                            - 22
-                            type: integer
-                        type: object
-                      endpoint:
-                        description: |-
-                          Endpoint configures an external embedding provider endpoint.
-                          The API key should be injected into the semantic router pod environment
-                          and referenced by APIKeyEnv rather than stored directly in the CR.
-                        properties:
-                          api_key_env:
-                            description: APIKeyEnv names the environment variable
-                              containing the provider API key.
-                            type: string
-                          base_url:
-                            description: BaseURL is the base URL for the embedding
-                              endpoint, typically ending in /v1.
-                            type: string
-                          dimensions:
-                            description: Dimensions requests a provider-side output
-                              dimension when supported.
-                            minimum: 1
-                            type: integer
-                          max_retries:
-                            description: MaxRetries is the maximum number of retry
-                              attempts for embedding calls.
-                            minimum: 0
-                            type: integer
-                          model:
-                            description: Model is the embedding model name sent to
-                              the external provider.
-                            type: string
-                          timeout_seconds:
-                            description: TimeoutSeconds is the request timeout for
-                              embedding calls.
-                            minimum: 0
-                            type: integer
-                        type: object
-                      gemma_model_path:
-                        description: |-
-                          Path to EmbeddingGemma-300M model directory
-                          Gemma provides 8K context and fast embeddings (768 dimensions)
-                        type: string
-                      mmbert_model_path:
-                        description: |-
-                          Path to mmBERT 2D Matryoshka embedding model directory
-                          Supports layer early exit (3/6/11/22) and dimension reduction (64-768)
-                        type: string
-                      qwen3_model_path:
-                        description: |-
-                          Path to Qwen3-Embedding-0.6B model directory
-                          Qwen3 provides 32K context and high quality embeddings (1024 dimensions)
-                        type: string
-                      use_cpu:
-                        default: true
-                        description: 'Use CPU for inference (default: true)'
-                        type: boolean
+                    description: |-
+                      EmbeddingModels is removed: an embedding model is a model deployment,
+                      and global.model_catalog.embeddings.default names the one stores embed
+                      with (vela-embedding by default). A resource that sets it is refused.
                     type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  entrypoints:
+                    description: |-
+                      Entrypoints contains canonical entrypoints[]: the public model names of
+                      each recipe. Several recipes need them, with exactly one marked
+                      default: true.
+                    x-kubernetes-preserve-unknown-fields: true
+                  external_models:
+                    description: |-
+                      ExternalModels is removed: a remote model is a model deployment with
+                      provider openai_chat, openai_embeddings or systemone. A resource that
+                      sets it is refused.
+                    x-kubernetes-preserve-unknown-fields: true
+                  model_admission:
+                    description: |-
+                      ModelAdmission contains canonical global.model_catalog.admission budgets.
+                      Keys name deployments or the router's existing admission consumers.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  model_bindings:
+                    description: |-
+                      ModelBindings contains canonical global.model_catalog.bindings: each key
+                      is an application signal type whose rules share one answer (domain,
+                      fact_check, user_feedback, jailbreak, safety, pii, hallucination,
+                      refusal, turn_relation, complexity, modality), and each value names the
+                      model_deployments entry that answers it. A rule
+                      that asks its own question names its deployment on the rule. A signal no
+                      binding names follows decision_model; recipes[].model_bindings binds in
+                      its recipe and wins over these.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  model_deployments:
+                    description: |-
+                      ModelDeployments contains canonical global.model_catalog.deployments.
+                      The router validates provider, device, precision and task compatibility.
+                      A remote deployment (provider systemone, openai_embeddings, classify or
+                      openai_chat) takes a connection block: endpoint, model, auth,
+                      headers, timeout_ms, max_retries, tls, limits and capabilities. Its key
+                      never goes in the resource: auth.api_key_env names a spec.env variable
+                      that valueFrom.secretKeyRef fills from a Secret. The operator mounts no
+                      Secret into the Pod, so auth.api_key_file is not available.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  models:
+                    description: |-
+                      Models contains the facts of providers.models[] entries (capabilities,
+                      modalities, description, context_window_size, ...), by name; the
+                      operator writes each entry's transport from vllmEndpoints.
+                    x-kubernetes-preserve-unknown-fields: true
                   observability:
                     description: Observability configuration
                     properties:
@@ -1475,51 +1668,34 @@ spec:
                             type: object
                         type: object
                     type: object
-                  prompt_guard:
-                    description: Prompt guard configuration
-                    properties:
-                      enabled:
-                        default: true
-                        type: boolean
-                      jailbreak_mapping_path:
-                        type: string
-                      model_id:
-                        default: models/mmbert32k-jailbreak-detector-merged
-                        type: string
-                      threshold:
-                        default: "0.7"
-                        description: Jailbreak detection threshold (0.0-1.0). Stored
-                          as string to avoid float precision issues.
-                        pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
-                        type: string
-                      use_cpu:
-                        default: true
-                        type: boolean
-                      use_modernbert:
-                        default: false
-                        type: boolean
-                    type: object
-                  reasoning_families:
-                    additionalProperties:
-                      description: ReasoningFamily defines reasoning family configuration
-                      properties:
-                        parameter:
-                          type: string
-                        type:
-                          type: string
-                      type: object
-                    description: Reasoning families
-                    type: object
-                  routing:
+                  plugins:
                     description: |-
-                      Routing contains canonical v0.3 routing configuration under config.routing.
-                      It is intentionally preserved as an object so the operator can pass through
-                      the router-owned signal, projection, decision, and algorithm contract without
-                      lagging behind every router schema addition.
+                      Plugins contains canonical global.plugins: the default plugins of every
+                      decision, which a recipe's and a decision's plugins override.
+                    x-kubernetes-preserve-unknown-fields: true
+                  prompt_guard:
+                    description: |-
+                      PromptGuard is removed: the decision model answers jailbreak rules, and
+                      a threshold is a jailbreak rule's predicate. A resource that sets it is
+                      refused.
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
-                  semantic_cache:
-                    description: Semantic cache configuration
+                  reasoning_effort:
+                    description: |-
+                      ReasoningEffort is the default reasoning effort for model bindings that do
+                      not select a different effort. The selected model family validates the
+                      value because built-in and custom families may expose different ladders.
+                    type: string
+                  recipes:
+                    description: |-
+                      Recipes contains canonical recipes[]: each recipe's signals,
+                      projections, decisions, model_bindings and plugins. It is preserved as
+                      objects so the operator passes the router-owned contract through
+                      without lagging behind every router schema addition. The fields a
+                      recipe named default sets replace the operator's default recipe's.
+                    x-kubernetes-preserve-unknown-fields: true
+                  response_cache:
+                    description: Response cache configuration.
                     properties:
                       backend_type:
                         default: memory
@@ -1534,21 +1710,35 @@ spec:
                         - qdrant
                         - hybrid
                         type: string
-                      embedding_model:
-                        default: mmbert
+                      embedding:
                         description: |-
-                          EmbeddingModel specifies which embedding model to use for semantic similarity
-                          Options: "mmbert" (default), "bert", "qwen3", "gemma"
-                        enum:
-                        - bert
-                        - qwen3
-                        - gemma
-                        - mmbert
+                          Embedding names the deployment semantic reuse embeds with, and the
+                          width of its vectors.
+                        properties:
+                          deployment:
+                            description: |-
+                              Deployment is a global.model_catalog deployment; without it the store
+                              embeds with embeddings.default.
+                            type: string
+                          dimension:
+                            description: |-
+                              Dimension is the width of the vectors: the deployment's own, or a
+                              narrower one its model serves.
+                            minimum: 1
+                            type: integer
+                        type: object
+                      embedding_model:
+                        description: |-
+                          EmbeddingModel is removed: embedding.deployment names the deployment
+                          semantic reuse embeds with, embeddings.default without one. A resource
+                          that sets it is refused.
                         type: string
                       enabled:
                         default: true
-                        description: Enabled controls whether semantic caching is
-                          active
+                        description: |-
+                          Enabled, on by default, gives a configuration without decisions a
+                          response_cache plugin in config.plugins that caches every request; off,
+                          it turns the decisions' response_cache plugins off.
                         type: boolean
                       eviction_policy:
                         default: fifo
@@ -1743,44 +1933,6 @@ spec:
                                     type: string
                                 type: object
                             type: object
-                          data_management:
-                            description: DataManagement settings for TTL and compaction
-                            properties:
-                              compaction:
-                                description: Compaction settings
-                                properties:
-                                  enabled:
-                                    default: false
-                                    description: Enabled controls whether auto-compaction
-                                      is active
-                                    type: boolean
-                                  interval:
-                                    default: 86400
-                                    description: Interval in seconds between compaction
-                                      runs
-                                    minimum: 0
-                                    type: integer
-                                type: object
-                              ttl:
-                                description: TTL settings for automatic expiration
-                                properties:
-                                  cleanup_interval:
-                                    default: 3600
-                                    description: CleanupInterval in seconds between
-                                      cleanup runs
-                                    minimum: 0
-                                    type: integer
-                                  enabled:
-                                    default: false
-                                    description: Enabled controls whether TTL is active
-                                    type: boolean
-                                  timestamp_field:
-                                    default: created_at
-                                    description: TimestampField is the field used
-                                      for TTL calculation
-                                    type: string
-                                type: object
-                            type: object
                           development:
                             description: Development settings for Milvus cache
                             properties:
@@ -1794,48 +1946,6 @@ spec:
                                 description: DropCollectionOnStartup clears the collection
                                   when router starts (for testing)
                                 type: boolean
-                              verbose_errors:
-                                default: true
-                                description: VerboseErrors includes detailed error
-                                  messages in logs
-                                type: boolean
-                            type: object
-                          performance:
-                            description: Performance tuning for Milvus
-                            properties:
-                              batch:
-                                description: Batch settings for operations
-                                properties:
-                                  insert_batch_size:
-                                    default: 100
-                                    description: InsertBatchSize for bulk inserts
-                                    minimum: 1
-                                    type: integer
-                                  timeout:
-                                    default: 60
-                                    description: Timeout for batch operations in seconds
-                                    minimum: 0
-                                    type: integer
-                                type: object
-                              connection_pool:
-                                description: ConnectionPool settings
-                                properties:
-                                  acquire_timeout:
-                                    default: 30
-                                    description: AcquireTimeout in seconds
-                                    minimum: 0
-                                    type: integer
-                                  max_connections:
-                                    default: 10
-                                    description: MaxConnections in the pool
-                                    minimum: 1
-                                    type: integer
-                                  max_idle_connections:
-                                    default: 5
-                                    description: MaxIdleConnections to keep
-                                    minimum: 0
-                                    type: integer
-                                type: object
                             type: object
                           search:
                             description: Search settings for Milvus queries
@@ -1993,11 +2103,6 @@ spec:
                                 description: DropIndexOnStartup clears the index when
                                   router starts (for testing)
                                 type: boolean
-                              verbose_errors:
-                                default: true
-                                description: VerboseErrors includes detailed error
-                                  messages in logs
-                                type: boolean
                             type: object
                           index:
                             description: Index settings for Redis vector search
@@ -2075,8 +2180,9 @@ spec:
                         type: object
                       similarity_threshold:
                         default: "0.8"
-                        description: Similarity threshold for cache hits (0.0-1.0).
-                          Stored as string to avoid float precision issues.
+                        description: |-
+                          SimilarityThreshold (0.0-1.0) is the min_similarity of the response_cache
+                          plugin Enabled adds. Stored as string to avoid float precision issues.
                         pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
                         type: string
                       ttl_seconds:
@@ -2178,10 +2284,678 @@ spec:
                                 description: DropIndexOnStartup clears the index when
                                   router starts (for testing)
                                 type: boolean
-                              verbose_errors:
+                            type: object
+                          index:
+                            description: Index settings for Valkey vector search
+                            properties:
+                              index_type:
+                                default: HNSW
+                                description: |-
+                                  IndexType specifies the index algorithm
+                                  Options: "HNSW" (recommended), "FLAT"
+                                enum:
+                                - HNSW
+                                - FLAT
+                                type: string
+                              name:
+                                default: semantic_cache_idx
+                                description: Name of the Valkey index
+                                type: string
+                              params:
+                                description: Params for HNSW index
+                                properties:
+                                  M:
+                                    default: 16
+                                    description: |-
+                                      M is the number of bi-directional links per node
+                                      Higher values = better recall, more memory
+                                    minimum: 2
+                                    type: integer
+                                  efConstruction:
+                                    default: 64
+                                    description: |-
+                                      EfConstruction is the size of dynamic candidate list during construction
+                                      Higher values = better quality, slower indexing
+                                    minimum: 1
+                                    type: integer
+                                type: object
+                              prefix:
+                                default: 'doc:'
+                                description: Prefix for Valkey keys
+                                type: string
+                              vector_field:
+                                description: VectorField configuration for embeddings
+                                properties:
+                                  dimension:
+                                    description: |-
+                                      Dimension of the embedding vectors
+                                      For BERT: 384, for Qwen3: 1024, for Gemma: 768
+                                    minimum: 1
+                                    type: integer
+                                  metric_type:
+                                    default: COSINE
+                                    description: |-
+                                      MetricType for vector similarity
+                                      Options: "COSINE", "IP" (inner product), "L2" (Euclidean)
+                                    enum:
+                                    - COSINE
+                                    - IP
+                                    - L2
+                                    type: string
+                                  name:
+                                    default: embedding
+                                    description: Name of the vector field
+                                    type: string
+                                type: object
+                            type: object
+                          search:
+                            description: Search settings for Valkey queries
+                            properties:
+                              topk:
+                                default: 1
+                                description: TopK is the number of results to return
+                                  from vector search
+                                minimum: 1
+                                type: integer
+                            type: object
+                        type: object
+                    type: object
+                  routing:
+                    description: |-
+                      Routing is removed: the router configuration has no top-level routing
+                      block. Its fields are the recipe named default under config.recipes. A
+                      resource that sets it is refused.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  semantic_cache:
+                    description: SemanticCache is the deprecated response-cache field.
+                    properties:
+                      backend_type:
+                        default: memory
+                        description: |-
+                          BackendType specifies the cache backend to use
+                          Options: "memory" (default), "redis", "valkey", "milvus", "qdrant", "hybrid"
+                        enum:
+                        - memory
+                        - redis
+                        - valkey
+                        - milvus
+                        - qdrant
+                        - hybrid
+                        type: string
+                      embedding:
+                        description: |-
+                          Embedding names the deployment semantic reuse embeds with, and the
+                          width of its vectors.
+                        properties:
+                          deployment:
+                            description: |-
+                              Deployment is a global.model_catalog deployment; without it the store
+                              embeds with embeddings.default.
+                            type: string
+                          dimension:
+                            description: |-
+                              Dimension is the width of the vectors: the deployment's own, or a
+                              narrower one its model serves.
+                            minimum: 1
+                            type: integer
+                        type: object
+                      embedding_model:
+                        description: |-
+                          EmbeddingModel is removed: embedding.deployment names the deployment
+                          semantic reuse embeds with, embeddings.default without one. A resource
+                          that sets it is refused.
+                        type: string
+                      enabled:
+                        default: true
+                        description: |-
+                          Enabled, on by default, gives a configuration without decisions a
+                          response_cache plugin in config.plugins that caches every request; off,
+                          it turns the decisions' response_cache plugins off.
+                        type: boolean
+                      eviction_policy:
+                        default: fifo
+                        description: EvictionPolicy for in-memory cache ("fifo", "lru",
+                          "lfu")
+                        enum:
+                        - fifo
+                        - lru
+                        - lfu
+                        type: string
+                      hnsw:
+                        description: HNSW configuration for hybrid/in-memory backends
+                        properties:
+                          hnsw_ef_construction:
+                            default: 200
+                            description: EfConstruction is the size of dynamic candidate
+                              list during construction
+                            minimum: 1
+                            type: integer
+                          hnsw_m:
+                            default: 16
+                            description: M is the number of bi-directional links per
+                              node
+                            minimum: 2
+                            type: integer
+                          max_memory_entries:
+                            default: 1000
+                            description: MaxMemoryEntries limits in-memory entries
+                              for hybrid backend
+                            minimum: 0
+                            type: integer
+                          use_hnsw:
+                            default: false
+                            description: UseHNSW enables HNSW indexing for faster
+                              similarity search
+                            type: boolean
+                        type: object
+                      max_entries:
+                        default: 1000
+                        description: MaxEntries is the maximum number of cache entries
+                          (for memory/hybrid backends)
+                        type: integer
+                      milvus:
+                        description: Milvus configuration (required when backend_type
+                          is "milvus")
+                        properties:
+                          collection:
+                            description: Collection settings for Milvus
+                            properties:
+                              description:
+                                default: Semantic cache for LLM request-response pairs
+                                description: Description of the collection
+                                type: string
+                              index:
+                                description: Index configuration for the collection
+                                properties:
+                                  params:
+                                    description: Params for the index
+                                    properties:
+                                      M:
+                                        default: 16
+                                        description: M is the number of bi-directional
+                                          links for HNSW
+                                        minimum: 2
+                                        type: integer
+                                      efConstruction:
+                                        default: 64
+                                        description: EfConstruction for HNSW index
+                                          building
+                                        minimum: 1
+                                        type: integer
+                                    type: object
+                                  type:
+                                    default: HNSW
+                                    description: Type of index algorithm
+                                    enum:
+                                    - HNSW
+                                    - IVF_FLAT
+                                    - IVF_SQ8
+                                    - IVF_PQ
+                                    type: string
+                                type: object
+                              name:
+                                default: semantic_cache
+                                description: Name of the Milvus collection
+                                type: string
+                              vector_field:
+                                description: VectorField configuration for embeddings
+                                properties:
+                                  dimension:
+                                    description: Dimension of the embedding vectors
+                                    minimum: 1
+                                    type: integer
+                                  metric_type:
+                                    default: IP
+                                    description: |-
+                                      MetricType for vector similarity
+                                      Options: "IP" (inner product), "L2", "COSINE"
+                                    enum:
+                                    - IP
+                                    - L2
+                                    - COSINE
+                                    type: string
+                                  name:
+                                    default: embedding
+                                    description: Name of the vector field
+                                    type: string
+                                type: object
+                            type: object
+                          connection:
+                            description: Connection settings for Milvus server
+                            properties:
+                              auth:
+                                description: Auth configuration for Milvus authentication
+                                properties:
+                                  enabled:
+                                    default: false
+                                    description: Enabled controls whether to use authentication
+                                    type: boolean
+                                  password:
+                                    description: Password for Milvus authentication
+                                      (plaintext - consider using PasswordSecretRef
+                                      instead)
+                                    type: string
+                                  password_secret_ref:
+                                    description: |-
+                                      PasswordSecretRef references a Secret containing the Milvus password
+                                      Preferred over plaintext Password field for security
+                                    properties:
+                                      key:
+                                        description: The key of the secret to select
+                                          from.  Must be a valid secret key.
+                                        type: string
+                                      name:
+                                        default: ""
+                                        description: |-
+                                          Name of the referent.
+                                          This field is effectively required, but due to backwards compatibility is
+                                          allowed to be empty. Instances of this type with an empty value here are
+                                          almost certainly wrong.
+                                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                        type: string
+                                      optional:
+                                        description: Specify whether the Secret or
+                                          its key must be defined
+                                        type: boolean
+                                    required:
+                                    - key
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                  username:
+                                    description: Username for Milvus authentication
+                                    type: string
+                                type: object
+                              database:
+                                default: semantic_router_cache
+                                description: Database name in Milvus
+                                type: string
+                              host:
+                                description: Host is the Milvus server hostname or
+                                  IP address
+                                type: string
+                              port:
+                                default: 19530
+                                description: Port is the Milvus server port
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              timeout:
+                                default: 30
+                                description: Timeout for Milvus operations in seconds
+                                minimum: 0
+                                type: integer
+                              tls:
+                                description: TLS configuration for secure Milvus connections
+                                properties:
+                                  ca_file:
+                                    description: CAFile is the path to CA certificate
+                                      file
+                                    type: string
+                                  cert_file:
+                                    description: CertFile is the path to client certificate
+                                      file
+                                    type: string
+                                  enabled:
+                                    default: false
+                                    description: Enabled controls whether to use TLS
+                                    type: boolean
+                                  key_file:
+                                    description: KeyFile is the path to client key
+                                      file
+                                    type: string
+                                type: object
+                            type: object
+                          development:
+                            description: Development settings for Milvus cache
+                            properties:
+                              auto_create_collection:
                                 default: true
-                                description: VerboseErrors includes detailed error
-                                  messages in logs
+                                description: AutoCreateCollection automatically creates
+                                  the collection if it doesn't exist
+                                type: boolean
+                              drop_collection_on_startup:
+                                default: false
+                                description: DropCollectionOnStartup clears the collection
+                                  when router starts (for testing)
+                                type: boolean
+                            type: object
+                          search:
+                            description: Search settings for Milvus queries
+                            properties:
+                              consistency_level:
+                                default: Session
+                                description: |-
+                                  ConsistencyLevel for search operations
+                                  Options: "Strong", "Session", "Bounded", "Eventually"
+                                enum:
+                                - Strong
+                                - Session
+                                - Bounded
+                                - Eventually
+                                type: string
+                              params:
+                                description: Params for search operations
+                                properties:
+                                  ef:
+                                    default: 64
+                                    description: Ef is the search-time HNSW parameter
+                                    minimum: 1
+                                    type: integer
+                                type: object
+                              topk:
+                                default: 10
+                                description: TopK is the number of results to return
+                                minimum: 1
+                                type: integer
+                            type: object
+                        type: object
+                      qdrant:
+                        description: Qdrant configuration (required when backend_type
+                          is "qdrant")
+                        properties:
+                          api_key:
+                            description: APIKey for Qdrant authentication
+                            type: string
+                          collection_name:
+                            default: semantic_cache
+                            description: CollectionName is the Qdrant collection to
+                              use for semantic cache
+                            type: string
+                          connect_timeout:
+                            default: 10
+                            description: ConnectTimeout is the timeout in seconds
+                              for Qdrant connection
+                            type: integer
+                          host:
+                            description: Host is the Qdrant server hostname or IP
+                              address
+                            type: string
+                          port:
+                            default: 6334
+                            description: Port is the Qdrant gRPC port
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          use_tls:
+                            default: false
+                            description: UseTLS enables TLS for the Qdrant connection
+                            type: boolean
+                        type: object
+                      redis:
+                        description: Redis configuration (required when backend_type
+                          is "redis")
+                        properties:
+                          connection:
+                            description: Connection settings for Redis server
+                            properties:
+                              database:
+                                default: 0
+                                description: Database is the Redis database number
+                                  to use
+                                minimum: 0
+                                type: integer
+                              host:
+                                description: |-
+                                  Host is the Redis server hostname or IP address
+                                  Example: "redis.default.svc.cluster.local"
+                                type: string
+                              password:
+                                description: Password for Redis authentication (plaintext
+                                  - consider using PasswordSecretRef instead)
+                                type: string
+                              password_secret_ref:
+                                description: |-
+                                  PasswordSecretRef references a Secret containing the Redis password
+                                  Preferred over plaintext Password field for security
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              port:
+                                default: 6379
+                                description: Port is the Redis server port
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              timeout:
+                                default: 30
+                                description: Timeout for Redis operations in seconds
+                                minimum: 0
+                                type: integer
+                              tls:
+                                description: TLS configuration for secure Redis connections
+                                properties:
+                                  ca_file:
+                                    description: CAFile is the path to CA certificate
+                                      file
+                                    type: string
+                                  cert_file:
+                                    description: CertFile is the path to client certificate
+                                      file
+                                    type: string
+                                  enabled:
+                                    default: false
+                                    description: Enabled controls whether to use TLS
+                                      for Redis connection
+                                    type: boolean
+                                  key_file:
+                                    description: KeyFile is the path to client key
+                                      file
+                                    type: string
+                                type: object
+                            type: object
+                          development:
+                            description: Development settings for Redis cache
+                            properties:
+                              auto_create_index:
+                                default: true
+                                description: AutoCreateIndex automatically creates
+                                  the index if it doesn't exist
+                                type: boolean
+                              drop_index_on_startup:
+                                default: false
+                                description: DropIndexOnStartup clears the index when
+                                  router starts (for testing)
+                                type: boolean
+                            type: object
+                          index:
+                            description: Index settings for Redis vector search
+                            properties:
+                              index_type:
+                                default: HNSW
+                                description: |-
+                                  IndexType specifies the index algorithm
+                                  Options: "HNSW" (recommended), "FLAT"
+                                enum:
+                                - HNSW
+                                - FLAT
+                                type: string
+                              name:
+                                default: semantic_cache_idx
+                                description: Name of the Redis index
+                                type: string
+                              params:
+                                description: Params for HNSW index
+                                properties:
+                                  M:
+                                    default: 16
+                                    description: |-
+                                      M is the number of bi-directional links per node
+                                      Higher values = better recall, more memory
+                                    minimum: 2
+                                    type: integer
+                                  efConstruction:
+                                    default: 64
+                                    description: |-
+                                      EfConstruction is the size of dynamic candidate list during construction
+                                      Higher values = better quality, slower indexing
+                                    minimum: 1
+                                    type: integer
+                                type: object
+                              prefix:
+                                default: 'doc:'
+                                description: Prefix for Redis keys
+                                type: string
+                              vector_field:
+                                description: VectorField configuration for embeddings
+                                properties:
+                                  dimension:
+                                    description: |-
+                                      Dimension of the embedding vectors
+                                      For BERT: 384, for Qwen3: 1024, for Gemma: 768
+                                    minimum: 1
+                                    type: integer
+                                  metric_type:
+                                    default: COSINE
+                                    description: |-
+                                      MetricType for vector similarity
+                                      Options: "COSINE", "IP" (inner product), "L2" (Euclidean)
+                                    enum:
+                                    - COSINE
+                                    - IP
+                                    - L2
+                                    type: string
+                                  name:
+                                    default: embedding
+                                    description: Name of the vector field
+                                    type: string
+                                type: object
+                            type: object
+                          search:
+                            description: Search settings for Redis queries
+                            properties:
+                              topk:
+                                default: 1
+                                description: TopK is the number of results to return
+                                  from vector search
+                                minimum: 1
+                                type: integer
+                            type: object
+                        type: object
+                      similarity_threshold:
+                        default: "0.8"
+                        description: |-
+                          SimilarityThreshold (0.0-1.0) is the min_similarity of the response_cache
+                          plugin Enabled adds. Stored as string to avoid float precision issues.
+                        pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
+                        type: string
+                      ttl_seconds:
+                        default: 3600
+                        description: TTLSeconds is the time-to-live for cache entries
+                          in seconds
+                        type: integer
+                      valkey:
+                        description: Valkey configuration (required when backend_type
+                          is "valkey")
+                        properties:
+                          connection:
+                            description: Connection settings for Valkey server
+                            properties:
+                              database:
+                                default: 0
+                                description: Database is the Valkey database number
+                                  to use
+                                minimum: 0
+                                type: integer
+                              host:
+                                description: |-
+                                  Host is the Valkey server hostname or IP address
+                                  Example: "valkey.default.svc.cluster.local"
+                                type: string
+                              password:
+                                description: Password for Valkey authentication (plaintext
+                                  - consider using PasswordSecretRef instead)
+                                type: string
+                              password_secret_ref:
+                                description: |-
+                                  PasswordSecretRef references a Secret containing the Valkey password
+                                  Preferred over plaintext Password field for security
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              port:
+                                default: 6379
+                                description: Port is the Valkey server port
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              timeout:
+                                default: 30
+                                description: Timeout for Valkey operations in seconds
+                                minimum: 0
+                                type: integer
+                              tls:
+                                description: TLS configuration for secure Valkey connections
+                                properties:
+                                  ca_file:
+                                    description: CAFile is the path to CA certificate
+                                      file
+                                    type: string
+                                  cert_file:
+                                    description: CertFile is the path to client certificate
+                                      file
+                                    type: string
+                                  enabled:
+                                    default: false
+                                    description: Enabled controls whether to use TLS
+                                      for Valkey connection
+                                    type: boolean
+                                  key_file:
+                                    description: KeyFile is the path to client key
+                                      file
+                                    type: string
+                                type: object
+                            type: object
+                          development:
+                            description: Development settings for Valkey cache
+                            properties:
+                              auto_create_index:
+                                default: true
+                                description: AutoCreateIndex automatically creates
+                                  the index if it doesn't exist
+                                type: boolean
+                              drop_index_on_startup:
+                                default: false
+                                description: DropIndexOnStartup clears the index when
+                                  router starts (for testing)
                                 type: boolean
                             type: object
                           index:
@@ -2265,26 +3039,30 @@ spec:
                     enum:
                     - priority
                     type: string
-                  tools:
-                    description: Tools configuration
+                  streamed_body:
+                    description: |-
+                      StreamedBody enables streamed request body handling. Mirrors
+                      global.router.streamed_body; the gateway must send bodies to ExtProc in
+                      STREAMED or FullDuplexStreamed mode for it to take effect.
                     properties:
                       enabled:
-                        default: true
+                        description: Enabled accumulates request body chunks before
+                          routing at end-of-stream.
                         type: boolean
-                      fallback_to_empty:
-                        default: true
-                        type: boolean
-                      similarity_threshold:
-                        default: "0.2"
-                        description: Similarity threshold for tool selection (0.0-1.0).
-                          Stored as string to avoid float precision issues.
-                        pattern: ^0(\.[0-9]+)?$|^1(\.0+)?$
-                        type: string
-                      tools_db_path:
-                        default: config/tools_db.json
-                        type: string
-                      top_k:
-                        default: 3
+                      max_bytes:
+                        description: |-
+                          MaxBytes caps the accumulated body size. A larger body is rejected and the
+                          ExtProc stream ends; the downstream response follows the gateway's ExtProc
+                          failure policy. Zero disables the limit.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      timeout_sec:
+                        description: |-
+                          TimeoutSec caps how long body accumulation may take. A slower body is
+                          rejected and the ExtProc stream ends; the downstream response follows the
+                          gateway's ExtProc failure policy. Zero disables the limit.
+                        minimum: 0
                         type: integer
                     type: object
                 type: object
@@ -2446,10 +3224,17 @@ spec:
                   type: object
                 type: array
               gateway:
-                description: Gateway integration for reusing existing gateways
+                description: |-
+                  Gateway selects what serves client traffic. Omitted, the Router runs
+                  standalone: it serves the OpenAI-compatible API on port 8801 itself,
+                  with no Envoy, and the Service exposes that port. With existingRef, the
+                  Router serves ext_proc gRPC on port 50051 for that Gateway, whose
+                  ext_proc policy and routes you manage.
                 properties:
                   existingRef:
-                    description: ExistingRef references an existing Gateway to use
+                    description: |-
+                      ExistingRef references an existing Gateway that calls the Router over
+                      ext_proc. Setting it selects extproc mode.
                     properties:
                       name:
                         description: Name of the Gateway
@@ -2479,7 +3264,7 @@ spec:
                     - IfNotPresent
                     type: string
                   repository:
-                    default: ghcr.io/vllm-project/semantic-router/extproc
+                    default: ghcr.io/vllm-project/semantic-router/vllm-sr
                     description: Repository is the container image repository
                     type: string
                   tag:
@@ -3370,7 +4155,7 @@ spec:
                 description: |-
                   VLLMEndpoints is a Kubernetes-native backend discovery adapter.
                   It generates canonical config.providers.models[].backend_refs
-                  and config.routing.modelCards entries.
+                  and the loras of those entries.
                 items:
                   description: VLLMEndpointSpec defines a vLLM model backend endpoint
                   properties:
@@ -3415,9 +4200,14 @@ spec:
                       required:
                       - type
                       type: object
+                    catalog:
+                      description: |-
+                        Catalog optionally selects a repository built-in Model Card. Model remains
+                        the request-facing alias.
+                      type: string
                     loras:
-                      description: LoRAs declares the LoRA adapters exposed for this
-                        logical model in routing.modelCards.
+                      description: 'LoRAs declares the LoRA adapters exposed for this
+                        logical model: the loras of its providers.models[] entry.'
                       items:
                         description: LoRAAdapterSpec defines one LoRA adapter exposed
                           by a VLLMEndpoint model.
@@ -3447,10 +4237,53 @@ spec:
                       description: Name of the backend ref generated under config.providers.models[].backend_refs
                       minLength: 1
                       type: string
-                    reasoningFamily:
-                      description: Reasoning family for the model (e.g., "qwen3",
-                        "deepseek", "gpt")
-                      type: string
+                    reasoning:
+                      description: |-
+                        Reasoning optionally selects a built-in family or defines inline wire
+                        behavior for this self-hosted model. Catalog-backed models normally omit it.
+                      properties:
+                        activationParameter:
+                          type: string
+                        default:
+                          type: string
+                        defaultMode:
+                          enum:
+                          - enabled
+                          - disabled
+                          - adaptive
+                          type: string
+                        disabled:
+                          type: string
+                        effortFlags:
+                          additionalProperties:
+                            type: string
+                          description: EffortFlags maps a logical effort to a boolean
+                            chat-template parameter.
+                          type: object
+                        family:
+                          type: string
+                        levels:
+                          items:
+                            type: string
+                          type: array
+                        modes:
+                          items:
+                            enum:
+                            - enabled
+                            - disabled
+                            - adaptive
+                            type: string
+                          type: array
+                        parameter:
+                          type: string
+                        type:
+                          enum:
+                          - chat_template_kwargs
+                          - reasoning_effort
+                          - reasoning_mode
+                          - top_level_reasoning_effort
+                          type: string
+                      type: object
                     weight:
                       default: 1
                       description: 'Weight for load balancing (default: 1)'
@@ -3524,8 +4357,10 @@ spec:
                   type: object
                 type: array
               gatewayMode:
-                description: 'GatewayMode indicates deployment mode: standalone or
-                  gateway-integration'
+                description: |-
+                  GatewayMode is what serves client traffic: standalone (the Router's own
+                  listener on port 8801) or gateway-integration (the Gateway in
+                  spec.gateway, with the Router serving ext_proc)
                 type: string
               observedGeneration:
                 description: ObservedGeneration reflects the generation of the most

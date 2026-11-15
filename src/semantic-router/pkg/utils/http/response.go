@@ -305,9 +305,13 @@ func buildStreamingCacheBody(cachedResponse []byte) []byte {
 		return []byte("data: {\"error\": \"Failed to convert cached response\"}\n\ndata: [DONE]\n\n")
 	}
 
-	if len(cachedCompletion.Choices) == 0 || cachedCompletion.Choices[0].Message.Content == "" {
-		logging.Errorf("Cached response has no valid choices or content")
-		return []byte("data: {\"error\": \"Cached response has no content\"}\n\ndata: [DONE]\n\n")
+	extraDelta, cachedUsage := cachedStreamingExtras(cachedResponse)
+	if replayError := cachedStreamingReplayError(cachedCompletion, extraDelta); replayError != "" {
+		logging.Errorf("Cached streaming replay rejected: %s", replayError)
+		return []byte(fmt.Sprintf(
+			"data: {\"error\": %q}\n\ndata: [DONE]\n\n",
+			replayError,
+		))
 	}
 
 	unixTimeStep := time.Now().Unix()
@@ -319,6 +323,22 @@ func buildStreamingCacheBody(cachedResponse []byte) []byte {
 	}
 
 	var sseChunks []string
+	if len(extraDelta) > 0 {
+		extraChunk := map[string]interface{}{
+			"id":      newID,
+			"object":  "chat.completion.chunk",
+			"created": unixTimeStep,
+			"model":   cachedCompletion.Model,
+			"choices": []map[string]interface{}{{
+				"index":         cachedCompletion.Choices[0].Index,
+				"delta":         extraDelta,
+				"finish_reason": nil,
+			}},
+		}
+		if chunkJSON, err := json.Marshal(extraChunk); err == nil {
+			sseChunks = append(sseChunks, fmt.Sprintf("data: %s\n\n", chunkJSON))
+		}
+	}
 	for i, chunkContent := range chunks {
 		streamChunk := map[string]interface{}{
 			"id":      newID,
@@ -357,6 +377,9 @@ func buildStreamingCacheBody(cachedResponse []byte) []byte {
 			},
 		},
 	}
+	if cachedUsage != nil {
+		finalChunk["usage"] = cachedUsage
+	}
 	finalChunkJSON, err := json.Marshal(finalChunk)
 	if err != nil {
 		logging.Errorf("Error marshaling final streaming chunk: %v", err)
@@ -371,6 +394,68 @@ func buildStreamingCacheBody(cachedResponse []byte) []byte {
 		buf.WriteString(chunk)
 	}
 	return buf.Bytes()
+}
+
+func cachedStreamingReplayError(
+	completion openai.ChatCompletion,
+	extraDelta map[string]interface{},
+) string {
+	if len(completion.Choices) == 0 {
+		return "Cached response has no content"
+	}
+	if len(completion.Choices) > 1 {
+		return "Cached response has multiple choices"
+	}
+	if completion.Choices[0].Message.Content == "" && len(extraDelta) == 0 {
+		return "Cached response has no content"
+	}
+	return ""
+}
+
+func cachedStreamingExtras(cachedResponse []byte) (map[string]interface{}, interface{}) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(cachedResponse, &raw); err != nil {
+		return nil, nil
+	}
+	extras := map[string]interface{}{}
+	choices, ok := raw["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return nil, raw["usage"]
+	}
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil, raw["usage"]
+	}
+	message, ok := choice["message"].(map[string]interface{})
+	if !ok {
+		return nil, raw["usage"]
+	}
+	for _, field := range []string{"reasoning_content", "reasoning", "refusal", "tool_calls"} {
+		value, exists := message[field]
+		if !exists || value == nil {
+			continue
+		}
+		if !cacheReplayFieldPresent(value) {
+			continue
+		}
+		extras[field] = value
+	}
+	if len(extras) == 0 {
+		return nil, raw["usage"]
+	}
+	extras["role"] = "assistant"
+	return extras, raw["usage"]
+}
+
+func cacheReplayFieldPresent(value interface{}) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed != ""
+	case []interface{}:
+		return len(typed) > 0
+	default:
+		return value != nil
+	}
 }
 
 // buildNonStreamingCacheBody regenerates ID/timestamp on a cached response.
@@ -397,9 +482,9 @@ func buildNonStreamingCacheBody(cachedResponse []byte) []byte {
 	return marshaledBody
 }
 
-// KeystoneHeaderOptions returns the v0.4 keystone header options
+// KeystoneHeaderOptions returns the keystone header options
 // (x-vsr-schema-version + x-vsr-response-path) for an immediate response on the
-// given response path. See issue #2203.
+// given response path.
 func KeystoneHeaderOptions(path string) []*core.HeaderValueOption {
 	return []*core.HeaderValueOption{
 		{Header: &core.HeaderValue{Key: headers.VSRSchemaVersion, RawValue: []byte(headers.SchemaVersionValue)}},
@@ -407,14 +492,10 @@ func KeystoneHeaderOptions(path string) []*core.HeaderValueOption {
 	}
 }
 
-// CreateCacheHitResponse creates an immediate response from cache.
-//
-// content-type, the cache-hit marker and the final routing fact (selected
-// decision) ride on the default surface. The intermediate category,
-// cache-similarity and matched-keyword headers are demoted off the default
-// surface (#2205): each is emitted only when non-empty, so the caller demotes
-// them by passing empty values unless the request opted into x-vsr-debug.
-func CreateCacheHitResponse(cachedResponse []byte, isStreaming bool, category string, decisionName string, matchedKeywords []string, similarity ...float32) *ext_proc.ProcessingResponse {
+// CreateCacheHitResponse creates an immediate response from cache, with its
+// content-type and the keystone headers of the cache path. The Router adds
+// the rest of the public set.
+func CreateCacheHitResponse(cachedResponse []byte, isStreaming bool) *ext_proc.ProcessingResponse {
 	var responseBody []byte
 	var contentType string
 
@@ -430,71 +511,7 @@ func CreateCacheHitResponse(cachedResponse []byte, isStreaming bool, category st
 		responseBody = buildNonStreamingCacheBody(cachedResponse)
 	}
 
-	setHeaders := []*core.HeaderValueOption{
-		{
-			Header: &core.HeaderValue{
-				Key:      "content-type",
-				RawValue: []byte(contentType),
-			},
-		},
-		{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRCacheHit,
-				RawValue: []byte("true"),
-			},
-		},
-		{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRSelectedDecision,
-				RawValue: []byte(decisionName),
-			},
-		},
-	}
-
-	// Demoted intermediate detail (#2205): emitted only when non-empty.
-	if category != "" {
-		setHeaders = append(setHeaders, &core.HeaderValueOption{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRSelectedCategory,
-				RawValue: []byte(category),
-			},
-		})
-	}
-	if len(similarity) > 0 && similarity[0] > 0 {
-		setHeaders = append(setHeaders, &core.HeaderValueOption{
-			Header: &core.HeaderValue{
-				Key:      "x-vsr-cache-similarity",
-				RawValue: []byte(fmt.Sprintf("%.4f", similarity[0])),
-			},
-		})
-	}
-	if len(matchedKeywords) > 0 {
-		setHeaders = append(setHeaders, &core.HeaderValueOption{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRMatchedKeywords,
-				RawValue: []byte(strings.Join(matchedKeywords, ",")),
-			},
-		})
-	}
-
-	// v0.4 keystone headers: this is the semantic-cache path (#2203).
-	setHeaders = append(setHeaders, KeystoneHeaderOptions(headers.ResponsePathCache)...)
-
-	immediateResponse := &ext_proc.ImmediateResponse{
-		Status: &typev3.HttpStatus{
-			Code: typev3.StatusCode_OK,
-		},
-		Headers: &ext_proc.HeaderMutation{
-			SetHeaders: setHeaders,
-		},
-		Body: responseBody,
-	}
-
-	return &ext_proc.ProcessingResponse{
-		Response: &ext_proc.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: immediateResponse,
-		},
-	}
+	return CreateCacheHitResponseWithBody(responseBody, contentType)
 }
 
 // buildStreamingFastBody converts a message into SSE chunks for the fast_response plugin.
@@ -590,56 +607,44 @@ func buildNonStreamingFastBody(message string, unixTimeStep int64) []byte {
 // fast_response plugin. It supports both streaming (SSE) and non-streaming (JSON)
 // formats based on the original request's "stream" flag.
 // The response is returned as 200 OK with finish_reason "stop".
-func CreateFastResponse(message string, isStreaming bool, decisionName string) *ext_proc.ProcessingResponse {
+func CreateFastResponse(message string, isStreaming bool) *ext_proc.ProcessingResponse {
 	unixTimeStep := time.Now().Unix()
-	var responseBody []byte
-	var contentType string
-
 	if isStreaming {
-		contentType = "text/event-stream"
-		responseBody = buildStreamingFastBody(message, unixTimeStep)
-	} else {
-		contentType = "application/json"
-		responseBody = buildNonStreamingFastBody(message, unixTimeStep)
+		return CreateFastResponseWithBody(buildStreamingFastBody(message, unixTimeStep), "text/event-stream")
 	}
+	return CreateFastResponseWithBody(buildNonStreamingFastBody(message, unixTimeStep), "application/json")
+}
 
+// CreateFastResponseWithBody wraps a public response already encoded by the
+// protocol layer, with its content-type and the keystone headers of the
+// fast_response path. This transport helper never parses or rewrites its body.
+func CreateFastResponseWithBody(responseBody []byte, contentType string) *ext_proc.ProcessingResponse {
 	setHeaders := []*core.HeaderValueOption{
-		{
-			Header: &core.HeaderValue{
-				Key:      "content-type",
-				RawValue: []byte(contentType),
-			},
-		},
-		{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRSelectedDecision,
-				RawValue: []byte(decisionName),
-			},
-		},
-		{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRFastResponse,
-				RawValue: []byte("true"),
-			},
-		},
+		{Header: &core.HeaderValue{Key: "content-type", RawValue: []byte(contentType)}},
 	}
-
-	// v0.4 keystone headers: this is the fast_response plugin path (#2203).
 	setHeaders = append(setHeaders, KeystoneHeaderOptions(headers.ResponsePathFastResponse)...)
+	return createImmediateOK(responseBody, setHeaders)
+}
 
-	immediateResponse := &ext_proc.ImmediateResponse{
-		Status: &typev3.HttpStatus{
-			Code: typev3.StatusCode_OK,
-		},
-		Headers: &ext_proc.HeaderMutation{
-			SetHeaders: setHeaders,
-		},
-		Body: responseBody,
+// CreateCacheHitResponseWithBody wraps a cached public response already
+// encoded by the protocol layer, with its content-type and the keystone
+// headers of the cache path.
+func CreateCacheHitResponseWithBody(responseBody []byte, contentType string) *ext_proc.ProcessingResponse {
+	setHeaders := []*core.HeaderValueOption{
+		{Header: &core.HeaderValue{Key: "content-type", RawValue: []byte(contentType)}},
 	}
+	setHeaders = append(setHeaders, KeystoneHeaderOptions(headers.ResponsePathCache)...)
+	return createImmediateOK(responseBody, setHeaders)
+}
 
+func createImmediateOK(body []byte, setHeaders []*core.HeaderValueOption) *ext_proc.ProcessingResponse {
 	return &ext_proc.ProcessingResponse{
 		Response: &ext_proc.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: immediateResponse,
+			ImmediateResponse: &ext_proc.ImmediateResponse{
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_OK},
+				Headers: &ext_proc.HeaderMutation{SetHeaders: setHeaders},
+				Body:    body,
+			},
 		},
 	}
 }

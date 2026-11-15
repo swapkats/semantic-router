@@ -2,7 +2,12 @@ package routerreplay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay/store"
 )
@@ -11,6 +16,11 @@ const (
 	DefaultMaxRecords        = 200
 	DefaultMaxBodyBytes      = 4096 // 4KB
 	DefaultMaxToolTraceBytes = 0    // No limit — structured fields are typically small
+	// DefaultMaxPromptBytes caps the prompt a record keeps: 64 KiB keeps
+	// nearly every chat prompt whole and the head of a long one, so a store
+	// of long prompts cannot exhaust the router's memory. 0 means no limit.
+	DefaultMaxPromptBytes   = 64 << 10
+	DefaultOperationTimeout = 5 * time.Second
 	// DefaultMaxToolTraceSteps caps the number of ToolTraceStep entries kept
 	// per record. Long agent sessions can otherwise produce hundreds of
 	// steps and OOM the router process (see issue #1835). 0 means no limit;
@@ -19,10 +29,18 @@ const (
 	// default in pkg/config sets this to 100 so the router is safe out of
 	// the box.
 	DefaultMaxToolTraceSteps = 0
+
+	LifecycleUnknown    = store.LifecycleUnknown
+	LifecycleInProgress = store.LifecycleInProgress
+	LifecycleCompleted  = store.LifecycleCompleted
+	LifecycleAborted    = store.LifecycleAborted
+	LifecycleFailed     = store.LifecycleFailed
 )
 
 type (
 	Signal                        = store.Signal
+	HallucinationSpan             = store.HallucinationSpan
+	HallucinationScore            = store.HallucinationScore
 	LearningDiagnostics           = store.LearningDiagnostics
 	LearningAdaptationDiagnostics = store.LearningAdaptationDiagnostics
 	LearningCandidateScore        = store.LearningCandidateScore
@@ -33,9 +51,18 @@ type (
 	LearningPolicyDiagnostics     = store.LearningPolicyDiagnostics
 	LearningProtectionDiagnostics = store.LearningProtectionDiagnostics
 	LearningRescueDiagnostics     = store.LearningRescueDiagnostics
+	LearningReleaseDiagnostics    = store.LearningReleaseDiagnostics
 	LearningSamplingDiagnostics   = store.LearningSamplingDiagnostics
 	Outcome                       = store.Outcome
+	PreparedDispatchReceipt       = store.PreparedDispatchReceipt
+	RequestDemandSnapshot         = store.RequestDemandSnapshot
+	FusionPanelAttemptDiagnostics = store.FusionPanelAttemptDiagnostics
+	FusionQuorumDiagnostics       = store.FusionQuorumDiagnostics
+	LooperUsage                   = store.LooperUsage
+	LooperAttempt                 = store.LooperAttempt
+	LooperDiagnostics             = store.LooperDiagnostics
 	RouteDiagnostics              = store.RouteDiagnostics
+	DecisionRanking               = store.DecisionRanking
 	RoutingRecord                 = store.Record
 	ToolTrace                     = store.ToolTrace
 	ToolTraceStep                 = store.ToolTraceStep
@@ -43,27 +70,59 @@ type (
 )
 
 type Recorder struct {
-	storage store.Storage
+	*recorderState
 
-	maxBodyBytes      int
-	maxToolTraceBytes int // 0 = no limit
-	maxToolTraceSteps int // 0 = no limit
+	policyMu               sync.RWMutex
+	maxBodyBytes           int
+	maxPromptBytes         int // 0 = no limit
+	maxToolTraceBytes      int // 0 = no limit
+	maxRawToolTraceBytes   int // 0 = no limit
+	maxToolTraceTotalBytes int // 0 = no limit
+	maxToolTraceSteps      int // 0 = no limit
 
 	captureRequestBody  bool
 	captureResponseBody bool
 }
 
+// recorderState owns the store and its lifecycle across request-specific views.
+type recorderState struct {
+	storage   store.Storage
+	outcomes  *outcomeQueue
+	closeOnce sync.Once
+	closeErr  error
+	// operationTimeout bounds audit-store I/O independently from the client
+	// request. It is immutable after construction in production; tests may
+	// shorten it before issuing operations to exercise stalled backends.
+	operationTimeout time.Duration
+
+	lifecycleMu          sync.Mutex
+	lifecycleTransitions map[string]*lifecycleTransition
+}
+
+type lifecycleTransition struct {
+	done chan struct{}
+	err  error
+}
+
 // NewRecorder creates a new Recorder with the specified storage backend.
 func NewRecorder(storage store.Storage) *Recorder {
 	return &Recorder{
-		storage:           storage,
+		recorderState: &recorderState{
+			storage:              storage,
+			outcomes:             newOutcomeQueue(DefaultOutcomeQueueCapacity, outcomeShutdownGrace),
+			operationTimeout:     DefaultOperationTimeout,
+			lifecycleTransitions: make(map[string]*lifecycleTransition),
+		},
 		maxBodyBytes:      DefaultMaxBodyBytes,
+		maxPromptBytes:    DefaultMaxPromptBytes,
 		maxToolTraceBytes: DefaultMaxToolTraceBytes,
 		maxToolTraceSteps: DefaultMaxToolTraceSteps,
 	}
 }
 
 func (r *Recorder) SetCapturePolicy(captureRequest, captureResponse bool, maxBodyBytes int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
 	r.captureRequestBody = captureRequest
 	r.captureResponseBody = captureResponse
 
@@ -74,12 +133,48 @@ func (r *Recorder) SetCapturePolicy(captureRequest, captureResponse bool, maxBod
 	}
 }
 
-// SetMaxToolTraceBytes sets the per-field byte limit for structured tool-trace
-// fields (Prompt, ToolDefinitions, ToolTraceStep.Arguments, ToolTraceStep.Output).
-// A value of 0 disables truncation for those fields.
+// SetMaxPromptBytes sets the byte limit of the prompt a record keeps. A value
+// of 0 disables truncation; negative values are ignored.
+func (r *Recorder) SetMaxPromptBytes(max int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
+	if max >= 0 {
+		r.maxPromptBytes = max
+	}
+}
+
+// SetMaxToolTraceBytes sets the per-field byte limit for structured tool text
+// (ToolDefinitions, and each ToolTraceStep's Text, Arguments and Output). A
+// value of 0 disables truncation for those fields.
 func (r *Recorder) SetMaxToolTraceBytes(max int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
 	if max >= 0 {
 		r.maxToolTraceBytes = max
+	}
+}
+
+// SetMaxRawToolTraceBytes sets the byte limit of each step's raw copies of
+// its arguments and output (RawArguments and RawOutput), which
+// SetMaxToolTraceBytes leaves whole. A value of 0 keeps them whole; negative
+// values are ignored.
+func (r *Recorder) SetMaxRawToolTraceBytes(max int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
+	if max >= 0 {
+		r.maxRawToolTraceBytes = max
+	}
+}
+
+// SetMaxToolTraceTotalBytes caps the text a record's trace steps keep
+// together, raw copies included. Over it the oldest steps are dropped, the
+// newest is always kept, and ToolTrace.StepsTruncated is set. A value of 0
+// disables the budget; negative values are ignored.
+func (r *Recorder) SetMaxToolTraceTotalBytes(max int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
+	if max >= 0 {
+		r.maxToolTraceTotalBytes = max
 	}
 }
 
@@ -88,17 +183,53 @@ func (r *Recorder) SetMaxToolTraceBytes(max int) {
 // the most recent timeline) and ToolTrace.StepsTruncated is set. A value of
 // 0 disables step-count truncation. Negative values are ignored.
 func (r *Recorder) SetMaxToolTraceSteps(max int) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
 	if max >= 0 {
 		r.maxToolTraceSteps = max
 	}
 }
 
 func (r *Recorder) ShouldCaptureRequest() bool {
-	return r.captureRequestBody
+	return r.policySnapshot().captureRequestBody
 }
 
 func (r *Recorder) ShouldCaptureResponse() bool {
-	return r.captureResponseBody
+	return r.policySnapshot().captureResponseBody
+}
+
+type recorderPolicy struct {
+	maxBodyBytes           int
+	maxPromptBytes         int
+	maxToolTraceBytes      int
+	maxRawToolTraceBytes   int
+	maxToolTraceTotalBytes int
+	maxToolTraceSteps      int
+	captureRequestBody     bool
+	captureResponseBody    bool
+}
+
+func (r *Recorder) policySnapshot() recorderPolicy {
+	r.policyMu.RLock()
+	defer r.policyMu.RUnlock()
+	return recorderPolicy{
+		maxBodyBytes:           r.maxBodyBytes,
+		maxPromptBytes:         r.maxPromptBytes,
+		maxToolTraceBytes:      r.maxToolTraceBytes,
+		maxRawToolTraceBytes:   r.maxRawToolTraceBytes,
+		maxToolTraceTotalBytes: r.maxToolTraceTotalBytes,
+		maxToolTraceSteps:      r.maxToolTraceSteps,
+		captureRequestBody:     r.captureRequestBody,
+		captureResponseBody:    r.captureResponseBody,
+	}
+}
+
+// capToolTrace bounds a trace as policy says: each step's text fields, its
+// raw copies, the step count and the steps' total text, in that order.
+func capToolTrace(trace *ToolTrace, policy recorderPolicy) {
+	truncateToolTraceSteps(trace, policy.maxToolTraceBytes, policy.maxRawToolTraceBytes)
+	capToolTraceStepCount(trace, policy.maxToolTraceSteps)
+	capToolTraceTotalBytes(trace, policy.maxToolTraceTotalBytes)
 }
 
 func (r *Recorder) SetMaxRecords(max int) {
@@ -108,59 +239,113 @@ func (r *Recorder) SetMaxRecords(max int) {
 }
 
 func (r *Recorder) AddRecord(rec RoutingRecord) (string, error) {
+	policy := r.policySnapshot()
 	if rec.Timestamp.IsZero() {
 		rec.Timestamp = time.Now().UTC()
 	}
-
-	if r.captureRequestBody && len(rec.RequestBody) > r.maxBodyBytes {
-		rec.RequestBody = rec.RequestBody[:r.maxBodyBytes]
-		rec.RequestBodyTruncated = true
+	if rec.LifecycleState == "" {
+		rec.LifecycleState = store.LifecycleInProgress
 	}
 
-	if r.captureResponseBody && len(rec.ResponseBody) > r.maxBodyBytes {
-		rec.ResponseBody = rec.ResponseBody[:r.maxBodyBytes]
-		rec.ResponseBodyTruncated = true
-	}
+	// Enforce capture switches and apply body truncation limits.
+	rec.RequestBody, rec.RequestBodyTruncated = applyBodyCapturePolicy(
+		rec.RequestBody, rec.RequestBodyTruncated, policy.captureRequestBody, policy.maxBodyBytes)
+	rec.ResponseBody, rec.ResponseBodyTruncated = applyBodyCapturePolicy(
+		rec.ResponseBody, rec.ResponseBodyTruncated, policy.captureResponseBody, policy.maxBodyBytes)
+	omitUncapturedText(&rec, policy)
 
+	capRecordPrompt(&rec, policy.maxPromptBytes)
 	// Apply MaxToolTraceBytes to structured tool-trace fields.
 	// These are truncated independently of the raw body fields so that
 	// callers can keep MaxBodyBytes small without losing structured data.
-	applyMaxToolTraceBytes(&rec, r.maxToolTraceBytes)
-	// MaxToolTraceSteps is enforced separately so that an unbounded agent
-	// session that produces hundreds of steps per record can't keep growing
-	// the slice and OOM the router (see issue #1835).
-	capToolTraceStepCount(rec.ToolTrace, r.maxToolTraceSteps)
+	// MaxToolTraceSteps and MaxToolTraceTotalBytes are enforced too, so that
+	// an unbounded agent session that produces hundreds of steps per record
+	// can't keep growing the slice and OOM the router (see issue #1835).
+	applyMaxToolTraceBytes(&rec, policy)
 
-	ctx := context.Background()
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.Add(ctx, rec)
 }
 
-// applyMaxToolTraceBytes truncates structured tool-trace text fields to max
-// bytes. A non-positive max disables truncation.
-func applyMaxToolTraceBytes(rec *RoutingRecord, max int) {
-	if max <= 0 {
-		return
+// capPrompt is a prompt as a record keeps it under a limit of max bytes (none
+// for a non-positive max): cut on a UTF-8 boundary and, when cut, with the
+// size and SHA-256 of the whole prompt. Malformed UTF-8 is normalized first,
+// as it is before any text reaches a database.
+func capPrompt(prompt string, max int) store.StoredPrompt {
+	whole := strings.ToValidUTF8(prompt, "\uFFFD")
+	kept, cut := truncateString(whole, max)
+	if !cut {
+		return store.StoredPrompt{Text: kept}
 	}
-	if len(rec.Prompt) > max {
-		rec.Prompt = rec.Prompt[:max]
-		rec.PromptTruncated = true
-	}
-	if len(rec.ToolDefinitions) > max {
-		rec.ToolDefinitions = rec.ToolDefinitions[:max]
-		rec.ToolDefinitionsTruncated = true
-	}
-	truncateToolTraceSteps(rec.ToolTrace, max)
+	sum := sha256.Sum256([]byte(whole))
+	return store.StoredPrompt{Text: kept, Truncated: true, OriginalBytes: len(whole), OriginalSHA256: hex.EncodeToString(sum[:])}
 }
 
-// truncateToolTraceSteps applies the byte limit to each step's Arguments and
-// Output fields.
-func truncateToolTraceSteps(trace *ToolTrace, max int) {
-	if trace == nil || max <= 0 {
+// capRecordPrompt cuts the record's prompt to max bytes, as capPrompt does.
+func capRecordPrompt(rec *RoutingRecord, max int) {
+	if rec.Prompt == "" {
+		return
+	}
+	stored := capPrompt(rec.Prompt, max)
+	if !stored.Truncated {
+		rec.Prompt = stored.Text
+		return
+	}
+	stored.Apply(rec)
+}
+
+// applyMaxToolTraceBytes truncates the tool definitions to the policy's
+// per-field limit and bounds the trace as capToolTrace does. A non-positive
+// limit disables its truncation, but malformed UTF-8 is still normalized
+// before text reaches a database.
+func applyMaxToolTraceBytes(rec *RoutingRecord, policy recorderPolicy) {
+	definitions, definitionsCut := truncateString(rec.ToolDefinitions, policy.maxToolTraceBytes)
+	rec.ToolDefinitions, rec.ToolDefinitionsTruncated = definitions, rec.ToolDefinitionsTruncated || definitionsCut
+	capToolTrace(rec.ToolTrace, policy)
+}
+
+// truncateToolTraceSteps applies the byte limits to each step: max to its
+// Text, Arguments and Output, rawMax to its raw copies.
+func truncateToolTraceSteps(trace *ToolTrace, max, rawMax int) {
+	if trace == nil {
 		return
 	}
 	for i := range trace.Steps {
-		truncateToolTraceStep(&trace.Steps[i], max)
+		truncateToolTraceStep(&trace.Steps[i], max, rawMax)
 	}
+}
+
+// capToolTraceTotalBytes drops the oldest steps until the text the steps keep
+// together, raw copies included, fits max bytes. The newest step is always
+// kept, so a step larger than the budget alone is still recorded. A
+// non-positive max disables the budget.
+func capToolTraceTotalBytes(trace *ToolTrace, max int) {
+	if trace == nil || max <= 0 || len(trace.Steps) == 0 {
+		return
+	}
+	total := 0
+	for i := range trace.Steps {
+		total += toolTraceStepBytes(&trace.Steps[i])
+	}
+	dropped := 0
+	for total > max && dropped < len(trace.Steps)-1 {
+		total -= toolTraceStepBytes(&trace.Steps[dropped])
+		dropped++
+	}
+	if dropped == 0 {
+		return
+	}
+	kept := make([]ToolTraceStep, len(trace.Steps)-dropped)
+	copy(kept, trace.Steps[dropped:])
+	trace.Steps = kept
+	trace.StepsTruncated = true
+	trace.DroppedStepCount += dropped
+}
+
+// toolTraceStepBytes is the text a step keeps, raw copies included.
+func toolTraceStepBytes(step *ToolTraceStep) int {
+	return len(step.Text) + len(step.Arguments) + len(step.RawArguments) + len(step.Output) + len(step.RawOutput)
 }
 
 // capToolTraceStepCount drops the oldest steps so that no more than max
@@ -186,74 +371,176 @@ func capToolTraceStepCount(trace *ToolTrace, max int) {
 	trace.DroppedStepCount += dropped
 }
 
-// truncateToolTraceStep applies the byte limit to a single step's Arguments
-// and Output fields. RawArguments and RawOutput are intentionally preserved at
-// their original full-fidelity values so that downstream consumers that need
-// to replay the exchange byte-for-byte can still recover the untruncated
-// payload (see #1781). Only the "normalized" Arguments/Output fields are cut,
-// and Truncated is set to signal that truncation happened.
-func truncateToolTraceStep(step *ToolTraceStep, max int) {
-	if len(step.Arguments) > max {
-		step.Arguments = step.Arguments[:max]
+// truncateToolTraceStep applies the byte limit to a single step's Text,
+// Arguments and Output fields. RawArguments and RawOutput are preserved at
+// their original full-fidelity values unless rawMax is positive, so that
+// downstream consumers that need to replay the exchange byte-for-byte can
+// still recover the untruncated payload (see #1781). Truncated signals a cut
+// of the normalized fields, RawTruncated one of the raw copies.
+func truncateToolTraceStep(step *ToolTraceStep, max, rawMax int) {
+	text, t0 := truncateString(step.Text, max)
+	args, t1 := truncateString(step.Arguments, max)
+	out, t2 := truncateString(step.Output, max)
+	step.Text = text
+	step.Arguments = args
+	step.Output = out
+	if t0 || t1 || t2 {
 		step.Truncated = true
 	}
-	if len(step.Output) > max {
-		step.Output = step.Output[:max]
-		step.Truncated = true
+	if rawMax <= 0 {
+		return
+	}
+	rawArgs, r0 := truncateString(step.RawArguments, rawMax)
+	rawOut, r1 := truncateString(step.RawOutput, rawMax)
+	step.RawArguments, step.RawOutput = rawArgs, rawOut
+	if r0 || r1 {
+		step.RawTruncated = true
 	}
 }
 
 func (r *Recorder) UpdateStatus(id string, status int, fromCache bool, streaming bool) error {
-	ctx := context.Background()
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.UpdateStatus(ctx, id, status, fromCache, streaming)
 }
 
+// FinalizeLifecycle marks a replay record terminal. It deliberately does not
+// infer completion from response headers: streaming clients can disconnect
+// after a 200 header but before the terminal frame arrives.
+func (r *Recorder) FinalizeLifecycle(id string, state string, reason string) error {
+	r.lifecycleMu.Lock()
+	if transition, exists := r.lifecycleTransitions[id]; exists {
+		r.lifecycleMu.Unlock()
+		<-transition.done
+		return transition.err
+	}
+	transition := &lifecycleTransition{done: make(chan struct{})}
+	r.lifecycleTransitions[id] = transition
+	r.lifecycleMu.Unlock()
+
+	err := r.finalizeLifecycle(id, state, reason)
+	r.lifecycleMu.Lock()
+	transition.err = err
+	close(transition.done)
+	delete(r.lifecycleTransitions, id)
+	r.lifecycleMu.Unlock()
+	return err
+}
+
+func (r *Recorder) finalizeLifecycle(id string, state string, reason string) error {
+	record, found, err := r.getRecord(id)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if record.LifecycleState != "" && record.LifecycleState != store.LifecycleInProgress {
+		return nil
+	}
+	endedAt := time.Now().UTC()
+	durationMS := endedAt.Sub(record.Timestamp).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	return r.storage.UpdateLifecycle(
+		ctx,
+		id,
+		state,
+		endedAt,
+		durationMS,
+		boundedTerminalReason(reason),
+	)
+}
+
+func boundedTerminalReason(reason string) string {
+	const maxReasonRunes = 256
+	reason = strings.TrimSpace(reason)
+	runes := []rune(reason)
+	if len(runes) <= maxReasonRunes {
+		return reason
+	}
+	return string(runes[:maxReasonRunes])
+}
+
 func (r *Recorder) AttachRequest(id string, requestBody []byte) error {
-	if !r.captureRequestBody {
+	policy := r.policySnapshot()
+	if !policy.captureRequestBody {
 		return nil
 	}
 
-	body, truncated := truncateBody(requestBody, r.maxBodyBytes)
-	ctx := context.Background()
+	body, truncated := truncateBody(requestBody, policy.maxBodyBytes)
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.AttachRequest(ctx, id, body, truncated)
 }
 
+// AttachPrompt stores the prompt a record withheld when it was written, under
+// the same byte limit AddRecord applies to it.
+func (r *Recorder) AttachPrompt(id string, prompt string) error {
+	policy := r.policySnapshot()
+	if !policy.captureRequestBody {
+		return nil
+	}
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	return r.storage.AttachPrompt(ctx, id, capPrompt(prompt, policy.maxPromptBytes))
+}
+
 func (r *Recorder) AttachResponse(id string, responseBody []byte) error {
-	if !r.captureResponseBody {
+	policy := r.policySnapshot()
+	if !policy.captureResponseBody {
 		return nil
 	}
 
-	body, truncated := truncateBody(responseBody, r.maxBodyBytes)
-	ctx := context.Background()
+	body, truncated := truncateBody(responseBody, policy.maxBodyBytes)
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.AttachResponse(ctx, id, body, truncated)
 }
 
 func (r *Recorder) AppendOutcome(id string, outcome Outcome) error {
-	ctx := context.Background()
+	return r.AppendOutcomeContext(context.Background(), id, outcome)
+}
+
+// AppendOutcomeContext lets background dispatchers cancel outstanding receipt
+// I/O at shutdown. The recorder's operation timeout still bounds each write.
+func (r *Recorder) AppendOutcomeContext(parent context.Context, id string, outcome Outcome) error {
+	outcome = omitUncapturedReplies(outcome, r.policySnapshot())
+	ctx, cancel := r.replayOperationContextFrom(parent)
+	defer cancel()
 	return r.storage.AppendOutcome(ctx, id, outcome)
 }
 
 // UpdateHallucinationStatus updates hallucination detection results for a record.
-func (r *Recorder) UpdateHallucinationStatus(id string, detected bool, confidence float32, spans []string) error {
-	ctx := context.Background()
-	return r.storage.UpdateHallucinationStatus(ctx, id, detected, confidence, spans)
+func (r *Recorder) UpdateHallucinationStatus(id string, detected bool, confidence float32, spans []string, spanDetails []HallucinationSpan, score ...HallucinationScore) error {
+	spans, spanDetails = omitUncapturedSpans(spans, spanDetails, r.policySnapshot())
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	return r.storage.UpdateHallucinationStatus(ctx, id, detected, confidence, spans, spanDetails, score...)
 }
 
 func (r *Recorder) UpdateUsageCost(id string, usage UsageCost) error {
-	ctx := context.Background()
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.UpdateUsageCost(ctx, id, usage)
 }
 
 func (r *Recorder) UpdateToolTrace(id string, trace ToolTrace) error {
+	policy := r.policySnapshot()
 	// Apply MaxToolTraceBytes here too: response-side traces are attached via
 	// this update path (see extproc.attachRouterReplayResponse) and therefore
 	// bypass the AddRecord truncation unless we cap them again. The same
-	// reasoning applies to MaxToolTraceSteps — a long agent session updates
-	// the trace through this method, so without a cap here the OOM scenario
-	// from #1835 can still happen even when AddRecord truncates correctly.
-	truncateToolTraceSteps(&trace, r.maxToolTraceBytes)
-	capToolTraceStepCount(&trace, r.maxToolTraceSteps)
-	ctx := context.Background()
+	// reasoning applies to MaxToolTraceSteps and MaxToolTraceTotalBytes — a
+	// long agent session updates the trace through this method, so without a
+	// cap here the OOM scenario from #1835 can still happen even when
+	// AddRecord truncates correctly.
+	omitUncapturedStepText(&trace, policy)
+	capToolTrace(&trace, policy)
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
 	return r.storage.UpdateToolTrace(ctx, id, trace)
 }
 
@@ -265,59 +552,104 @@ func (r *Recorder) Reader() store.Reader {
 
 // GetRecord returns a copy of the record with the given ID.
 func (r *Recorder) GetRecord(id string) (RoutingRecord, bool) {
-	ctx := context.Background()
-	rec, found, err := r.storage.Get(ctx, id)
+	rec, found, err := r.getRecord(id)
 	if err != nil {
 		return RoutingRecord{}, false
 	}
 	return rec, found
 }
 
+func (r *Recorder) getRecord(id string) (RoutingRecord, bool, error) {
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	rec, found, err := r.storage.Get(ctx, id)
+	return rec, found, err
+}
+
+func (r *Recorder) ListRecords() ([]RoutingRecord, error) {
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	return r.storage.List(ctx)
+}
+
 func (r *Recorder) ListAllRecords() []RoutingRecord {
-	ctx := context.Background()
-	records, err := r.storage.List(ctx)
+	records, err := r.ListRecords()
 	if err != nil {
 		return []RoutingRecord{}
 	}
 	return records
 }
 
-// Releases resources held by the storage backend.
-func (r *Recorder) Close() error {
-	return r.storage.Close()
+// replayOperationContext is intentionally independent from a client request:
+// a disconnected client must not cancel a terminal audit write. It is still
+// bounded so an unavailable replay backend cannot hang chat completion,
+// config reload, or shutdown indefinitely. Store mutations acknowledge queued
+// persistence before returning, so callers can release the timer immediately.
+func (r *Recorder) replayOperationContext() (context.Context, context.CancelFunc) {
+	return r.replayOperationContextFrom(context.Background())
+}
+
+// replayOperationContextFrom bounds an operation whose caller owns cancellation,
+// such as the background outcome writer at shutdown.
+func (r *Recorder) replayOperationContextFrom(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := r.operationTimeout
+	if timeout <= 0 {
+		timeout = DefaultOperationTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+// applyBodyCapturePolicy enforces one capture switch on one body field. The
+// switch decides whether a body may reach storage at all, not just whether it
+// is truncated: when capture is off the body must be dropped entirely —
+// truncation alone only bounds a leak (see #2748). Within the limit the
+// caller's truncated flag is preserved.
+func applyBodyCapturePolicy(body string, truncated, capture bool, maxBytes int) (string, bool) {
+	if !capture {
+		return "", false
+	}
+	body, cut := truncateString(body, maxBytes)
+	return body, truncated || cut
 }
 
 func truncateBody(body []byte, maxBytes int) (string, bool) {
-	if maxBytes <= 0 || len(body) <= maxBytes {
-		return string(body), false
+	return truncateString(string(body), maxBytes)
+}
+
+// Captured text uses U+FFFD for malformed UTF-8 runs. Apply the byte budget after
+// normalization, and keep only complete runes so PostgreSQL TEXT remains valid.
+func truncateString(s string, maxBytes int) (string, bool) {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s, false
 	}
-	return string(body[:maxBytes]), true
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return strings.Clone(s[:end]), true
 }
 
 func logSignalFields(signals Signal) map[string]interface{} {
 	return map[string]interface{}{
 		"keyword":       signals.Keyword,
-		"embedding":     signals.Embedding,
 		"domain":        signals.Domain,
 		"fact_check":    signals.FactCheck,
 		"user_feedback": signals.UserFeedback,
-		"reask":         signals.Reask,
-		"preference":    signals.Preference,
+		"turn_relation": signals.TurnRelation,
 		"language":      signals.Language,
 		"context":       signals.Context,
-		"structure":     signals.Structure,
 		"complexity":    signals.Complexity,
 		"modality":      signals.Modality,
 		"authz":         signals.Authz,
 		"jailbreak":     signals.Jailbreak,
 		"pii":           signals.PII,
-		"kb":            signals.KB,
 		"conversation":  signals.Conversation,
 	}
 }
 
 func appendGuardrailLogFields(fields map[string]interface{}, r RoutingRecord) {
-	if !r.GuardrailsEnabled && !r.JailbreakEnabled && !r.PIIEnabled {
+	if !r.GuardrailsEnabled && !r.JailbreakEnabled && !r.PIIEnabled && !r.JailbreakScoreAvailable {
 		return
 	}
 
@@ -325,15 +657,15 @@ func appendGuardrailLogFields(fields map[string]interface{}, r RoutingRecord) {
 	fields["jailbreak_enabled"] = r.JailbreakEnabled
 	fields["pii_enabled"] = r.PIIEnabled
 
-	if r.JailbreakDetected {
+	if r.JailbreakDetected || r.JailbreakScoreAvailable {
 		fields["jailbreak_detected"] = r.JailbreakDetected
 		fields["jailbreak_type"] = r.JailbreakType
-		fields["jailbreak_confidence"] = r.JailbreakConfidence
-	}
-	if r.ResponseJailbreakDetected {
-		fields["response_jailbreak_detected"] = r.ResponseJailbreakDetected
-		fields["response_jailbreak_type"] = r.ResponseJailbreakType
-		fields["response_jailbreak_confidence"] = r.ResponseJailbreakConfidence
+		fields["jailbreak_score_available"] = r.JailbreakScoreAvailable
+		if r.JailbreakDecision != nil {
+			fields["jailbreak_decision"] = r.JailbreakDecision
+		} else if r.JailbreakScoreAvailable {
+			fields["jailbreak_confidence"] = r.JailbreakConfidence
+		}
 	}
 	if r.PIIDetected {
 		fields["pii_detected"] = r.PIIDetected
@@ -360,7 +692,11 @@ func appendHallucinationLogFields(fields map[string]interface{}, r RoutingRecord
 
 	fields["hallucination_enabled"] = r.HallucinationEnabled
 	fields["hallucination_detected"] = r.HallucinationDetected
-	fields["hallucination_confidence"] = r.HallucinationConfidence
+	fields["hallucination_score_available"] = r.HallucinationScoreAvailable
+	if r.HallucinationScoreAvailable {
+		fields["hallucination_confidence"] = r.HallucinationConfidence
+		fields["hallucination_score_kind"] = r.HallucinationScoreKind
+	}
 	if len(r.HallucinationSpans) > 0 {
 		fields["hallucination_spans"] = r.HallucinationSpans
 	}
@@ -372,6 +708,9 @@ func appendUsageCostLogFields(fields map[string]interface{}, r RoutingRecord) {
 	}
 	if r.CachedPromptTokens != nil {
 		fields["cached_prompt_tokens"] = *r.CachedPromptTokens
+	}
+	if r.CacheWriteTokens != nil {
+		fields["cache_write_tokens"] = *r.CacheWriteTokens
 	}
 	if r.CompletionTokens != nil {
 		fields["completion_tokens"] = *r.CompletionTokens
@@ -398,25 +737,39 @@ func appendUsageCostLogFields(fields map[string]interface{}, r RoutingRecord) {
 
 func LogFields(r RoutingRecord, event string) map[string]interface{} {
 	fields := map[string]interface{}{
-		"event":             event,
-		"replay_id":         r.ID,
-		"decision":          r.Decision,
-		"decision_tier":     r.DecisionTier,
-		"decision_priority": r.DecisionPriority,
-		"category":          r.Category,
-		"original_model":    r.OriginalModel,
-		"selected_model":    r.SelectedModel,
-		"reasoning_mode":    r.ReasoningMode,
-		"confidence_score":  r.ConfidenceScore,
-		"selection_method":  r.SelectionMethod,
-		"session_policy":    r.SessionPolicy,
-		"request_id":        r.RequestID,
-		"timestamp":         r.Timestamp,
-		"turn_index":        r.TurnIndex,
-		"from_cache":        r.FromCache,
-		"streaming":         r.Streaming,
-		"response_status":   r.ResponseStatus,
-		"signals":           logSignalFields(r.Signals),
+		"event":                      event,
+		"replay_id":                  r.ID,
+		"decision":                   r.Decision,
+		"decision_tier":              r.DecisionTier,
+		"decision_priority":          r.DecisionPriority,
+		"category":                   r.Category,
+		"original_model":             r.OriginalModel,
+		"selected_model":             r.SelectedModel,
+		"reasoning_mode":             r.ReasoningMode,
+		"confidence_score_available": r.ConfidenceScoreAvailable,
+		"selection_method":           r.SelectionMethod,
+		"session_policy":             r.SessionPolicy,
+		"request_id":                 r.RequestID,
+		"timestamp":                  r.Timestamp,
+		"turn_index":                 r.TurnIndex,
+		"from_cache":                 r.FromCache,
+		"streaming":                  r.Streaming,
+		"response_status":            r.ResponseStatus,
+		"lifecycle_state":            r.LifecycleState,
+		"signals":                    logSignalFields(r.Signals),
+	}
+	if r.ConfidenceScoreAvailable {
+		fields["confidence_score"] = r.ConfidenceScore
+	}
+	if len(r.SignalErrorMatches) > 0 {
+		fields["signal_error_matches"] = r.SignalErrorMatches
+	}
+	if r.EndedAt != nil {
+		fields["ended_at"] = *r.EndedAt
+		fields["duration_ms"] = r.DurationMS
+	}
+	if r.TerminalReason != "" {
+		fields["terminal_reason"] = r.TerminalReason
 	}
 	if r.SessionID != "" {
 		fields["session_id"] = r.SessionID

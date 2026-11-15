@@ -11,6 +11,7 @@ resources:
   - prometheus/rbac.yaml
   - prometheus/pvc.yaml
   - prometheus/configmap.yaml
+  - prometheus/rules.yaml
   - prometheus/deployment.yaml
   - prometheus/service.yaml
   - grafana/secret.yaml
@@ -20,6 +21,8 @@ resources:
   - grafana/deployment.yaml
   - grafana/service.yaml
   - dashboard/configmap.yaml
+  - dashboard/serviceaccount.yaml
+  - dashboard/rbac.yaml
   - dashboard/deployment.yaml
   - dashboard/service.yaml
   - ingress.yaml

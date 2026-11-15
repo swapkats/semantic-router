@@ -2,9 +2,8 @@
 
 ## Overview
 
-Use `config/decision/not/` when a route should match only if a risky or disallowed signal is absent.
-
-`NOT` is the simplest exclusion rule in the decision catalog.
+A `NOT` decision matches only when its child condition does not match. Use it
+to make an exclusion explicit in route policy.
 
 ## Key Advantages
 
@@ -21,7 +20,7 @@ Some routes should only run when a known risk signal is absent. If that exclusio
 
 ## When to Use
 
-Use `not/` when:
+Use `NOT` when:
 
 - known jailbreak or PII-bearing traffic must be excluded
 - premium routes should stay away from unsafe inputs
@@ -29,22 +28,29 @@ Use `not/` when:
 
 ## Configuration
 
-Source fragment: `config/decision/not/exclude-jailbreak.yaml`
-
 ```yaml
-routing:
-  decisions:
-    - name: safe_only_route
-      description: Match only when the known prompt-injection signal is absent.
-      priority: 70
-      rules:
-        operator: NOT
-        conditions:
-          - type: jailbreak
-            name: prompt_injection
-      modelRefs:
-        - model: qwen2.5:3b
-          use_reasoning: false
+recipes:
+  - name: default
+    decisions:
+      - name: safe_only_route
+        description: Match only when the known prompt-injection signal is absent.
+        priority: 70
+        rules:
+          operator: NOT
+          conditions:
+            - type: jailbreak
+              name: prompt_injection
+        modelRefs:
+          - model: qwen2.5:3b
+            use_reasoning: false
 ```
 
 Use `NOT` sparingly and keep the excluded signal explicit, otherwise the decision becomes hard to audit.
+
+`NOT` reverses a known match; it does not turn an unavailable signal into a
+negative result. `NOT Unknown` remains `Unknown`, and the root decision's
+`rules.on_unknown` policy determines the outcome. Use `fail_request` when an
+unresolved safety check must reject the request. A known negative prediction
+still does not prove that content is safe; use trusted identity for access
+control. See a complete example:
+[`config/fragments/decision/not/exclude-jailbreak.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/decision/not/exclude-jailbreak.yaml).

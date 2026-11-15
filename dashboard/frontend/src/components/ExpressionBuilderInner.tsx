@@ -275,6 +275,20 @@ const ExpressionBuilderInner: React.FC<ExpressionBuilderInnerProps> = ({
     setContextMenu({ x: e.clientX, y: e.clientY, path: node.data.path })
   }, [])
 
+  const onNodeMenuKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return
+      const element = (event.target as HTMLElement).closest<HTMLElement>('.react-flow__node')
+      const node = nodes.find((candidate) => candidate.id === element?.dataset.id)
+      if (!element || !node) return
+      event.preventDefault()
+      event.stopPropagation()
+      const bounds = element.getBoundingClientRect()
+      setContextMenu({ x: bounds.left, y: bounds.bottom, path: node.data.path })
+    },
+    [nodes],
+  )
+
   const onPaneClick = useCallback(() => {
     setSelectedPath(null)
     setContextMenu(null)
@@ -372,6 +386,7 @@ const ExpressionBuilderInner: React.FC<ExpressionBuilderInnerProps> = ({
 
           <div className={styles.rfCanvas}
             ref={reactFlowRef}
+            onKeyDown={onNodeMenuKeyDown}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
           >
@@ -399,14 +414,14 @@ const ExpressionBuilderInner: React.FC<ExpressionBuilderInnerProps> = ({
                 edgesFocusable={false}
                 proOptions={{ hideAttribution: true }}
               >
-                <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="rgba(118, 185, 0, 0.15)" />
+                <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="rgba(143, 148, 156, 0.15)" />
                 <Controls
                   showInteractive={false}
                   position="bottom-left"
                   className={styles.rfControls}
                 />
                 <MiniMap
-                  nodeColor={(n) => n.type === 'operatorNode' ? 'rgba(99, 102, 241, 0.7)' : 'rgba(118, 185, 0, 0.7)'}
+                  nodeColor={(n) => n.type === 'operatorNode' ? 'rgba(99, 102, 241, 0.7)' : 'rgba(143, 148, 156, 0.7)'}
                   maskColor="rgba(0, 0, 0, 0.15)"
                   className={styles.rfMinimap}
                   pannable
@@ -475,6 +490,7 @@ const ExpressionBuilderInner: React.FC<ExpressionBuilderInnerProps> = ({
             setInsertSiblingTarget(target)
             setContextMenu(null)
           }}
+          onClose={() => setContextMenu(null)}
           onUnwrap={handleUnwrap}
           onWrap={handleWrap}
         />

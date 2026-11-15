@@ -1,0 +1,194 @@
+//go:build !windows
+
+package apiserver
+
+import (
+	"context"
+	"encoding/json"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestHandleConfigValidate(t *testing.T) {
+	body := `{"yaml":"version: v0.5\nproviders:\n  defaults:\n    model: m1\n  models:\n    - name: m1\n      backend_refs:\n        - endpoint: 127.0.0.1:8000\nrecipes:\n  - name: default\n"}`
+	request := httptest.NewRequest("POST", "/api/v1/config/validate", strings.NewReader(body))
+	response := httptest.NewRecorder()
+
+	(&ClassificationAPIServer{}).handleConfigValidate(response, request)
+
+	if response.Code != 200 {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"valid":true`) {
+		t.Fatalf("body = %s", response.Body.String())
+	}
+}
+
+func TestHandleConfigValidateRejectsUnknownFields(t *testing.T) {
+	body := `{"yaml":"version: v0.5\n","dsl":"ignored legacy payload"}`
+	request := httptest.NewRequest("POST", "/api/v1/config/validate", strings.NewReader(body))
+	response := httptest.NewRecorder()
+
+	(&ClassificationAPIServer{}).handleConfigValidate(response, request)
+
+	if response.Code != 400 || !strings.Contains(response.Body.String(), "unknown field") {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHandleConfigValidateRejectsUnknownYAMLFields(t *testing.T) {
+	body := `{"yaml":"version: v0.5\nproviders:\n  defaults:\n    model: m1\n  models:\n    - name: m1\n      descriptin: typo\nrecipes:\n  - name: default\n"}`
+	request := httptest.NewRequest("POST", "/api/v1/config/validate", strings.NewReader(body))
+	response := httptest.NewRecorder()
+
+	(&ClassificationAPIServer{}).handleConfigValidate(response, request)
+
+	if response.Code != 422 || !strings.Contains(response.Body.String(), `unknown field \"descriptin\"`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestConfigValidateRouteRequiresReadPermission(t *testing.T) {
+	for _, route := range apiConfigRoutes() {
+		if route.Path == "/api/v1/config/validate" && route.Method == "POST" {
+			if route.Permission != PermConfigRead {
+				t.Fatalf("permission = %q, want %q", route.Permission, PermConfigRead)
+			}
+			return
+		}
+	}
+	t.Fatal("config validation route not found")
+}
+
+func TestHandleConfigValidateDoesNotExpandEnvironmentSecrets(t *testing.T) {
+	const canary = "validation-secret-canary"
+	t.Setenv("VALIDATE_SECRET_CANARY", canary)
+	yamlInput := `
+version: v0.5
+providers:
+  defaults:
+    model: m1
+  models:
+    - name: m1
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+          auth: {api_key_env: VALIDATE_SECRET_CANARY}
+      description: ${VALIDATE_SECRET_CANARY}
+recipes:
+  - name: default
+`
+	body, err := json.Marshal(RouterConfigUpdateRequest{YAML: yamlInput})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(
+		"POST",
+		"/api/v1/config/validate",
+		strings.NewReader(string(body)),
+	)
+	request = request.WithContext(context.WithValue(
+		request.Context(),
+		managementPrincipalContextKey,
+		managementPrincipal{Role: "admin", AuthEnabled: true},
+	))
+	response := httptest.NewRecorder()
+
+	(&ClassificationAPIServer{}).handleConfigValidate(response, request)
+
+	if response.Code != 200 {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), canary) {
+		t.Fatal("validation response expanded an environment secret")
+	}
+	if !strings.Contains(response.Body.String(), "${VALIDATE_SECRET_CANARY}") {
+		t.Fatalf("validation response did not preserve the environment reference: %s", response.Body.String())
+	}
+	if !strings.Contains(
+		response.Body.String(),
+		"api_key_env: VALIDATE_SECRET_CANARY",
+	) {
+		t.Fatalf("validation response did not preserve api_key_env: %s", response.Body.String())
+	}
+}
+
+func TestHandleConfigValidatePreservesCredentialEnvironmentReference(t *testing.T) {
+	yamlInput := `
+version: v0.5
+providers:
+  defaults:
+    model: m1
+  models:
+    - name: m1
+      backend_refs:
+        - endpoint: 127.0.0.1:8000
+          provider: vllm
+          api_key: ${MODEL_API_KEY}
+recipes:
+  - name: default
+`
+	body, err := json.Marshal(RouterConfigUpdateRequest{YAML: yamlInput})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(
+		"POST",
+		"/api/v1/config/validate",
+		strings.NewReader(string(body)),
+	)
+	response := httptest.NewRecorder()
+
+	(&ClassificationAPIServer{}).handleConfigValidate(response, request)
+
+	if response.Code != 200 {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "api_key: ${MODEL_API_KEY}") {
+		t.Fatalf("validation response did not preserve credential reference: %s", response.Body.String())
+	}
+}
+
+func TestValidateHotReloadCompatibilityRejectsEnvoyTopologyChange(t *testing.T) {
+	current := minimalDeployTestConfig("route")
+	next := minimalDeployTestConfig("route")
+	next.VLLMEndpoints[0].Port++
+
+	currentYAML := mustMarshalCanonicalConfigYAML(t, current)
+	nextYAML := mustMarshalCanonicalConfigYAML(t, next)
+	err := validateHotReloadCompatibility(currentYAML, nextYAML)
+	if err == nil {
+		t.Fatal("expected restart-required Envoy topology error")
+	}
+	if !strings.Contains(err.Error(), "deployment workflow") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateHotReloadCompatibilityAllowsRouterPolicyChange(t *testing.T) {
+	current := minimalDeployTestConfig("before")
+	next := minimalDeployTestConfig("after")
+
+	if err := validateHotReloadCompatibility(
+		mustMarshalCanonicalConfigYAML(t, current),
+		mustMarshalCanonicalConfigYAML(t, next),
+	); err != nil {
+		t.Fatalf("routing-only change should be hot-reloadable: %v", err)
+	}
+}
+
+func TestPreviewTimeoutReloadKeepsListenerAdmissionBound(t *testing.T) {
+	current := minimalDeployTestConfig("route")
+	next := minimalDeployTestConfig("route")
+	timeout, limit := 600, 8
+	next.API.RoutingPreview.RequestTimeoutSeconds = &timeout
+	if err := validateParsedHotReloadCompatibility(current, next); err != nil {
+		t.Fatalf("timeout-only reload rejected: %v", err)
+	}
+	next.API.RoutingPreview.MaxConcurrency = &limit
+	err := validateParsedHotReloadCompatibility(current, next)
+	if err == nil || !strings.Contains(err.Error(), "deployment workflow") {
+		t.Fatalf("listener admission change was not rejected: %v", err)
+	}
+}

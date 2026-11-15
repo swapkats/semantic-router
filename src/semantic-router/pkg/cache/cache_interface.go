@@ -1,11 +1,11 @@
 package cache
 
 import (
-	"math"
-	"sync/atomic"
+	"context"
 	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/embedding"
 )
 
 // CacheEntry represents a complete cached request-response pair with associated metadata
@@ -21,6 +21,79 @@ type CacheEntry struct {
 	HitCount     int64     // Access count
 	TTLSeconds   int       // Per-entry TTL in seconds (0 = not cached, -1 = use cache default, >0 = specific TTL)
 	ExpiresAt    time.Time // Calculated expiration time based on TTL
+
+	// Immutable in-memory lookup metadata; not part of the stored/public entry.
+	polarityTokens []string
+}
+
+// LookupResult carries the request-owned outcome of one lookup. A hit includes
+// the matched score and, for a semantic hit, the cached request it matched; a
+// below-threshold miss may include its rejected candidate's score. Errors
+// carry no score.
+type LookupResult struct {
+	ResponseBody  []byte
+	Found         bool
+	Similarity    float32
+	Query         string
+	StoredAt      time.Time
+	ExpiresAt     time.Time
+	Age           time.Duration
+	AgeKnown      bool
+	NegationGuard NegationGuardOutcome // semantic hits only
+	RequestID     string               // the request that wrote a semantic hit's entry
+}
+
+// lookupResultFromTimestamps constructs a successful LookupResult and calculates Age / AgeKnown.
+func lookupResultFromTimestamps(responseBody []byte, similarity float32, storedAt, expiresAt time.Time) LookupResult {
+	var age time.Duration
+	var ageKnown bool
+	if !storedAt.IsZero() {
+		age = time.Since(storedAt)
+		ageKnown = true
+	}
+	return LookupResult{
+		ResponseBody: responseBody,
+		Found:        true,
+		Similarity:   similarity,
+		StoredAt:     storedAt,
+		ExpiresAt:    expiresAt,
+		Age:          age,
+		AgeKnown:     ageKnown,
+	}
+}
+
+// ExactCacheBackend is an optional exact-response fast path implemented by
+// key-value-capable cache backends.
+type ExactCacheBackend interface {
+	FindExact(ctx context.Context, partition string, fingerprint string) (LookupResult, error)
+	AddExact(ctx context.Context, partition string, fingerprint string, responseBody []byte, ttlSeconds int) error
+}
+
+// ctxErr treats a nil context as having no error.
+//
+// Embedding cannot be interrupted mid-flight; callers check before embedding
+// and before publishing state.
+func ctxErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func contextErrorOnFailure(ctx context.Context, operationErr error) error {
+	if operationErr == nil {
+		return nil
+	}
+	return ctxErr(ctx)
+}
+
+// releaseOnFailure releases a partially constructed client when setup fails.
+func releaseOnFailure(step func() error, release func()) error {
+	if err := step(); err != nil {
+		release()
+		return err
+	}
+	return nil
 }
 
 // CacheBackend defines the interface for semantic cache implementations
@@ -31,30 +104,16 @@ type CacheBackend interface {
 	// CheckConnection verifies the cache backend connection is healthy
 	// Returns nil if the connection is healthy, error otherwise
 	// For local caches (in-memory), this may be a no-op
-	CheckConnection() error
-
-	// AddPendingRequest stores a request awaiting its response
-	AddPendingRequest(requestID string, model string, query string, requestBody []byte, ttlSeconds int) error
-
-	// UpdateWithResponse completes a pending request with the received response
-	UpdateWithResponse(requestID string, responseBody []byte, ttlSeconds int) error
+	CheckConnection(ctx context.Context) error
 
 	// AddEntry stores a complete request-response pair in the cache
-	AddEntry(requestID string, model string, query string, requestBody, responseBody []byte, ttlSeconds int) error
+	AddEntry(ctx context.Context, requestID string, model string, query string, requestBody, responseBody []byte, ttlSeconds int) error
 
-	// FindSimilar searches for semantically similar cached requests
-	// Returns the cached response, match status, and any error
-	FindSimilar(model string, query string) ([]byte, bool, error)
-
-	// FindSimilarWithThreshold searches for semantically similar cached requests using a specific threshold
-	// This allows category-specific similarity thresholds
-	// Returns the cached response, match status, and any error
-	FindSimilarWithThreshold(model string, query string, threshold float32) ([]byte, bool, error)
-
-	// LastSimilarity returns the similarity score from the most recent
-	// FindSimilarWithThreshold call. Returns 0 if no lookup has been performed.
-	// Used by the extproc layer to set the x-vsr-cache-similarity response header.
-	LastSimilarity() float32
+	// LookupSimilar returns the cached entries of model's partition most
+	// similar to query within bounds, most similar first, with their
+	// responses, from one lookup operation. A canceled or expired context is
+	// reported as an error rather than as a miss.
+	LookupSimilar(ctx context.Context, model string, query string, bounds SimilarityBounds) (SimilarEntries, error)
 
 	// Close releases all resources held by the cache backend
 	Close() error
@@ -63,30 +122,50 @@ type CacheBackend interface {
 	GetStats() CacheStats
 }
 
-// SimilarityTracker provides thread-safe storage for the last similarity score.
-// Embed this in cache backends to satisfy the LastSimilarity() interface method.
-type SimilarityTracker struct {
-	lastSimilarity uint64 // atomic; stores float32 bits
+// LegacyCacheBackend is the temporary backend-implementation seam. New request
+// paths depend on TypedCacheStore; only backend tests and migration adapters
+// should use these two-phase and convenience methods.
+//
+// These methods stay context-free on purpose: they are not on a request path,
+// so there is no caller context to honor. Implementations forward
+// context.Background() to the context-aware core.
+type LegacyCacheBackend interface {
+	CacheBackend
+	AddPendingRequest(requestID string, model string, query string, requestBody []byte, ttlSeconds int) error
+	UpdateWithResponse(requestID string, responseBody []byte, ttlSeconds int) error
+	FindSimilar(model string, query string) ([]byte, bool, error)
+	FindSimilarWithThreshold(model string, query string, threshold float32) ([]byte, bool, error)
+	// LookupSimilarWithThreshold is LookupSimilar's most similar entry, or a
+	// miss with the closest similarity the lookup saw.
+	LookupSimilarWithThreshold(ctx context.Context, model string, query string, threshold float32) (LookupResult, error)
 }
 
-// StoreSimilarity records a similarity score (thread-safe).
-func (t *SimilarityTracker) StoreSimilarity(similarity float32) {
-	atomic.StoreUint64(&t.lastSimilarity, uint64(math.Float32bits(similarity)))
-}
-
-// LastSimilarity returns the most recently stored similarity score.
-func (t *SimilarityTracker) LastSimilarity() float32 {
-	bits := atomic.LoadUint64(&t.lastSimilarity)
-	return math.Float32frombits(uint32(bits & 0xFFFFFFFF)) //nolint:gosec // intentional: float32 bits fit in 32 bits
-}
+// Compile-time assertions keep production implementations aligned with CacheBackend.
+var (
+	_ CacheBackend = (*InMemoryCache)(nil)
+	_ CacheBackend = (*HybridCache)(nil)
+	_ CacheBackend = (*MilvusCache)(nil)
+	_ CacheBackend = (*QdrantCache)(nil)
+	_ CacheBackend = (*RedisCache)(nil)
+	_ CacheBackend = (*ValkeyCache)(nil)
+)
 
 // CacheStats holds performance metrics and usage statistics for cache operations
 type CacheStats struct {
-	TotalEntries    int        `json:"total_entries"`
-	HitCount        int64      `json:"hit_count"`
-	MissCount       int64      `json:"miss_count"`
-	HitRatio        float64    `json:"hit_ratio"`
-	LastCleanupTime *time.Time `json:"last_cleanup_time,omitempty"`
+	TotalEntries        int        `json:"total_entries"`
+	HitCount            int64      `json:"hit_count"`
+	MissCount           int64      `json:"miss_count"`
+	HitRatio            float64    `json:"hit_ratio"`
+	LastCleanupTime     *time.Time `json:"last_cleanup_time,omitempty"`
+	ExactHitCount       int64      `json:"exact_hit_count"`
+	SemanticHitCount    int64      `json:"semantic_hit_count"`
+	L1HitCount          int64      `json:"l1_hit_count"`
+	L2HitCount          int64      `json:"l2_hit_count"`
+	L1Entries           int        `json:"l1_entries"`
+	SingleflightWaiters int64      `json:"singleflight_waiters"`
+	InvalidationCount   int64      `json:"invalidation_count"`
+	StaleMissCount      int64      `json:"stale_miss_count"`
+	FailOpenCount       int64      `json:"fail_open_count"`
 }
 
 // CacheBackendType defines the available cache backend implementations
@@ -128,6 +207,9 @@ const (
 
 // CacheConfig contains configuration settings shared across all cache backends
 type CacheConfig struct {
+	// EmbeddingProvider is prepared by the generation owner and is never serialized.
+	EmbeddingProvider embedding.Provider `yaml:"-" json:"-"`
+
 	// BackendType specifies which cache implementation to use
 	BackendType CacheBackendType `yaml:"backend_type"`
 
@@ -170,7 +252,10 @@ type CacheConfig struct {
 	// Hybrid cache specific settings
 	MaxMemoryEntries int `yaml:"max_memory_entries,omitempty"` // Max entries in HNSW for hybrid cache
 
-	// EmbeddingModel specifies which embedding model to use
-	// Options: "bert" (default), "qwen3", "gemma", "mmbert", "multimodal"
-	EmbeddingModel string `yaml:"embedding_model,omitempty"`
+	// EmbeddingDeployment names the deployment semantic entries are embedded
+	// with, and EmbeddingDimension and EmbeddingLayer the view the in-memory
+	// backend reads (config.RouterConfig.ResponseCacheEmbedding).
+	EmbeddingDeployment string `yaml:"-" json:"-"`
+	EmbeddingDimension  int    `yaml:"-" json:"-"`
+	EmbeddingLayer      int    `yaml:"-" json:"-"`
 }

@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package cache
 
@@ -12,7 +12,8 @@ import (
 
 func TestValkeyCacheDisabled(t *testing.T) {
 	cache, err := NewValkeyCache(ValkeyCacheOptions{
-		Enabled: false,
+		EmbeddingProvider: cacheTestEmbeddingProvider(),
+		Enabled:           false,
 	})
 	assert.NoError(t, err)
 	assert.NotNil(t, cache)
@@ -21,8 +22,9 @@ func TestValkeyCacheDisabled(t *testing.T) {
 
 func TestValkeyCacheConfigValidation(t *testing.T) {
 	_, err := NewValkeyCache(ValkeyCacheOptions{
-		Enabled: true,
-		Config:  nil,
+		EmbeddingProvider: cacheTestEmbeddingProvider(),
+		Enabled:           true,
+		Config:            nil,
 	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "valkey config is required")
@@ -43,23 +45,25 @@ func TestValkeyCacheEmbeddingModel(t *testing.T) {
 	valkeyConfig.Development.AutoCreateIndex = true
 
 	cache, err := NewValkeyCache(ValkeyCacheOptions{
+		EmbeddingProvider:   cacheTestEmbeddingProvider(),
 		Enabled:             false,
 		Config:              valkeyConfig,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          3600,
 	})
 	assert.NoError(t, err)
-	assert.Empty(t, cache.embeddingModel)
+	assert.Empty(t, cache.embeddingDeployment)
 
 	cache, err = NewValkeyCache(ValkeyCacheOptions{
+		EmbeddingProvider:   cacheTestEmbeddingProvider(),
 		Enabled:             false,
 		Config:              valkeyConfig,
 		SimilarityThreshold: 0.8,
 		TTLSeconds:          3600,
-		EmbeddingModel:      "qwen3",
+		EmbeddingDeployment: "qwen3-embedding",
 	})
 	assert.NoError(t, err)
-	assert.Empty(t, cache.embeddingModel)
+	assert.Empty(t, cache.embeddingDeployment)
 }
 
 func TestValkeyCacheGetStats(t *testing.T) {
@@ -106,36 +110,11 @@ func TestValkeyMetricTypeNormalization(t *testing.T) {
 			// NewValkeyCache will fail to connect, but normalization
 			// happens before the connection attempt, mutating cfg.
 			_, _ = NewValkeyCache(ValkeyCacheOptions{
-				Enabled: true,
-				Config:  cfg,
+				EmbeddingProvider: cacheTestEmbeddingProvider(),
+				Enabled:           true,
+				Config:            cfg,
 			})
 			assert.Equal(t, tt.expected, cfg.Index.VectorField.MetricType)
-		})
-	}
-}
-
-func TestDistanceToSimilarity(t *testing.T) {
-	tests := []struct {
-		name     string
-		metric   string
-		distance float64
-		expected float32
-	}{
-		{"COSINE zero distance", "COSINE", 0.0, 1.0},
-		{"COSINE max distance", "COSINE", 2.0, 0.0},
-		{"IP passthrough", "IP", 0.75, 0.75},
-		{"L2 zero distance", "L2", 0.0, 1.0},
-		// Lowercase inputs hit the default branch (1 - distance).
-		// After normalization these should never occur, but verify
-		// the fallback is sane.
-		{"lowercase cosine falls to default", "cosine", 0.0, 1.0},
-		{"lowercase ip falls to default", "ip", 0.75, 0.25},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := distanceToSimilarity(tt.metric, tt.distance)
-			assert.InDelta(t, tt.expected, result, 0.001)
 		})
 	}
 }

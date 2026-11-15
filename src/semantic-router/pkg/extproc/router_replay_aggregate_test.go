@@ -1,6 +1,8 @@
 package extproc
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -15,7 +17,7 @@ func TestHandleRouterReplayAPIListAppliesFilters(t *testing.T) {
 
 	response := router.handleRouterReplayAPI(
 		"GET",
-		"/v1/router_replay?decision=decision-b&cache_status=streamed&limit=10",
+		"/api/v1/observability/replays?recipe=beta&decision=decision-b&cache_status=streamed&limit=10",
 	)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate replay list response")
@@ -31,15 +33,40 @@ func TestHandleRouterReplayAPIListAppliesFilters(t *testing.T) {
 	}
 }
 
+// An agent harness names its session in a header; pasting that session id
+// into the search finds the session's requests.
+func TestHandleRouterReplayAPIListSearchesSessionIDs(t *testing.T) {
+	router := newReplayAggregateTestRouter(t)
+
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays?search=6582A295-CLAUDE&limit=10")
+	if response == nil || response.GetImmediateResponse() == nil {
+		t.Fatal("expected immediate replay list response")
+	}
+	body := decodeJSONBody(t, response.GetImmediateResponse().Body)
+	if got := int(body["count"].(float64)); got != 1 {
+		t.Fatalf("expected count=1, got %d", got)
+	}
+	if got := mustReplayData(t, body["data"])[0]["id"]; got != "replay-2" {
+		t.Fatalf("expected the session's replay-2, got %#v", got)
+	}
+}
+
 func TestHandleRouterReplayAggregateAPIReturnsChartsAndSummary(t *testing.T) {
 	router := newReplayAggregateTestRouter(t)
 
-	response := router.handleRouterReplayAPI("GET", "/v1/router_replay/aggregate")
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/aggregate")
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate aggregate response")
 	}
 
 	body := decodeJSONBody(t, response.GetImmediateResponse().Body)
+	assertReplayAggregateSummary(t, body)
+	assertReplayAggregateCharts(t, body)
+	assertReplayAggregateOptions(t, body)
+}
+
+func assertReplayAggregateSummary(t *testing.T, body map[string]interface{}) {
+	t.Helper()
 	if got := body["object"]; got != "router_replay.aggregate" {
 		t.Fatalf("expected aggregate object, got %#v", got)
 	}
@@ -57,7 +84,10 @@ func TestHandleRouterReplayAggregateAPIReturnsChartsAndSummary(t *testing.T) {
 	if got := int(summary["excluded_record_count"].(float64)); got != 1 {
 		t.Fatalf("expected excluded_record_count=1, got %d", got)
 	}
+}
 
+func assertReplayAggregateCharts(t *testing.T, body map[string]interface{}) {
+	t.Helper()
 	modelSelection := body["model_selection"].([]interface{})
 	if got := modelSelection[0].(map[string]interface{})["name"]; got != "gpt-4o" {
 		t.Fatalf("expected alphabetical tie-breaker for model_selection, got %#v", got)
@@ -70,8 +100,16 @@ func TestHandleRouterReplayAggregateAPIReturnsChartsAndSummary(t *testing.T) {
 
 	tokenBreakdown := body["token_breakdown"].(map[string]interface{})
 	byDecision := tokenBreakdown["by_decision"].([]interface{})
-	if got := byDecision[0].(map[string]interface{})["name"]; got != "decision-b" {
+	if got := byDecision[0].(map[string]interface{})["name"]; got != "beta::decision-b" {
 		t.Fatalf("expected highest token decision first, got %#v", got)
+	}
+}
+
+func assertReplayAggregateOptions(t *testing.T, body map[string]interface{}) {
+	t.Helper()
+	availableRecipes := body["available_recipes"].([]interface{})
+	if len(availableRecipes) != 2 || availableRecipes[0] != "alpha" || availableRecipes[1] != "beta" {
+		t.Fatalf("expected sorted recipe options, got %#v", availableRecipes)
 	}
 
 	availableModels := body["available_models"].([]interface{})
@@ -85,7 +123,7 @@ func TestHandleRouterReplayAggregateAPIAppliesFilters(t *testing.T) {
 
 	response := router.handleRouterReplayAPI(
 		"GET",
-		"/v1/router_replay/aggregate?cache_status=cached&search=alpha",
+		"/api/v1/observability/replays/aggregate?cache_status=cached&search=alpha",
 	)
 	if response == nil || response.GetImmediateResponse() == nil {
 		t.Fatal("expected immediate aggregate response")
@@ -101,6 +139,76 @@ func TestHandleRouterReplayAggregateAPIAppliesFilters(t *testing.T) {
 	summary := body["summary"].(map[string]interface{})
 	if got := summary["total_saved"].(float64); got != 0.003 {
 		t.Fatalf("expected filtered total_saved=0.003, got %#v", got)
+	}
+}
+
+func TestRouterReplayAggregateExcludesNonCompletedCostAndReportsLifecycle(t *testing.T) {
+	cost := 1.25
+	records := []routerreplay.RoutingRecord{
+		{LifecycleState: routerreplay.LifecycleCompleted, ActualCost: &cost, BaselineCost: &cost, CostSavings: &cost, Currency: replayStringPtr("USD"), BaselineModel: replayStringPtr("base"), TotalTokens: replayIntPtr(100)},
+		{LifecycleState: routerreplay.LifecycleFailed, ActualCost: &cost, BaselineCost: &cost, CostSavings: &cost},
+		{LifecycleState: routerreplay.LifecycleAborted, ActualCost: &cost, BaselineCost: &cost, CostSavings: &cost},
+		{LifecycleState: routerreplay.LifecycleInProgress, ActualCost: &cost, BaselineCost: &cost, CostSavings: &cost},
+		{LifecycleState: routerreplay.LifecycleUnknown, ActualCost: &cost, BaselineCost: &cost, CostSavings: &cost},
+	}
+
+	payload := buildRouterReplayAggregatePayload(records, records)
+	if payload.Summary.CostRecordCount != 1 || payload.Summary.ExcludedRecordCount != 4 || payload.Summary.ActualSpend != cost {
+		t.Fatalf("cost summary = %+v", payload.Summary)
+	}
+	if payload.Lifecycle.Completed != 1 || payload.Lifecycle.Failed != 1 ||
+		payload.Lifecycle.Aborted != 1 || payload.Lifecycle.InProgress != 1 ||
+		payload.Lifecycle.Unknown != 1 {
+		t.Fatalf("lifecycle summary = %+v", payload.Lifecycle)
+	}
+}
+
+func TestHandleRouterReplayAggregateAPIGroupsCurrenciesWithoutConversion(t *testing.T) {
+	router := newReplayAggregateTestRouter(t)
+	recorder := router.ReplayRecorders["decision-a"]
+	_, err := recorder.AddRecord(routerreplay.RoutingRecord{
+		ID: "eur-record", Timestamp: time.Unix(3, 0).UTC(), LifecycleState: routerreplay.LifecycleCompleted,
+		ActualCost: replayFloat64Ptr(0.004), BaselineCost: replayFloat64Ptr(0.009), CostSavings: replayFloat64Ptr(0.005),
+		Currency: replayStringPtr("EUR"), BaselineModel: replayStringPtr("eur-base"), TotalTokens: replayIntPtr(150),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/aggregate")
+	body := decodeJSONBody(t, response.GetImmediateResponse().Body)
+	summary := body["summary"].(map[string]interface{})
+	if summary["currency"] != nil || summary["total_saved"].(float64) != 0 || int(summary["cost_record_count"].(float64)) != 2 || int(summary["excluded_record_count"].(float64)) != 1 {
+		t.Fatalf("unexpected mixed-currency summary: %#v", summary)
+	}
+	groups := summary["by_currency"].([]interface{})
+	if len(groups) != 2 {
+		t.Fatalf("expected two retained currency groups, got %#v", groups)
+	}
+	eur := groups[0].(map[string]interface{})
+	usd := groups[1].(map[string]interface{})
+	if eur["currency"] != "EUR" || eur["actual_spend"].(float64) != 0.004 || eur["total_saved"].(float64) != 0.005 || usd["currency"] != "USD" || usd["actual_spend"].(float64) != 0.002 || usd["total_saved"].(float64) != 0.003 {
+		t.Fatalf("currency amounts lost or converted: %#v", groups)
+	}
+}
+
+func TestRouterReplayAggregateExcludesIncompleteCostEstimates(t *testing.T) {
+	complete := routerreplay.RoutingRecord{
+		LifecycleState: routerreplay.LifecycleCompleted, ActualCost: replayFloat64Ptr(0), BaselineCost: replayFloat64Ptr(0), CostSavings: replayFloat64Ptr(0),
+		Currency: replayStringPtr("USD"), BaselineModel: replayStringPtr("free"), TotalTokens: replayIntPtr(100),
+	}
+	records := []routerreplay.RoutingRecord{complete}
+	missingUsage := complete
+	missingUsage.TotalTokens = nil
+	missingCurrency := complete
+	missingCurrency.Currency = nil
+	missingPricing := complete
+	missingPricing.ActualCost = nil
+	missingBaseline := complete
+	missingBaseline.BaselineModel = nil
+	records = append(records, missingUsage, missingCurrency, missingPricing, missingBaseline)
+	got := buildRouterReplayAggregateCostSummary(records)
+	if got.CostRecordCount != 1 || got.ExcludedRecordCount != 4 || got.Currency != "USD" || len(got.ByCurrency) != 1 {
+		t.Fatalf("incomplete estimates counted or explicit free pricing lost: %#v", got)
 	}
 }
 
@@ -124,9 +232,11 @@ func newReplayAggregateTestRouter(t *testing.T) *OpenAIRouter {
 			ID:               "replay-1",
 			Timestamp:        time.Unix(1, 0).UTC(),
 			RequestID:        "req-alpha",
+			Recipe:           "alpha",
 			Decision:         "decision-a",
 			OriginalModel:    "gpt-4",
 			SelectedModel:    "gpt-4o-mini",
+			LifecycleState:   routerreplay.LifecycleCompleted,
 			FromCache:        true,
 			PromptTokens:     &promptA,
 			CompletionTokens: &completionA,
@@ -145,15 +255,18 @@ func newReplayAggregateTestRouter(t *testing.T) *OpenAIRouter {
 			ID:               "replay-2",
 			Timestamp:        time.Unix(2, 0).UTC(),
 			RequestID:        "req-beta",
+			SessionID:        "6582a295-claude-code-session",
+			Recipe:           "beta",
 			Decision:         "decision-b",
 			OriginalModel:    "gpt-4",
 			SelectedModel:    "gpt-4o",
+			LifecycleState:   routerreplay.LifecycleCompleted,
 			Streaming:        true,
 			PromptTokens:     &promptB,
 			CompletionTokens: &completionB,
 			Signals: store.Signal{
-				Domain:     []string{"business"},
-				Preference: []string{"latency"},
+				Domain:       []string{"business"},
+				TurnRelation: []string{"asked_again"},
 			},
 		},
 	}
@@ -168,5 +281,35 @@ func newReplayAggregateTestRouter(t *testing.T) *OpenAIRouter {
 		ReplayRecorders: map[string]*routerreplay.Recorder{
 			"decision-a": recorder,
 		},
+	}
+}
+
+func TestRouterReplayAggregateCountsEverySignalFamily(t *testing.T) {
+	recorder := routerreplay.NewRecorder(store.NewMemoryStore(10, 0))
+	if _, err := recorder.AddRecord(routerreplay.RoutingRecord{ID: "every-family", Decision: "guarded", Signals: routerreplay.Signal{
+		Keyword: []string{"a"}, Domain: []string{"a"}, FactCheck: []string{"a"}, UserFeedback: []string{"a"},
+		TurnRelation: []string{"a"}, Language: []string{"a"}, Context: []string{"a"}, Complexity: []string{"a"},
+		Modality: []string{"a"}, Authz: []string{"a"}, Jailbreak: []string{"a"}, Safety: []string{"a"},
+		PII: []string{"a"}, Conversation: []string{"a"}, Metadata: []string{"a"}, InputModality: []string{"a"},
+		Decision: []string{"a", "b"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	router := &OpenAIRouter{ReplayRecorder: recorder}
+	payload := routerreplay.AggregateResponse{}
+	if err := json.Unmarshal(router.handleRouterReplayAPI("GET", "/api/v1/observability/replays/aggregate").GetImmediateResponse().GetBody(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, value := range payload.SignalDistribution {
+		got[value.Name] = value.Value
+	}
+	want := map[string]int{
+		"keyword": 1, "domain": 1, "fact_check": 1, "user_feedback": 1, "turn_relation": 1, "language": 1,
+		"context": 1, "complexity": 1, "modality": 1, "authz": 1, "jailbreak": 1, "safety": 1, "pii": 1,
+		"conversation": 1, "metadata": 1, "input_modality": 1, "decision": 2,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("signal_distribution = %v, want %v", got, want)
 	}
 }

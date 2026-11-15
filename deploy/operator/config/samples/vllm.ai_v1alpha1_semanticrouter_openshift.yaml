@@ -9,7 +9,7 @@ spec:
   # Image Configuration
   # ====================
   image:
-    repository: ghcr.io/vllm-project/semantic-router/extproc
+    repository: ghcr.io/vllm-project/semantic-router/vllm-sr
     tag: latest
     pullPolicy: IfNotPresent
     # imageRegistry: quay.io  # Optional registry prefix
@@ -27,12 +27,13 @@ spec:
   # ====================
   # Configure model backends that semantic router routes to after classification.
   # The operator renders these into canonical providers.models[].backend_refs
-  # and routing.modelCards entries in config.yaml.
+  # with the facts routing reads about each model in config.yaml.
   vllmEndpoints:
     # Example 1: KServe InferenceService (RHOAI 3)
     - name: kserve-llama3-8b
       model: llama3-8b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: kserve
         inferenceServiceName: llama-3-8b  # InferenceService in same namespace
@@ -41,7 +42,8 @@ spec:
     # Example 2: KServe InferenceService with reasoning disabled
     - name: kserve-qwen-2-5-7b
       model: qwen2.5-7b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: kserve
         inferenceServiceName: qwen-2-5-7b
@@ -49,7 +51,8 @@ spec:
     # Example 3: Llama Stack service discovery
     - name: llamastack-llama-405b
       model: llama-3.3-70b-instruct
-      reasoningFamily: gpt
+      reasoning:
+        family: gpt
       backend:
         type: llamastack
         discoveryLabels:
@@ -59,7 +62,8 @@ spec:
     # Example 4: Direct Kubernetes service
     - name: vllm-custom-model
       model: deepseek-r1-distill-qwen-7b
-      reasoningFamily: deepseek
+      reasoning:
+        family: deepseek
       backend:
         type: service
         service:
@@ -70,8 +74,10 @@ spec:
   # ====================
   # NEW: Gateway Integration (Optional)
   # ====================
-  # Reuse existing Gateway (Envoy Gateway, Istio) instead of deploying Envoy sidecar
-  # When configured, operator creates HTTPRoute and skips Envoy sidecar container
+  # Reuse an existing Gateway (Envoy Gateway, Istio): the Router serves ext_proc
+  # instead of its own listener. Configure the Gateway-specific ExtProc
+  # policy targeting this Router Service on port 50051 and model backend routes
+  # separately. The Operator does not create an HTTPRoute.
   gateway:
     existingRef:
       name: istio-ingressgateway
@@ -126,77 +132,27 @@ spec:
       memory: 4Gi
     limits:
       cpu: 4000m
-      memory: 8Gi
+      memory: 12Gi
 
   # ====================
   # Semantic Router Configuration
   # ====================
   config:
-    embedding_models:
-      mmbert_model_path: "models/mom-embedding-ultra"
-      use_cpu: true
-
-    # Semantic cache for latency/token optimization
-    semantic_cache:
+    response_cache:
       enabled: true
       backend_type: memory  # or milvus
       similarity_threshold: "0.85"  # Higher = more strict matching
       max_entries: 10000
       ttl_seconds: 3600  # 1 hour
       eviction_policy: lru  # fifo, lru, or lfu
-      embedding_model: mmbert
-
-    # Tools auto-selection based on semantic similarity
-    tools:
-      enabled: true
-      top_k: 3
-      similarity_threshold: "0.2"
-      tools_db_path: config/tools_db.json
-      fallback_to_empty: true
-
-    # Prompt guard (jailbreak detection)
-    prompt_guard:
-      enabled: true
-      use_modernbert: false
-      model_id: models/mom-jailbreak-classifier
-      threshold: "0.7"
-      use_cpu: true
-
-    # Category and PII classifiers
-    classifier:
-      category_model:
-        model_id: models/mom-category-classifier
-        use_modernbert: false
-        threshold: "0.5"
-        use_cpu: true
-      pii_model:
-        model_id: models/mmbert32k-pii-detector-merged
-        use_modernbert: false
-        use_mmbert_32k: true
-        threshold: "0.7"
-        use_cpu: true
-        pii_mapping_path: models/mmbert32k-pii-detector-merged/pii_type_mapping.json
 
     # Reasoning families configuration
-    reasoning_families:
-      qwen3:
-        type: chat_template_kwargs
-        parameter: enable_thinking
-      deepseek:
-        type: chat_template_kwargs
-        parameter: thinking
-      gpt:
-        type: reasoning_effort
-        parameter: reasoning_effort
-
-    default_reasoning_effort: medium  # low, medium, high
+    reasoning_effort: medium  # low, medium, high
 
     # API configuration
     api:
       batch_classification:
         max_batch_size: 100
-        concurrency_threshold: 5
-        max_concurrency: 8
         metrics:
           enabled: true
           detailed_goroutine_tracking: true
@@ -274,27 +230,23 @@ spec:
   # ====================
   # Health Probes
   # ====================
+  # ProbeSpec only accepts timing/enable fields. The operator always probes
+  # TCP on the gRPC port; httpGet/path/port are not CR fields.
   startupProbe:
-    httpGet:
-      path: /health
-      port: 8080
+    enabled: true
     initialDelaySeconds: 10
     periodSeconds: 5
     timeoutSeconds: 3
     failureThreshold: 30
 
   livenessProbe:
-    httpGet:
-      path: /health
-      port: 8080
+    enabled: true
     periodSeconds: 10
     timeoutSeconds: 3
     failureThreshold: 3
 
   readinessProbe:
-    httpGet:
-      path: /ready
-      port: 8080
+    enabled: true
     periodSeconds: 5
     timeoutSeconds: 3
     failureThreshold: 3
@@ -329,10 +281,10 @@ spec:
       operator: "Exists"
       effect: "NoExecute"
       tolerationSeconds: 300
-    # Example: GPU taints
-    # - key: "nvidia.com/gpu"
-    #   operator: "Exists"
-    #   effect: "NoSchedule"
+  # Example: GPU taints
+  # - key: "nvidia.com/gpu"
+  #   operator: "Exists"
+  #   effect: "NoSchedule"
 
   affinity:
     podAntiAffinity:
@@ -363,12 +315,12 @@ spec:
       value: info
     - name: RUST_BACKTRACE
       value: "1"
-    # Example: External service credentials
-    # - name: API_KEY
-    #   valueFrom:
-    #     secretKeyRef:
-    #       name: api-credentials
-    #       key: api-key
+  # Example: External service credentials
+  # - name: API_KEY
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: api-credentials
+  #       key: api-key
 
   # ====================
   # Service Account
@@ -377,5 +329,5 @@ spec:
     create: true
     name: semantic-router
     annotations:
-      # Example: AWS IAM role for service account
-      # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/semantic-router-role
+    # Example: AWS IAM role for service account
+    # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/semantic-router-role

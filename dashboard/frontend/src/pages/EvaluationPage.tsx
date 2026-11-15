@@ -1,187 +1,446 @@
-import { useState, useCallback } from 'react';
-import type { EvaluationTask, CreateTaskRequest } from '../types/evaluation';
-import { useTasks, useTaskMutations, useResults } from '../hooks/useEvaluation';
-import {
-  TaskList,
-  TaskCreationForm,
-  ProgressTracker,
-  ReportViewer,
-  HistoricalResults,
-} from '../components/evaluation';
-import styles from './EvaluationPage.module.css';
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { useAuth } from '../contexts/AuthContext'
+import { useReadonly } from '../contexts/ReadonlyContext'
+import { canRunEvaluation, canWriteEvaluation } from '../utils/accessControl'
+import { benchApi } from '../components/sr-bench/api'
+import { active } from '../components/sr-bench/model'
+import RunComposer from '../components/sr-bench/RunComposer'
+import RunDetails from '../components/sr-bench/RunDetails'
+import RunComparison from '../components/sr-bench/RunComparison'
+import ReplayComposer from '../components/sr-bench/ReplayComposer'
+import RunList, { type RunFilters } from '../components/sr-bench/RunList'
+import DatasetInventory from '../components/sr-bench/DatasetInventory'
+import DatasetPreparationPanel from '../components/sr-bench/DatasetPreparationPanel'
+import ExperimentWorkspace from '../components/sr-bench/ExperimentWorkspace'
+import type {
+  Catalog,
+  Dataset,
+  ExperimentRunContext,
+  Run,
+  Target,
+} from '../components/sr-bench/types'
+import styles from '../components/sr-bench/SrBench.module.css'
+import ProductIcon from '../components/ProductIcon'
+import ProductLoadingState from '../components/ProductLoadingState'
 
-type TabType = 'tasks' | 'create' | 'progress' | 'report' | 'history';
+type Inventory = 'catalog' | 'datasets' | 'targets' | 'runs'
 
-interface TabState {
-  active: TabType;
-  selectedTaskId: string | null;
-}
-
-export function EvaluationPage() {
-  const { tasks, loading: tasksLoading, refresh: refreshTasks } = useTasks(true);
-  const { loading: mutationLoading, error: mutationError, createTask, runTask, cancelTask, deleteTask, clearError } = useTaskMutations();
-
-  const [tabState, setTabState] = useState<TabState>({ active: 'tasks', selectedTaskId: null });
-
-  // Fetch results when viewing a task's report
-  const { results: selectedResults } = useResults(
-    tabState.active === 'report' ? tabState.selectedTaskId : null
-  );
-
-  const handleViewTask = useCallback((task: EvaluationTask) => {
-    if (task.status === 'running') {
-      setTabState({ active: 'progress', selectedTaskId: task.id });
-    } else if (task.status === 'completed' || task.status === 'failed') {
-      setTabState({ active: 'report', selectedTaskId: task.id });
-    } else {
-      // For pending tasks, just select them
-      setTabState({ active: 'tasks', selectedTaskId: task.id });
+export default function EvaluationPage() {
+  const { user, refreshSession } = useAuth()
+  const {
+    serverReadonly,
+    isLoading: settingsLoading,
+    settingsError,
+    refreshSettings,
+  } = useReadonly()
+  const writeDisabledReason = settingsLoading
+    ? 'Checking preparation access…'
+    : settingsError
+      ? settingsError
+      : serverReadonly
+        ? 'Preparation is disabled in read-only mode.'
+        : !canWriteEvaluation(user)
+          ? 'View only. Ask an administrator for dataset preparation access.'
+          : null
+  const canWrite = writeDisabledReason === null
+  const canRun = canWrite && canRunEvaluation(user)
+  const [search, setSearch] = useSearchParams()
+  const pendingSearch = useRef(search)
+  useEffect(() => {
+    pendingSearch.current = search
+  }, [search])
+  const selectedID = search.get('run')
+  const experimentID = search.get('experiment')
+  const experimentRoute: Record<string, string> = experimentID ? { experiment: experimentID } : {}
+  const openComposer = (mode: 'live' | 'preview', baseline = search.get('baseline') ?? '') => {
+    const role =
+      mode === 'preview'
+        ? 'preview'
+        : !baseline
+          ? 'baseline'
+          : runs.find((run) => run.id === baseline)?.manifest.profile === 'standard'
+            ? 'validation'
+            : 'candidate'
+    setSearch({
+      view: mode === 'preview' ? 'preview' : 'new',
+      ...experimentRoute,
+      ...(baseline ? { baseline } : {}),
+      ...(experimentID ? { role } : {}),
+    })
+  }
+  const runFilters: RunFilters = {
+    query: search.get('q') ?? '',
+    status: ['active', 'completed', 'failed', 'interrupted', 'cancelled'].includes(
+      search.get('status') ?? '',
+    )
+      ? search.get('status')!
+      : 'all',
+    mode: ['live', 'preview', 'replay'].includes(search.get('mode') ?? '')
+      ? search.get('mode')!
+      : 'all',
+    profile: ['smoke', 'quick', 'standard'].includes(search.get('profile') ?? '')
+      ? search.get('profile')!
+      : 'all',
+    page: Math.max(0, Math.floor(Number(search.get('page')) || 0)),
+  }
+  const openRun = (id?: string) => {
+    const next = new URLSearchParams(search)
+    next.set('view', 'runs')
+    next.delete('section')
+    if (id) next.set('run', id)
+    else next.delete('run')
+    setSearch(next)
+  }
+  const updateRunFilters = (patch: Partial<RunFilters>) => {
+    // Router setters do not queue functional updates. Keep same-event patches
+    // together until navigation renders; external navigation resyncs above.
+    const next = new URLSearchParams(pendingSearch.current)
+    for (const [field, value] of Object.entries(patch)) {
+      const key = field === 'query' ? 'q' : field
+      if (!value || value === 'all') next.delete(key)
+      else next.set(key, String(value))
     }
-  }, []);
+    pendingSearch.current = next
+    setSearch(next, { replace: true })
+  }
+  const requestedView = search.get('view') ?? (search.has('model') ? 'new' : 'runs')
+  const view = ['runs', 'experiments', 'compare', 'datasets', 'new', 'preview'].includes(
+    requestedView,
+  )
+    ? requestedView
+    : 'runs'
+  const creating = view === 'new' || view === 'preview'
+  const [catalog, setCatalog] = useState<Catalog | null>(null)
+  const [datasets, setDatasets] = useState<Dataset[]>([])
+  const [targets, setTargets] = useState<Target[]>([])
+  const [runs, setRuns] = useState<Run[]>([])
+  const [readErrors, setReadErrors] = useState<Partial<Record<Inventory, string>>>({})
+  const [loaded, setLoaded] = useState<Partial<Record<Inventory, boolean>>>({})
+  const [loading, setLoading] = useState(true)
+  const [revision, setRevision] = useState(0)
+  const [lastRead, setLastRead] = useState<string | null>(null)
+  const refresh = useCallback(() => setRevision((value) => value + 1), [])
+  const error = Object.entries(readErrors)
+    .filter(([, message]) => message)
+    .map(([name, message]) => `${name}: ${message}`)
+    .join(' ')
 
-  const handleRunTask = useCallback(async (task: EvaluationTask) => {
-    const success = await runTask(task.id);
-    if (success) {
-      setTabState({ active: 'progress', selectedTaskId: task.id });
-      refreshTasks();
+  useEffect(() => {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    setLoading(true)
+    async function read<T>(name: Inventory, response: Promise<T>, accept: (value: T) => void) {
+      try {
+        const value = await response
+        if (!controller.signal.aborted) {
+          accept(value)
+          setLoaded((previous) => ({ ...previous, [name]: true }))
+          setReadErrors((previous) => ({ ...previous, [name]: '' }))
+        }
+        return value
+      } catch (cause) {
+        if (!controller.signal.aborted)
+          setReadErrors((previous) => ({
+            ...previous,
+            [name]:
+              cause instanceof Error ? cause.message : 'sr-bench service could not be reached.',
+          }))
+        throw cause
+      }
     }
-  }, [runTask, refreshTasks]);
-
-  const handleCancelTask = useCallback(async (task: EvaluationTask) => {
-    await cancelTask(task.id);
-    refreshTasks();
-    setTabState({ active: 'tasks', selectedTaskId: null });
-  }, [cancelTask, refreshTasks]);
-
-  const handleDeleteTask = useCallback(async (task: EvaluationTask) => {
-    if (window.confirm(`Are you sure you want to delete "${task.name}"?`)) {
-      await deleteTask(task.id);
-      refreshTasks();
+    async function load() {
+      try {
+        const responses = await Promise.allSettled([
+          read('catalog', benchApi.catalog(controller.signal), setCatalog),
+          read('datasets', benchApi.datasets(controller.signal), (value) =>
+            setDatasets(value.datasets),
+          ),
+          read('targets', benchApi.targets(controller.signal), (value) =>
+            setTargets(value.targets),
+          ),
+          read('runs', benchApi.runs(controller.signal), (value) => {
+            setRuns(value.runs)
+            setLastRead(new Date().toLocaleTimeString())
+          }),
+        ])
+        if (controller.signal.aborted) return
+        const failure = responses.find((response) => response.status === 'rejected')
+        // Retry reads after a disconnect and discover runs started from the CLI.
+        // This timer never submits, resumes or retries an evaluation.
+        const running =
+          responses[3].status === 'fulfilled' &&
+          responses[3].value.runs.some((run) => active(run.status))
+        timer = setTimeout(() => void load(), failure || running ? 5000 : 15000)
+      } finally {
+        if (!controller.signal.aborted) setLoading(false)
+      }
     }
-  }, [deleteTask, refreshTasks]);
-
-  const handleCreateTask = useCallback(async (request: CreateTaskRequest) => {
-    const task = await createTask(request);
-    if (task) {
-      refreshTasks();
-      setTabState({ active: 'tasks', selectedTaskId: task.id });
+    void load()
+    return () => {
+      controller.abort()
+      if (timer) clearTimeout(timer)
     }
-  }, [createTask, refreshTasks]);
-
-  const handleCancelCreate = useCallback(() => {
-    setTabState({ active: 'tasks', selectedTaskId: null });
-  }, []);
-
-  const handleProgressComplete = useCallback(() => {
-    refreshTasks();
-    if (tabState.selectedTaskId) {
-      setTabState({ active: 'report', selectedTaskId: tabState.selectedTaskId });
-    }
-  }, [refreshTasks, tabState.selectedTaskId]);
-
-  const handleBackFromReport = useCallback(() => {
-    setTabState({ active: 'tasks', selectedTaskId: null });
-  }, []);
-
-  const handleViewHistoricalResults = useCallback((task: EvaluationTask) => {
-    setTabState({ active: 'report', selectedTaskId: task.id });
-  }, []);
-
-  const tabs = [
-    { id: 'tasks' as const, label: 'Tasks', icon: '📋' },
-    { id: 'create' as const, label: 'Create', icon: '➕' },
-    { id: 'history' as const, label: 'History', icon: '📊' },
-  ];
+  }, [revision])
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <div className={styles.titleSection}>
-          <h1>Evaluation</h1>
-          <p>Evaluate the Mixture-of-Models across multiple dimensions at Signal and System Level.</p>
+    <section className={styles.page} aria-label="sr-bench workspace">
+      <header className={styles.hero}>
+        <div>
+          <p className={styles.eyebrow}>
+            <ProductIcon name="evaluation" /> Evaluation
+          </p>
+          <h1>
+            sr-bench <span>1.0</span>
+          </h1>
+          <p>
+            Measure capability, cost and speed. Improve Balance against your strongest single model.
+          </p>
         </div>
-      </div>
-
-      {mutationError && (
-        <div className={styles.errorBanner}>
-          <span>{mutationError}</span>
-          <button onClick={clearError}>Dismiss</button>
-        </div>
-      )}
-
-      {tabState.active === 'progress' && tabState.selectedTaskId && (
-        <div className={styles.progressView}>
-          <button
-            className={styles.backButton}
-            onClick={() => setTabState({ active: 'tasks', selectedTaskId: null })}
-          >
-            Back to Tasks
+        <div className={styles.actions}>
+          <button onClick={refresh} disabled={loading}>
+            <ProductIcon name="refresh" />
+            {loading ? 'Refreshing…' : 'Refresh'}
           </button>
-          <ProgressTracker
-            taskId={tabState.selectedTaskId}
-            onComplete={handleProgressComplete}
-            onCancel={() => {
-              const task = tasks.find(t => t.id === tabState.selectedTaskId);
-              if (task) handleCancelTask(task);
-            }}
-          />
+          {view !== 'preview' && (
+            <button onClick={() => openComposer('preview')}>
+              <ProductIcon name="decision" />
+              Preview routing
+            </button>
+          )}
+          {view !== 'new' && (
+            <button className={styles.primary} onClick={() => openComposer('live')}>
+              <ProductIcon name="plus" />
+              Create evaluation
+            </button>
+          )}
+        </div>
+      </header>
+      <nav className={styles.tabs} aria-label="Evaluation views">
+        {(
+          [
+            ['runs', 'Runs', 'list'],
+            ['experiments', 'Experiments', 'evaluation'],
+            ['compare', 'Compare iterations', 'chart'],
+            ['datasets', 'Datasets', 'database'],
+          ] as const
+        ).map(([key, label, icon]) => (
+          <button
+            key={key}
+            aria-current={view === key ? 'page' : undefined}
+            onClick={() => setSearch({ view: key, ...experimentRoute })}
+          >
+            <ProductIcon name={icon} />
+            {label}
+            {key === 'runs' && loaded.runs ? ` (${runs.length})` : ''}
+          </button>
+        ))}
+      </nav>
+      {lastRead && (
+        <p className={styles.muted} role="status">
+          Last synchronized {lastRead} · Read-only updates continue automatically.
+        </p>
+      )}
+      {error && (
+        <div className={styles.error} role="alert">
+          <strong>sr-bench needs attention.</strong> {error}
+          <p>
+            Check that the sr-bench service is running and configured for this Dashboard, then
+            refresh. Existing runs are owned by the service and continue independently of this page.
+          </p>
         </div>
       )}
-
-      {tabState.active === 'report' && selectedResults && (
-        <ReportViewer
-          results={selectedResults}
-          onBack={handleBackFromReport}
+      {!catalog && loading && <ProductLoadingState compact label="Loading sr-bench…" />}
+      {experimentID && view !== 'experiments' && (
+        <button
+          className={styles.backLink}
+          onClick={() => setSearch({ view: 'experiments', experiment: experimentID })}
+        >
+          <ProductIcon name="arrow-left" />
+          Back to experiment
+        </button>
+      )}
+      {!experimentID && (creating || (view === 'runs' && selectedID)) && (
+        <button className={styles.backLink} onClick={() => openRun()}>
+          <ProductIcon name="arrow-left" />
+          Back to runs
+        </button>
+      )}
+      {creating && catalog && loaded.datasets && loaded.targets && (
+        <RunComposer
+          catalog={catalog}
+          datasets={datasets}
+          targets={targets}
+          canRun={canRun}
+          actorID={user?.id ?? ''}
+          key={`${user?.id ?? ''}:${view}:${search.get('dataset') ?? 'new'}:${search.get('baseline') ?? ''}:${search.get('experiment') ?? ''}:${search.get('role') ?? ''}`}
+          mode={view === 'preview' ? 'preview' : 'live'}
+          baselineID={search.get('baseline') ?? undefined}
+          experiment={
+            search.get('experiment')
+              ? {
+                  id: search.get('experiment')!,
+                  role:
+                    view === 'preview'
+                      ? 'preview'
+                      : (search.get('role') as ExperimentRunContext['role']) ||
+                        (search.has('baseline') ? 'candidate' : 'baseline'),
+                }
+              : undefined
+          }
+          initialModel={search.get('model') ?? undefined}
+          initialDataset={search.get('dataset') ?? undefined}
+          onStarted={(run) => {
+            setRuns((previous) => [run, ...previous.filter((item) => item.id !== run.id)])
+            setSearch({ view: 'runs', run: run.id, ...experimentRoute })
+            refresh()
+          }}
         />
       )}
-
-      {tabState.active !== 'progress' && tabState.active !== 'report' && (
+      {view === 'experiments' && (
+        <ExperimentWorkspace
+          key={`${user?.id ?? ''}:${search.get('experiment') ?? 'all'}`}
+          id={search.get('experiment') ?? undefined}
+          actorID={user?.id ?? ''}
+          runs={runs}
+          canWrite={canWrite}
+          canRun={canRun}
+          onSelect={(id) =>
+            setSearch(id ? { view: 'experiments', experiment: id } : { view: 'experiments' })
+          }
+          onOpenRun={openRun}
+          onCandidate={(baseline, experiment, mode, role) =>
+            setSearch({
+              view: mode === 'preview' ? 'preview' : 'new',
+              ...(baseline ? { baseline } : {}),
+              experiment,
+              role,
+            })
+          }
+          onCompare={(baseline) => setSearch({ view: 'compare', baseline, ...experimentRoute })}
+        />
+      )}
+      {view === 'runs' && (
         <>
-          <div className={styles.tabs}>
-            {tabs.map((tab) => (
-              <button
-                key={tab.id}
-                className={`${styles.tab} ${tabState.active === tab.id ? styles.activeTab : ''}`}
-                onClick={() => setTabState({ active: tab.id, selectedTaskId: null })}
-              >
-                <span className={styles.tabIcon}>{tab.icon}</span>
-                <span className={styles.tabLabel}>{tab.label}</span>
-              </button>
+          {!selectedID &&
+            (loaded.runs ? (
+              <RunList
+                runs={runs}
+                selectedID={selectedID}
+                filters={runFilters}
+                onFilters={updateRunFilters}
+                onSelect={openRun}
+              />
+            ) : readErrors.runs ? (
+              <p role="status">Run inventory is unavailable.</p>
+            ) : (
+              <ProductLoadingState compact label="Loading evaluation runs…" />
             ))}
-          </div>
-
-          <div className={styles.tabContent}>
-            {tabState.active === 'tasks' && (
-              <TaskList
-                tasks={tasks}
-                loading={tasksLoading || mutationLoading}
-                onView={handleViewTask}
-                onRun={handleRunTask}
-                onCancel={handleCancelTask}
-                onDelete={handleDeleteTask}
-                onRefresh={refreshTasks}
-              />
-            )}
-
-            {tabState.active === 'create' && (
-              <TaskCreationForm
-                onSubmit={handleCreateTask}
-                onCancel={handleCancelCreate}
-                loading={mutationLoading}
-              />
-            )}
-
-            {tabState.active === 'history' && (
-              <HistoricalResults
-                tasks={tasks}
-                onViewResults={handleViewHistoricalResults}
-              />
-            )}
-          </div>
+          {selectedID && (
+            <RunDetails
+              key={`${user?.id ?? ''}:${selectedID}`}
+              id={selectedID}
+              section={
+                ['results', 'questions', 'calls', 'evidence', 'recipe'].includes(
+                  search.get('section') ?? '',
+                )
+                  ? search.get('section')!
+                  : 'results'
+              }
+              onSectionChange={(section) => {
+                const next = new URLSearchParams(search)
+                next.set('section', section)
+                setSearch(next)
+              }}
+              actorID={user?.id ?? ''}
+              canRun={canRun}
+              onChanged={refresh}
+              onRecovered={(run) => {
+                setSearch({ view: 'runs', run: run.id, ...experimentRoute })
+                refresh()
+              }}
+              onCandidate={(baseline, mode) => openComposer(mode, baseline)}
+            />
+          )}
         </>
       )}
-    </div>
-  );
+      {view === 'datasets' && search.get('prepare') === '1' && (
+        <DatasetPreparationPanel
+          key={user?.id ?? ''}
+          disabledReason={writeDisabledReason}
+          accessRefreshing={settingsLoading}
+          onRefreshAccess={() => {
+            refreshSettings()
+            void refreshSession()
+          }}
+          onCompleted={refresh}
+          onOpenDataset={(dataset) =>
+            setSearch({ view: 'datasets', dataset: dataset.id, ...experimentRoute })
+          }
+          onClose={() => setSearch({ view: 'datasets', ...experimentRoute })}
+        />
+      )}
+      {view === 'datasets' && loaded.datasets && (
+        <DatasetInventory
+          datasets={datasets}
+          runs={runs}
+          runsLoaded={!!loaded.runs}
+          canRun={canRun}
+          onPrepare={
+            search.get('prepare') === '1'
+              ? undefined
+              : () => setSearch({ view: 'datasets', prepare: '1', ...experimentRoute })
+          }
+          selectedDatasetId={search.get('dataset') ?? ''}
+          onSelectDataset={(id) => setSearch({ view: 'datasets', dataset: id, ...experimentRoute })}
+          onBackToDatasets={() => setSearch({ view: 'datasets', ...experimentRoute })}
+          onUse={(dataset) =>
+            setSearch({
+              view: 'new',
+              dataset: dataset.id,
+              ...experimentRoute,
+              ...(experimentID ? { role: 'baseline' } : {}),
+            })
+          }
+        />
+      )}
+      {view === 'datasets' &&
+        !loaded.datasets &&
+        (readErrors.datasets ? (
+          <p role="status">Dataset inventory is unavailable.</p>
+        ) : (
+          <ProductLoadingState compact label="Loading prepared datasets…" />
+        ))}
+      {creating && (!catalog || !loaded.datasets || !loaded.targets) && (
+        <ProductLoadingState
+          compact
+          label="Waiting for the benchmark catalog, prepared datasets and configured targets."
+        />
+      )}
+      {view === 'compare' &&
+        !loaded.runs &&
+        (readErrors.runs ? (
+          <p role="status">Run inventory is unavailable.</p>
+        ) : (
+          <ProductLoadingState compact label="Loading evaluation runs…" />
+        ))}
+      {view === 'compare' && loaded.runs && (
+        <>
+          <RunComparison key={user?.id ?? ''} runs={runs} />
+          <details className={styles.panel}>
+            <summary>Estimate a routing change</summary>
+            <ReplayComposer
+              key={user?.id ?? ''}
+              actorID={user?.id ?? ''}
+              canRun={canRun}
+              onCreated={(run) => {
+                setSearch({ view: 'runs', run: run.id, ...experimentRoute })
+                refresh()
+              }}
+            />
+          </details>
+        </>
+      )}
+    </section>
+  )
 }
-
-export default EvaluationPage;

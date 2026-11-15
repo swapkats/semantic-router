@@ -1,4 +1,4 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
@@ -23,27 +23,31 @@ func TestOpenAIModelsEndpoint(t *testing.T) {
 		{
 			name:                      "default excludes config models",
 			includeConfiguredModels:   false,
-			expectedModels:            []string{"vllm-sr/auto", "auto", "MoM"},
-			expectedModelResultLength: 3,
+			expectedModels:            []string{"vllm-sr/auto"},
+			expectedModelResultLength: 1,
 		},
 		{
 			name:                      "router option includes config models",
 			includeConfiguredModels:   true,
-			expectedModels:            []string{"vllm-sr/auto", "auto", "MoM", "gpt-4o-mini", "llama-3.1-8b-instruct"},
-			expectedModelResultLength: 5,
+			expectedModels:            []string{"vllm-sr/auto", "gpt-4o-mini", "llama-3.1-8b-instruct"},
+			expectedModelResultLength: 3,
 		},
 		{
-			name:   "direct looper models are exposed when decisions are configured",
+			name:   "entrypoint model names are exposed",
+			config: openAIModelsEntrypointTestConfig(),
+			expectedModels: []string{
+				"vllm-sr/privacy",
+				"vllm-sr/default-alias",
+			},
+			expectedModelResultLength: 2,
+		},
+		{
+			name:   "algorithms do not publish implicit model names",
 			config: openAIModelsLooperTestConfig(),
 			expectedModels: []string{
 				"vllm-sr/auto",
-				"auto",
-				"MoM",
-				"vllm-sr/remom",
-				"vllm-sr/fusion",
-				"vllm-sr/flow",
 			},
-			expectedModelResultLength: 6,
+			expectedModelResultLength: 1,
 		},
 	}
 
@@ -100,7 +104,20 @@ func openAIModelsTestConfig(includeConfiguredModels bool) *config.RouterConfig {
 			},
 		},
 		RouterOptions: config.RouterOptions{
-			IncludeConfigModelsInList: includeConfiguredModels,
+			ListBackendModels: includeConfiguredModels,
+		},
+	}
+}
+
+func openAIModelsEntrypointTestConfig() *config.RouterConfig {
+	return &config.RouterConfig{
+		Recipes: []config.RoutingRecipe{
+			{Name: config.DefaultRecipeName},
+			{Name: "privacy", Description: "privacy profile"},
+		},
+		Entrypoints: []config.EntrypointMapping{
+			{ModelNames: []string{"vllm-sr/privacy"}, Recipe: "privacy"},
+			{ModelNames: []string{"vllm-sr/default-alias"}, Recipe: config.DefaultRecipeName},
 		},
 	}
 }
@@ -152,6 +169,9 @@ func assertOpenAIModelList(t *testing.T, resp OpenAIModelList, expectedModels []
 		}
 		if model.Created == 0 {
 			t.Fatalf("expected created timestamp to be non-zero")
+		}
+		if model.Routing.Resolution == "" {
+			t.Fatalf("expected %s to declare routing metadata", model.ID)
 		}
 	}
 

@@ -69,43 +69,40 @@ func TestConfigDeploymentDetailHandlerNotFound(t *testing.T) {
 
 func testCanonicalYAMLForProjection() string {
 	return `
-version: v0.3
+version: v0.5
 listeners:
   - name: public
     address: 0.0.0.0
     port: 8801
 providers:
   defaults:
-    default_model: test-model
-    reasoning_families:
-      qwen3:
-        type: reasoning_effort
-        parameter: reasoning_effort
+    model: test-model
   models:
     - name: test-model
-      reasoning_family: qwen3
+      reasoning:
+        family: qwen3
       provider_model_id: test-model
       backend_refs:
         - name: endpoint1
+          provider: vllm
           endpoint: 127.0.0.1:8000
           protocol: http
           weight: 1
-routing:
-  modelCards:
-    - name: test-model
-  signals:
-    domains:
-      - name: business
-        description: Business and management related queries
-  decisions:
-    - name: default-business
-      priority: 1
-      rules:
-        operator: OR
-        conditions:
-          - type: domain
-            name: business
-      modelRefs:
-        - model: test-model
+recipes:
+  - name: default
+    signals:
+      domains:
+        - name: business
+          description: Business and management related queries
+    decisions:
+      - name: default-business
+        priority: 1
+        rules:
+          operator: OR
+          conditions:
+            - type: domain
+              name: business
+        modelRefs:
+          - model: test-model
 `
 }

@@ -1,12 +1,19 @@
 package services
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelservice"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/presets"
 )
 
 // FactCheckRequest represents a request for fact-check classification
 type FactCheckRequest struct {
+	Recipe  string            `json:"recipe,omitempty"`
 	Text    string            `json:"text"`
 	Options *FactCheckOptions `json:"options,omitempty"`
 }
@@ -18,60 +25,66 @@ type FactCheckOptions struct {
 
 // FactCheckResponse represents the response from fact-check classification
 type FactCheckResponse struct {
-	NeedsFactCheck   bool    `json:"needs_fact_check"`
-	Label            string  `json:"label"`
-	Confidence       float64 `json:"confidence"`
-	ProcessingTimeMs int64   `json:"processing_time_ms"`
+	Recipe              string  `json:"recipe,omitempty"`
+	NeedsFactCheck      bool    `json:"needs_fact_check"`
+	Label               string  `json:"label"`
+	Confidence          float64 `json:"confidence"`
+	ConfidenceAvailable bool    `json:"confidence_available"`
+	ProcessingTimeMs    int64   `json:"processing_time_ms"`
 }
 
-// ClassifyFactCheck performs fact-check classification
-func (s *ClassificationService) ClassifyFactCheck(req FactCheckRequest) (*FactCheckResponse, error) {
+// ClassifyFactCheck asks the fact_check preset whether answering the text
+// needs fact checking: it does when the probability of FACT_CHECK_NEEDED
+// reaches the option's threshold, else the one calibrated for the model.
+func (s *ClassificationService) ClassifyFactCheck(ctx context.Context, req FactCheckRequest) (*FactCheckResponse, error) {
+	s.runtimeMutex.RLock()
+	defer s.runtimeMutex.RUnlock()
 	start := time.Now()
 
 	if blankText(req.Text) {
 		return nil, ErrEmptyText
 	}
-
-	// Check if classifier is available
-	if s.classifier == nil {
-		processingTime := time.Since(start).Milliseconds()
+	classifier, _, recipe, scopeErr := s.diagnosticClassifierSnapshot(req.Recipe)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	if classifier == nil {
 		return &FactCheckResponse{
-			NeedsFactCheck:   false,
-			Label:            "unknown",
-			Confidence:       0.0,
-			ProcessingTimeMs: processingTime,
+			Recipe: recipe, Label: "unknown", ProcessingTimeMs: time.Since(start).Milliseconds(),
 		}, nil
 	}
-
-	// Check if fact-check classifier is enabled
-	if !s.classifier.IsFactCheckEnabled() {
-		processingTime := time.Since(start).Milliseconds()
-		return &FactCheckResponse{
-			NeedsFactCheck:   false,
-			Label:            "fact_check_disabled",
-			Confidence:       0.0,
-			ProcessingTimeMs: processingTime,
-		}, nil
+	answer, err := classifier.AskPreset(ctx, config.SignalTypeFactCheck, presets.FactCheck, req.Text)
+	if errors.Is(err, modelservice.ErrUnavailable) {
+		if req.Recipe == "" {
+			return &FactCheckResponse{
+				Recipe: recipe, Label: "unknown", ProcessingTimeMs: time.Since(start).Milliseconds(),
+			}, nil
+		}
+		return nil, fmt.Errorf("%w: fact-check classification failed: %w", ErrClassifierUnavailable, err)
 	}
-
-	// Perform fact-check classification
-	result, err := s.classifier.ClassifyFactCheck(req.Text)
 	if err != nil {
 		return nil, fmt.Errorf("fact-check classification failed: %w", err)
 	}
-
-	processingTime := time.Since(start).Milliseconds()
-
+	threshold := classifier.Config.PresetThreshold(config.SignalTypeFactCheck, presets.FactCheck)
+	if req.Options != nil && req.Options.ConfidenceThreshold > 0 {
+		threshold = req.Options.ConfidenceThreshold
+	}
 	return &FactCheckResponse{
-		NeedsFactCheck:   result.NeedsFactCheck,
-		Label:            result.Label,
-		Confidence:       float64(result.Confidence),
-		ProcessingTimeMs: processingTime,
+		Recipe:              recipe,
+		NeedsFactCheck:      answer.Probabilities[factCheckNeeded] >= threshold,
+		Label:               answer.Choice,
+		Confidence:          answer.Probabilities[answer.Choice],
+		ConfidenceAvailable: true,
+		ProcessingTimeMs:    time.Since(start).Milliseconds(),
 	}, nil
 }
 
+// factCheckNeeded is the fact_check preset's positive option.
+const factCheckNeeded = "FACT_CHECK_NEEDED"
+
 // UserFeedbackRequest represents a request for user feedback classification
 type UserFeedbackRequest struct {
+	Recipe  string               `json:"recipe,omitempty"`
 	Text    string               `json:"text"`
 	Options *UserFeedbackOptions `json:"options,omitempty"`
 }
@@ -83,113 +96,59 @@ type UserFeedbackOptions struct {
 
 // UserFeedbackResponse represents the response from user feedback classification
 type UserFeedbackResponse struct {
-	FeedbackType     string  `json:"feedback_type"`
-	Label            string  `json:"label"`
-	Confidence       float64 `json:"confidence"`
-	ProcessingTimeMs int64   `json:"processing_time_ms"`
+	Recipe              string  `json:"recipe,omitempty"`
+	Abstained           bool    `json:"abstained,omitempty"`
+	FeedbackType        string  `json:"feedback_type"`
+	Label               string  `json:"label"`
+	Confidence          float64 `json:"confidence"`
+	ConfidenceAvailable bool    `json:"confidence_available"`
+	ProcessingTimeMs    int64   `json:"processing_time_ms"`
 }
 
-// ClassifyUserFeedback performs user feedback classification
-func (s *ClassificationService) ClassifyUserFeedback(req UserFeedbackRequest) (*UserFeedbackResponse, error) {
+// ClassifyUserFeedback asks the feedback preset what feedback the text
+// gives; it abstains when the chosen option's probability is below the
+// option's threshold, else the one calibrated for the model.
+func (s *ClassificationService) ClassifyUserFeedback(ctx context.Context, req UserFeedbackRequest) (*UserFeedbackResponse, error) {
+	s.runtimeMutex.RLock()
+	defer s.runtimeMutex.RUnlock()
 	start := time.Now()
 
 	if blankText(req.Text) {
 		return nil, ErrEmptyText
 	}
-
-	// Check if classifier is available
-	if s.classifier == nil {
-		processingTime := time.Since(start).Milliseconds()
+	classifier, _, recipe, scopeErr := s.diagnosticClassifierSnapshot(req.Recipe)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	if classifier == nil {
 		return &UserFeedbackResponse{
-			FeedbackType:     "unknown",
-			Label:            "unknown",
-			Confidence:       0.0,
-			ProcessingTimeMs: processingTime,
+			Recipe: recipe, FeedbackType: "unknown", Label: "unknown", ProcessingTimeMs: time.Since(start).Milliseconds(),
 		}, nil
 	}
-
-	// Check if feedback detector is enabled
-	if !s.classifier.IsFeedbackDetectorEnabled() {
-		processingTime := time.Since(start).Milliseconds()
-		return &UserFeedbackResponse{
-			FeedbackType:     "feedback_detector_disabled",
-			Label:            "feedback_detector_disabled",
-			Confidence:       0.0,
-			ProcessingTimeMs: processingTime,
-		}, nil
+	answer, err := classifier.AskPreset(ctx, config.SignalTypeUserFeedback, presets.Feedback, req.Text)
+	if errors.Is(err, modelservice.ErrUnavailable) {
+		if req.Recipe == "" {
+			return &UserFeedbackResponse{
+				Recipe: recipe, FeedbackType: "unknown", Label: "unknown", ProcessingTimeMs: time.Since(start).Milliseconds(),
+			}, nil
+		}
+		return nil, fmt.Errorf("%w: user feedback classification failed: %w", ErrClassifierUnavailable, err)
 	}
-
-	// Perform user feedback classification
-	result, err := s.classifier.ClassifyFeedback(req.Text)
 	if err != nil {
 		return nil, fmt.Errorf("user feedback classification failed: %w", err)
 	}
-
-	processingTime := time.Since(start).Milliseconds()
-
+	threshold := classifier.Config.PresetThreshold(config.SignalTypeUserFeedback, presets.Feedback)
+	if req.Options != nil && req.Options.ConfidenceThreshold > 0 {
+		threshold = req.Options.ConfidenceThreshold
+	}
+	confidence := answer.Probabilities[answer.Choice]
 	return &UserFeedbackResponse{
-		FeedbackType:     result.FeedbackType,
-		Label:            result.FeedbackType, // FeedbackType is the label
-		Confidence:       float64(result.Confidence),
-		ProcessingTimeMs: processingTime,
+		Recipe:              recipe,
+		Abstained:           confidence < threshold,
+		FeedbackType:        answer.Choice,
+		Label:               answer.Choice,
+		Confidence:          confidence,
+		ConfidenceAvailable: true,
+		ProcessingTimeMs:    time.Since(start).Milliseconds(),
 	}, nil
-}
-
-// NLIRequest represents a request for Natural Language Inference classification.
-type NLIRequest struct {
-	Premise    string `json:"premise"`    // Text to evaluate (the source text or claim)
-	Hypothesis string `json:"hypothesis"` // Policy or hypothesis to check against the premise
-}
-
-// NLIResponse represents the result of NLI classification.
-type NLIResponse struct {
-	Label             string  `json:"label"`              // "entailment", "neutral", or "contradiction"
-	Confidence        float32 `json:"confidence"`         // Confidence of the predicted label (0.0-1.0)
-	EntailmentProb    float32 `json:"entailment_prob"`    // Probability that premise entails hypothesis
-	NeutralProb       float32 `json:"neutral_prob"`       // Probability that relationship is neutral
-	ContradictionProb float32 `json:"contradiction_prob"` // Probability that premise contradicts hypothesis
-	ProcessingTimeMs  int64   `json:"processing_time_ms"`
-}
-
-// ClassifyNLI performs Natural Language Inference between a premise and hypothesis.
-// Returns ENTAILMENT when the premise supports the hypothesis, NEUTRAL when it
-// neither supports nor contradicts, and CONTRADICTION when it conflicts.
-func (s *ClassificationService) ClassifyNLI(req NLIRequest) (*NLIResponse, error) {
-	start := time.Now()
-
-	if req.Premise == "" || req.Hypothesis == "" {
-		return nil, fmt.Errorf("both premise and hypothesis must be provided")
-	}
-
-	if s.classifier == nil {
-		return nil, fmt.Errorf("classification service not available")
-	}
-
-	det := s.classifier.GetHallucinationDetector()
-	if det == nil || !det.IsNLIInitialized() {
-		return nil, fmt.Errorf("NLI model not initialized — configure hallucination_mitigation.nli_model in your router config")
-	}
-
-	result, err := det.ClassifyNLI(req.Premise, req.Hypothesis)
-	if err != nil {
-		return nil, fmt.Errorf("NLI classification failed: %w", err)
-	}
-
-	return &NLIResponse{
-		Label:             result.LabelStr,
-		Confidence:        result.Confidence,
-		EntailmentProb:    result.EntailmentProb,
-		NeutralProb:       result.NeutralProb,
-		ContradictionProb: result.ContradictProb,
-		ProcessingTimeMs:  time.Since(start).Milliseconds(),
-	}, nil
-}
-
-// IsNLIReady reports whether the NLI model is loaded and ready for inference.
-func (s *ClassificationService) IsNLIReady() bool {
-	if s.classifier == nil {
-		return false
-	}
-	det := s.classifier.GetHallucinationDetector()
-	return det != nil && det.IsNLIInitialized()
 }

@@ -25,66 +25,19 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection/lookuptable"
 )
 
-// ModelSelectionConfig represents the configuration for model selection
-type ModelSelectionConfig struct {
-	// Method specifies the selection algorithm to use
-	Method string `yaml:"method"`
-
-	// Elo configuration (used when method is "elo")
-	Elo *EloConfig `yaml:"elo,omitempty"`
-
-	// RouterDC configuration (used when method is "router_dc")
-	RouterDC *RouterDCConfig `yaml:"router_dc,omitempty"`
-
-	// AutoMix configuration (used when method is "automix")
-	AutoMix *AutoMixConfig `yaml:"automix,omitempty"`
-
-	// Hybrid configuration (used when method is "hybrid")
-	Hybrid *HybridConfig `yaml:"hybrid,omitempty"`
-
-	// ML configuration (used for knn, kmeans, svm methods)
-	ML *MLSelectorConfig `yaml:"ml,omitempty"`
-
-	// RLDriven configuration (used when method is "rl_driven")
-	// Implements Router-R1 reward structure for RL training
-	RLDriven *RLDrivenConfig `yaml:"rl_driven,omitempty"`
-
-	// GMTRouter configuration (used when method is "gmtrouter")
-	// Implements heterogeneous graph learning for personalized routing
-	GMTRouter *GMTRouterConfig `yaml:"gmtrouter,omitempty"`
-
-	// MultiFactor configuration (used when method is "multi_factor")
-	// Implements weighted quality/latency/cost/load composition. Issue #37.
-	MultiFactor *MultiFactorConfig `yaml:"multi_factor,omitempty"`
-}
-
-// DefaultModelSelectionConfig returns the default configuration
-func DefaultModelSelectionConfig() *ModelSelectionConfig {
-	return &ModelSelectionConfig{
-		Method: string(MethodStatic),
-	}
-}
-
-// Factory creates and initializes selectors based on configuration
+// Factory creates the shared selectors of a routing recipe: static, random
+// and the default multi_factor. A decision with its own multi_factor block,
+// and a systemone selector, are built for that decision.
 type Factory struct {
-	cfg           *ModelSelectionConfig
-	modelConfig   map[string]config.ModelParams
-	categories    []config.Category
-	embeddingFunc func(string) ([]float32, error)
-	lookupTable   lookuptable.LookupTable
+	modelConfig map[string]config.ModelParams
+	categories  []config.Category
 }
 
 // NewFactory creates a new selector factory
-func NewFactory(cfg *ModelSelectionConfig) *Factory {
-	if cfg == nil {
-		cfg = DefaultModelSelectionConfig()
-	}
-	return &Factory{
-		cfg: cfg,
-	}
+func NewFactory() *Factory {
+	return &Factory{}
 }
 
 // WithModelConfig sets the model configuration
@@ -99,103 +52,19 @@ func (f *Factory) WithCategories(categories []config.Category) *Factory {
 	return f
 }
 
-// WithEmbeddingFunc sets the embedding function for RouterDC
-func (f *Factory) WithEmbeddingFunc(fn func(string) ([]float32, error)) *Factory {
-	f.embeddingFunc = fn
-	return f
-}
-
-// WithLookupTable sets the lookup table used by selectors that support data-driven
-// constant resolution (e.g. HybridSelector's quality-gap threshold).
-func (f *Factory) WithLookupTable(lt lookuptable.LookupTable) *Factory {
-	f.lookupTable = lt
-	return f
-}
-
-// Create creates and initializes a selector based on the configured method
-func (f *Factory) Create() Selector {
-	method := SelectionMethod(f.cfg.Method)
-
-	var selector Selector
-
-	switch method {
-	case MethodElo:
-		eloSelector := NewEloSelector(f.cfg.Elo)
-		if f.modelConfig != nil {
-			eloSelector.InitializeFromConfig(f.modelConfig, f.categories)
-		}
-		selector = eloSelector
-
-	case MethodRouterDC:
-		routerDCSelector := NewRouterDCSelector(f.cfg.RouterDC)
-		if f.embeddingFunc != nil {
-			routerDCSelector.SetEmbeddingFunc(f.embeddingFunc)
-		}
-		// Initialize model embeddings from descriptions in model config
-		if f.modelConfig != nil {
-			if err := routerDCSelector.InitializeFromConfig(f.modelConfig); err != nil {
-				logging.Errorf("[SelectionFactory] RouterDC initialization failed: %v", err)
-			}
-		}
-		selector = routerDCSelector
-
-	case MethodAutoMix:
-		autoMixSelector := NewAutoMixSelector(f.cfg.AutoMix)
-		if f.modelConfig != nil {
-			autoMixSelector.InitializeFromConfig(f.modelConfig)
-		}
-		selector = autoMixSelector
-
-	case MethodHybrid:
-		hybridSelector := NewHybridSelector(f.cfg.Hybrid)
-		if f.modelConfig != nil {
-			hybridSelector.InitializeFromConfig(f.modelConfig, f.categories)
-		}
-		if f.embeddingFunc != nil && hybridSelector.routerDCSelector != nil {
-			hybridSelector.routerDCSelector.SetEmbeddingFunc(f.embeddingFunc)
-		}
-		if f.lookupTable != nil {
-			hybridSelector.SetLookupTable(f.lookupTable)
-		}
-		selector = hybridSelector
-
-	case MethodGMTRouter:
-		gmtRouterSelector := NewGMTRouterSelector(f.cfg.GMTRouter)
-		if f.modelConfig != nil {
-			gmtRouterSelector.InitializeFromConfig(f.modelConfig)
-		}
-		if f.embeddingFunc != nil {
-			gmtRouterSelector.SetEmbeddingFunc(f.embeddingFunc)
-		}
-		selector = gmtRouterSelector
-
-	case MethodRLDriven:
-		rlDrivenSelector := NewRLDrivenSelector(f.cfg.RLDriven)
-		if f.modelConfig != nil {
-			rlDrivenSelector.InitializeFromConfig(f.modelConfig, f.categories)
-		}
-		selector = rlDrivenSelector
-
-	case MethodLatencyAware:
-		selector = NewLatencyAwareSelector(nil)
-
-	case MethodMultiFactor:
-		multiFactorSelector := NewMultiFactorSelector(f.cfg.MultiFactor)
-		if f.modelConfig != nil {
-			multiFactorSelector.InitializeFromConfig(f.modelConfig)
-		}
-		selector = multiFactorSelector
-
-	default:
-		// Default to static selector
-		staticSelector := NewStaticSelector(DefaultStaticConfig())
-		if f.categories != nil {
-			staticSelector.InitializeFromConfig(f.categories)
-		}
-		selector = staticSelector
+func (f *Factory) staticSelector() *StaticSelector {
+	selector := NewStaticSelector(DefaultStaticConfig())
+	if f.categories != nil {
+		selector.InitializeFromConfig(f.categories)
 	}
+	return selector
+}
 
-	logging.Infof("[SelectionFactory] Created selector: method=%s", method)
+func (f *Factory) multiFactorSelector() *MultiFactorSelector {
+	selector := NewMultiFactorSelector(nil)
+	if f.modelConfig != nil {
+		selector.InitializeFromConfig(f.modelConfig)
+	}
 	return selector
 }
 
@@ -205,140 +74,9 @@ func (f *Factory) CreateAll() *Registry {
 	InitializeMetrics()
 
 	registry := NewRegistry()
-
-	// Always create static selector
-	staticSelector := NewStaticSelector(DefaultStaticConfig())
-	if f.categories != nil {
-		staticSelector.InitializeFromConfig(f.categories)
-	}
-	registry.Register(MethodStatic, staticSelector)
-
-	// Create Elo selector
-	eloCfg := f.cfg.Elo
-	if eloCfg == nil {
-		eloCfg = DefaultEloConfig()
-	}
-	eloSelector := NewEloSelector(eloCfg)
-	if f.modelConfig != nil {
-		eloSelector.InitializeFromConfig(f.modelConfig, f.categories)
-	}
-	registry.Register(MethodElo, eloSelector)
-
-	// Create RouterDC selector
-	routerDCCfg := f.cfg.RouterDC
-	if routerDCCfg == nil {
-		routerDCCfg = DefaultRouterDCConfig()
-	}
-	routerDCSelector := NewRouterDCSelector(routerDCCfg)
-	if f.embeddingFunc != nil {
-		routerDCSelector.SetEmbeddingFunc(f.embeddingFunc)
-	}
-	// Initialize model embeddings from descriptions in model config
-	if f.modelConfig != nil {
-		if err := routerDCSelector.InitializeFromConfig(f.modelConfig); err != nil {
-			logging.Errorf("[SelectionFactory] RouterDC initialization failed: %v", err)
-		}
-	}
-	registry.Register(MethodRouterDC, routerDCSelector)
-
-	// Create AutoMix selector
-	autoMixCfg := f.cfg.AutoMix
-	if autoMixCfg == nil {
-		autoMixCfg = DefaultAutoMixConfig()
-	}
-	autoMixSelector := NewAutoMixSelector(autoMixCfg)
-	if f.modelConfig != nil {
-		autoMixSelector.InitializeFromConfig(f.modelConfig)
-	}
-	registry.Register(MethodAutoMix, autoMixSelector)
-
-	// Create Hybrid selector with component references
-	hybridCfg := f.cfg.Hybrid
-	if hybridCfg == nil {
-		hybridCfg = DefaultHybridConfig()
-	}
-	hybridSelector := NewHybridSelectorWithComponents(hybridCfg, eloSelector, routerDCSelector, autoMixSelector)
-	if f.modelConfig != nil {
-		hybridSelector.InitializeFromConfig(f.modelConfig, f.categories)
-	}
-	if f.lookupTable != nil {
-		hybridSelector.SetLookupTable(f.lookupTable)
-	}
-	registry.Register(MethodHybrid, hybridSelector)
-
-	// Create ML-based selectors (KNN, KMeans, SVM)
-	mlCfg := f.cfg.ML
-	if mlCfg == nil {
-		mlCfg = DefaultMLSelectorConfig()
-	}
-
-	// Create KNN selector
-	knnAdapter, err := CreateKNNSelector(mlCfg, f.embeddingFunc)
-	if err != nil {
-		logging.Warnf("[SelectionFactory] Failed to create KNN selector: %v", err)
-	} else {
-		registry.Register(MethodKNN, knnAdapter)
-	}
-
-	// Create KMeans selector
-	kmeansAdapter, err := CreateKMeansSelector(mlCfg, f.embeddingFunc)
-	if err != nil {
-		logging.Warnf("[SelectionFactory] Failed to create KMeans selector: %v", err)
-	} else {
-		registry.Register(MethodKMeans, kmeansAdapter)
-	}
-
-	// Create SVM selector
-	svmAdapter, err := CreateSVMSelector(mlCfg, f.embeddingFunc)
-	if err != nil {
-		logging.Warnf("[SelectionFactory] Failed to create SVM selector: %v", err)
-	} else {
-		registry.Register(MethodSVM, svmAdapter)
-	}
-
-	// Create MLP selector (GPU-accelerated via Candle)
-	mlpAdapter, err := CreateMLPSelector(mlCfg, f.embeddingFunc)
-	if err != nil {
-		logging.Warnf("[SelectionFactory] Failed to create MLP selector: %v", err)
-	} else {
-		registry.Register(MethodMLP, mlpAdapter)
-	}
-
-	// Create RL-Driven selector
-	rlDrivenCfg := f.cfg.RLDriven
-	if rlDrivenCfg == nil {
-		rlDrivenCfg = DefaultRLDrivenConfig()
-	}
-	rlDrivenSelector := NewRLDrivenSelector(rlDrivenCfg)
-	if f.modelConfig != nil {
-		rlDrivenSelector.InitializeFromConfig(f.modelConfig, f.categories)
-	}
-	registry.Register(MethodRLDriven, rlDrivenSelector)
-
-	// Create GMTRouter selector
-	gmtRouterCfg := f.cfg.GMTRouter
-	if gmtRouterCfg == nil {
-		gmtRouterCfg = DefaultGMTRouterConfig()
-	}
-	gmtRouterSelector := NewGMTRouterSelector(gmtRouterCfg)
-	if f.modelConfig != nil {
-		gmtRouterSelector.InitializeFromConfig(f.modelConfig)
-	}
-	if f.embeddingFunc != nil {
-		gmtRouterSelector.SetEmbeddingFunc(f.embeddingFunc)
-	}
-	registry.Register(MethodGMTRouter, gmtRouterSelector)
-
-	// Create LatencyAware selector
-	latencyAwareSelector := NewLatencyAwareSelector(nil)
-	registry.Register(MethodLatencyAware, latencyAwareSelector)
-
-	// Create MultiFactor selector
-	multiFactorSelector := NewMultiFactorSelector(f.cfg.MultiFactor)
-	if f.modelConfig != nil {
-		multiFactorSelector.InitializeFromConfig(f.modelConfig)
-	}
-	registry.Register(MethodMultiFactor, multiFactorSelector)
+	registry.Register(MethodStatic, f.staticSelector())
+	registry.Register(MethodRandom, NewRandomSelector())
+	registry.Register(MethodMultiFactor, f.multiFactorSelector())
 
 	LogRegisteredAlgorithms(registry)
 	logging.ComponentEvent("selection", "selection_factory_initialized", map[string]interface{}{
@@ -430,27 +168,13 @@ func CheckDependencyHealth(registry *Registry, configuredMethods []SelectionMeth
 	}
 }
 
-// Initialize sets up the global registry with all selectors
-func Initialize(cfg *ModelSelectionConfig, modelConfig map[string]config.ModelParams, categories []config.Category, embeddingFunc func(string) ([]float32, error)) {
-	factory := NewFactory(cfg).
-		WithModelConfig(modelConfig).
-		WithCategories(categories).
-		WithEmbeddingFunc(embeddingFunc)
-
-	// Create all selectors and register globally
-	GlobalRegistry = factory.CreateAll()
-
-	logging.ComponentEvent("selection", "selection_registry_initialized", map[string]interface{}{
-		"selector_count": len(GlobalRegistry.selectors),
-	})
-}
-
 // GetSelector returns a selector for the specified method from global registry
 func GetSelector(method SelectionMethod) Selector {
-	selector, ok := GlobalRegistry.Get(method)
+	registry := GetGlobalRegistry()
+	selector, ok := registry.Get(method)
 	if !ok {
 		// Fallback to static
-		selector, _ = GlobalRegistry.Get(MethodStatic)
+		selector, _ = registry.Get(MethodStatic)
 	}
 	return selector
 }

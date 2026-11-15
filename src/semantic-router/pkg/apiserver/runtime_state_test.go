@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,19 +21,19 @@ type fakeResolvedClassificationService struct {
 	updatedConfig *config.RouterConfig
 }
 
-func (s *fakeResolvedClassificationService) ClassifyIntent(req services.IntentRequest) (*services.IntentResponse, error) {
+func (s *fakeResolvedClassificationService) ClassifyIntent(_ context.Context, req services.IntentRequest) (*services.IntentResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
-func (s *fakeResolvedClassificationService) ClassifyIntentForEval(req services.IntentRequest) (*services.EvalResponse, error) {
+func (s *fakeResolvedClassificationService) ClassifyIntentForEval(_ context.Context, req services.IntentRequest) (*services.EvalResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
-func (s *fakeResolvedClassificationService) DetectPII(req services.PIIRequest) (*services.PIIResponse, error) {
+func (s *fakeResolvedClassificationService) DetectPII(_ context.Context, req services.PIIRequest) (*services.PIIResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
-func (s *fakeResolvedClassificationService) CheckSecurity(req services.SecurityRequest) (*services.SecurityResponse, error) {
+func (s *fakeResolvedClassificationService) CheckSecurity(_ context.Context, req services.SecurityRequest) (*services.SecurityResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
@@ -43,26 +44,19 @@ func (s *fakeResolvedClassificationService) ClassifyBatchUnifiedWithOptions(_ []
 	return nil, fmt.Errorf("resolved service invoked")
 }
 
-func (s *fakeResolvedClassificationService) ClassifyFactCheck(req services.FactCheckRequest) (*services.FactCheckResponse, error) {
+func (s *fakeResolvedClassificationService) ClassifyFactCheck(_ context.Context, req services.FactCheckRequest) (*services.FactCheckResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
-func (s *fakeResolvedClassificationService) ClassifyUserFeedback(req services.UserFeedbackRequest) (*services.UserFeedbackResponse, error) {
+func (s *fakeResolvedClassificationService) ClassifyUserFeedback(_ context.Context, req services.UserFeedbackRequest) (*services.UserFeedbackResponse, error) {
 	return nil, fmt.Errorf("not used in this test: %q", req.Text)
 }
 
-func (s *fakeResolvedClassificationService) ClassifyNLI(_ services.NLIRequest) (*services.NLIResponse, error) {
-	return nil, fmt.Errorf("NLI not available in fake resolved service")
-}
-
-func (s *fakeResolvedClassificationService) IsNLIReady() bool { return false }
-
-func (s *fakeResolvedClassificationService) HasUnifiedClassifier() bool      { return true }
-func (s *fakeResolvedClassificationService) HasClassifier() bool             { return true }
-func (s *fakeResolvedClassificationService) HasFactCheckClassifier() bool    { return true }
-func (s *fakeResolvedClassificationService) HasHallucinationDetector() bool  { return true }
-func (s *fakeResolvedClassificationService) HasHallucinationExplainer() bool { return true }
-func (s *fakeResolvedClassificationService) HasFeedbackDetector() bool       { return true }
+func (s *fakeResolvedClassificationService) HasUnifiedClassifier() bool     { return true }
+func (s *fakeResolvedClassificationService) HasClassifier() bool            { return true }
+func (s *fakeResolvedClassificationService) HasFactCheckClassifier() bool   { return true }
+func (s *fakeResolvedClassificationService) HasHallucinationDetector() bool { return true }
+func (s *fakeResolvedClassificationService) HasFeedbackDetector() bool      { return true }
 func (s *fakeResolvedClassificationService) UpdateConfig(newConfig *config.RouterConfig) {
 	s.updatedConfig = newConfig
 }
@@ -77,13 +71,14 @@ func TestHandleBatchClassificationUsesResolvedClassificationService(t *testing.T
 		classificationSvc: newLiveClassificationService(
 			services.NewPlaceholderClassificationService(),
 			func() classificationService { return resolvedSvc },
+			nil,
 		),
 		config: &config.RouterConfig{},
 	}
 
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/classify/batch",
+		"/api/v1/diagnostics/classify/batch",
 		bytes.NewBufferString(`{"texts":["resolver should win"],"task_type":"intent"}`),
 	)
 	req.Header.Set("Content-Type", "application/json")
@@ -109,7 +104,6 @@ func TestHandleOpenAIModelsUsesResolvedRuntimeConfig(t *testing.T) {
 		runtimeConfig: newLiveRuntimeConfig(
 			staleCfg,
 			func() *config.RouterConfig { return liveCfg },
-			nil,
 		),
 	}
 
@@ -152,7 +146,6 @@ func TestHandleClassifierInfoUsesResolvedRuntimeConfig(t *testing.T) {
 		runtimeConfig: newLiveRuntimeConfig(
 			staleCfg,
 			func() *config.RouterConfig { return liveCfg },
-			nil,
 		),
 	}
 
@@ -174,8 +167,8 @@ func TestHandleClassifierInfoUsesResolvedRuntimeConfig(t *testing.T) {
 		t.Fatalf("failed to decode config payload: %v", err)
 	}
 
-	if cfg["AutoModelName"] != "LiveRouter" {
-		t.Fatalf("expected live config payload, got %#v", cfg["AutoModelName"])
+	if cfg["Entrypoints"] == nil {
+		t.Fatalf("expected live entrypoint config payload, got %#v", cfg["Entrypoints"])
 	}
 }
 
@@ -206,7 +199,6 @@ func TestHandleClassifierInfoNormalizesYAMLStylePluginConfig(t *testing.T) {
 		runtimeConfig: newLiveRuntimeConfig(
 			liveCfg,
 			func() *config.RouterConfig { return liveCfg },
-			nil,
 		),
 	}
 
@@ -234,70 +226,12 @@ func TestHandleClassifierInfoNormalizesYAMLStylePluginConfig(t *testing.T) {
 	}
 }
 
-func TestBuildModelsInfoResponseUsesResolvedRuntimeConfig(t *testing.T) {
-	staleCfg := &config.RouterConfig{}
-	liveCfg := &config.RouterConfig{
-		InlineModels: config.InlineModels{
-			Classifier: config.Classifier{
-				CategoryModel: config.CategoryModel{
-					ModelID:             "live-category-model",
-					Threshold:           0.42,
-					CategoryMappingPath: "live-mapping.json",
-				},
-			},
-		},
-		IntelligentRouting: config.IntelligentRouting{
-			Signals: config.Signals{
-				Categories: []config.Category{
-					{CategoryMetadata: config.CategoryMetadata{Name: "billing"}},
-				},
-			},
-		},
-	}
-
-	apiServer := &ClassificationAPIServer{
-		classificationSvc: &fakeResolvedClassificationService{},
-		config:            staleCfg,
-		runtimeConfig: newLiveRuntimeConfig(
-			staleCfg,
-			func() *config.RouterConfig { return liveCfg },
-			nil,
-		),
-	}
-
-	resp := apiServer.buildModelsInfoResponse()
-
-	if len(resp.Models) == 0 {
-		t.Fatalf("expected model info entries from live config")
-	}
-
-	found := false
-	for _, model := range resp.Models {
-		if model.Name != "category_classifier" {
-			continue
-		}
-		found = true
-		if model.ModelPath != "live-category-model" {
-			t.Fatalf("expected live model path, got %q", model.ModelPath)
-		}
-		if model.Metadata["mapping_path"] != "live-mapping.json" {
-			t.Fatalf("expected live mapping path, got %+v", model.Metadata)
-		}
-	}
-
-	if !found {
-		t.Fatalf("expected category_classifier entry, got %+v", resp.Models)
-	}
-}
-
 func TestRuntimeRegistryResolvesSharedDependencies(t *testing.T) {
 	cfg := &config.RouterConfig{}
-	memoryStore := newMockMemoryStore()
 	manager := &vectorstore.Manager{}
 	fileStore := &vectorstore.FileStore{}
 
 	registry := routerruntime.NewRegistry(cfg)
-	registry.SetMemoryStore(memoryStore)
 	registry.SetVectorStoreRuntime(&routerruntime.VectorStoreRuntime{
 		Manager:   manager,
 		FileStore: fileStore,
@@ -307,9 +241,6 @@ func TestRuntimeRegistryResolvesSharedDependencies(t *testing.T) {
 		runtimeRegistry: registry,
 	}
 
-	if got := apiServer.currentMemoryStore(); got != memoryStore {
-		t.Fatalf("currentMemoryStore() = %v, want %v", got, memoryStore)
-	}
 	if got := apiServer.currentVectorStoreManager(); got != manager {
 		t.Fatalf("currentVectorStoreManager() = %v, want %v", got, manager)
 	}
@@ -327,6 +258,7 @@ func testModelListConfig(autoModelName string, includeConfigModels bool, models 
 	}
 
 	return &config.RouterConfig{
+		Entrypoints: []config.EntrypointMapping{{ModelNames: []string{autoModelName}, Recipe: config.DefaultRecipeName}},
 		BackendModels: config.BackendModels{
 			VLLMEndpoints: []config.VLLMEndpoint{
 				{
@@ -339,8 +271,7 @@ func testModelListConfig(autoModelName string, includeConfigModels bool, models 
 			ModelConfig: modelConfig,
 		},
 		RouterOptions: config.RouterOptions{
-			AutoModelName:             autoModelName,
-			IncludeConfigModelsInList: includeConfigModels,
+			ListBackendModels: includeConfigModels,
 		},
 	}
 }

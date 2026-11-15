@@ -2,9 +2,8 @@
 
 ## Overview
 
-`content-safety` is a reusable route-local safety bundle that combines supported safety-oriented plugins in one fragment.
-
-It aligns to `config/plugin/content-safety/hybrid.yaml`.
+Content Safety combines supported route-local safety plugins into one reusable
+policy. It is a configuration bundle, not a separate plugin type.
 
 ## Key Advantages
 
@@ -14,7 +13,9 @@ It aligns to `config/plugin/content-safety/hybrid.yaml`.
 
 ## What Problem Does It Solve?
 
-Some routes need more than one safety control at once. Instead of repeatedly hand-writing response screening, route-local guard prompts, and audit headers together, `content-safety` packages that chain into one reusable fragment.
+Some routes need more than one safety control at once. The bundle keeps
+response screening, route-local guard prompts, and audit headers consistent
+across those routes.
 
 ## When to Use
 
@@ -24,7 +25,7 @@ Some routes need more than one safety control at once. Instead of repeatedly han
 
 ## Configuration
 
-Use this fragment under `routing.decisions[].plugins`:
+Add the bundled plugin entries under `recipes[].decisions[].plugins`:
 
 ```yaml
 plugins:
@@ -38,9 +39,23 @@ plugins:
       add:
         - name: X-Safety-Profile
           value: standard
-  - type: response_jailbreak
+  - type: response_guard
     configuration:
-      enabled: true
-      threshold: 0.8
-      action: header
+      rules:
+        - when:
+            type: jailbreak
+            name: unsafe_completion
+          action: annotate
 ```
+
+This is a composition example, not a `content_safety` plugin type. The
+`system_prompt` adds request-side guidance, `header_mutation` adds a policy
+label, and the [`response_guard`](./response-guard) annotates a generated
+response that the jailbreak rule `unsafe_completion`, declared with
+`stage: response`, flags. The bundle runs no request-side content check, and
+the header is not proof that content is safe. Calibrate the
+rule's `predicate` and decide whether annotating is sufficient or the rule
+should block.
+
+See the complete bundle:
+[`config/fragments/plugin/content-safety/hybrid.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/plugin/content-safety/hybrid.yaml).

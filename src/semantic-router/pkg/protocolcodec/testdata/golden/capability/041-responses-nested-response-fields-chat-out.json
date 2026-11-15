@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "name": "text_annotations_and_logprobs",
+      "outcome": {
+        "status": "ok",
+        "body": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "annotations": [
+                  {
+                    "type": "url_citation",
+                    "url_citation": {
+                      "end_index": 6,
+                      "start_index": 0,
+                      "title": "Source",
+                      "url": "https://example.com/source"
+                    }
+                  }
+                ],
+                "content": "source",
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 100,
+          "id": "resp_1",
+          "model": "routed-model",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 1,
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            },
+            "prompt_tokens": 2,
+            "total_tokens": 3
+          }
+        },
+        "diagnostics": [
+          {
+            "field": "output.status",
+            "action": "dropped"
+          },
+          {
+            "field": "output.content.logprobs",
+            "action": "dropped"
+          }
+        ]
+      }
+    },
+    {
+      "name": "refusal",
+      "outcome": {
+        "status": "ok",
+        "body": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "refusal": "cannot comply",
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 100,
+          "id": "resp_refusal",
+          "model": "routed-model",
+          "object": "chat.completion"
+        },
+        "diagnostics": [
+          {
+            "field": "output.status",
+            "action": "dropped"
+          }
+        ]
+      }
+    },
+    {
+      "name": "reasoning_and_namespaced_tool",
+      "outcome": {
+        "status": "ok",
+        "body": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"q\":\"weather\"}",
+                      "name": "lookup"
+                    },
+                    "id": "call_1",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 100,
+          "id": "resp_tool",
+          "model": "routed-model",
+          "object": "chat.completion"
+        },
+        "diagnostics": [
+          {
+            "field": "output.status",
+            "action": "dropped"
+          },
+          {
+            "field": "output.async",
+            "action": "dropped"
+          },
+          {
+            "field": "output.caller",
+            "action": "dropped"
+          },
+          {
+            "field": "output.status",
+            "action": "dropped"
+          },
+          {
+            "field": "reasoning_details",
+            "action": "dropped"
+          },
+          {
+            "field": "output.namespace",
+            "action": "dropped"
+          }
+        ]
+      }
+    }
+  ]
+}

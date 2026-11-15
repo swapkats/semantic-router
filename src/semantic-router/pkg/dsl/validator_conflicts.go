@@ -12,6 +12,7 @@ import (
 
 func (v *Validator) checkConflicts() {
 	v.checkDomainSignalOverlap()
+	v.checkContextSignalBands()
 	v.checkSameSignalTypeGuard()
 	v.checkProjectionPartitions()
 	v.checkProjections()
@@ -19,58 +20,57 @@ func (v *Validator) checkConflicts() {
 	v.checkTierConstraints()
 }
 
-// checkDomainSignalOverlap detects MMLU category strings shared by two or more
-// domain signals. When two domain signals list the same category, both will
-// fire on queries in that category, causing silent routing conflicts where
-// priority alone determines the winner regardless of classifier confidence.
+// checkDomainSignalOverlap detects a domain label two or more domain signals
+// match. Both fire on a request in that domain, so priority alone decides
+// between them.
 func (v *Validator) checkDomainSignalOverlap() {
-	type catSource struct {
+	type labelSource struct {
 		signalName string
 		pos        Position
 	}
-	categoryToSignal := make(map[string]catSource)
+	labelToSignal := make(map[string]labelSource)
 
 	for _, s := range v.prog.Signals {
 		if s.SignalType != "domain" {
 			continue
 		}
-		cats := getMMLUCategories(s)
-		for _, cat := range cats {
-			if existing, clash := categoryToSignal[cat]; clash {
+		for _, label := range domainLabels(s) {
+			if existing, clash := labelToSignal[label]; clash {
 				v.addDiag(DiagWarning, s.Pos,
 					fmt.Sprintf(
-						"domain(%q) and domain(%q) share MMLU category %q — "+
-							"both signals will fire on queries in this category, "+
+						"domain(%q) and domain(%q) both match domain %q — "+
+							"both signals will fire on queries in this domain, "+
 							"causing priority to resolve ambiguously",
-						s.Name, existing.signalName, cat),
+						s.Name, existing.signalName, label),
 					&QuickFix{
-						Description: fmt.Sprintf("Remove %q from domain(%q) or domain(%q)", cat, s.Name, existing.signalName),
+						Description: fmt.Sprintf("Remove %q from domain(%q) or domain(%q)", label, s.Name, existing.signalName),
 						NewText:     "",
 					},
 				)
 			}
-			categoryToSignal[cat] = catSource{signalName: s.Name, pos: s.Pos}
+			labelToSignal[label] = labelSource{signalName: s.Name, pos: s.Pos}
 		}
 	}
 }
 
-// getMMLUCategories extracts the mmlu_categories string array from a signal's fields.
-func getMMLUCategories(s *SignalDecl) []string {
-	raw, ok := s.Fields["mmlu_categories"]
+// domainLabels are the domains a domain signal matches: its labels, else its
+// name.
+func domainLabels(s *SignalDecl) []string {
+	raw, ok := s.Fields["labels"]
 	if !ok {
-		return nil
+		return []string{s.Name}
 	}
 	av, ok := raw.(ArrayValue)
 	if !ok {
 		return nil
 	}
-	var cats []string
+	var labels []string
 	for _, item := range av.Items {
 		if sv, ok := item.(StringValue); ok {
-			cats = append(cats, sv.V)
+			labels = append(labels, sv.V)
 		}
 	}
-	return cats
+	return labels
 }
 
 // collectSignalRefs walks a boolean expression tree and classifies signal
@@ -87,11 +87,21 @@ func collectSignalRefs(expr BoolExpr, negated bool, info *routeSignalInfo) {
 		collectSignalRefs(e.Expr, !negated, info)
 	case *SignalRefExpr:
 		if negated {
-			info.negatedRefs[e.SignalType] = append(info.negatedRefs[e.SignalType], e.SignalName)
+			info.negatedRefs[e.SignalType] = append(info.negatedRefs[e.SignalType], guardSignalName(e))
 		} else {
-			info.positiveRefs[e.SignalType] = append(info.positiveRefs[e.SignalType], e.SignalName)
+			info.positiveRefs[e.SignalType] = append(info.positiveRefs[e.SignalType], guardSignalName(e))
 		}
 	}
+}
+
+// guardSignalName is the exact reference that route guards compare. A
+// labelled reference names its label, so conditions on different options of
+// one decision question or classifier are different references.
+func guardSignalName(ref *SignalRefExpr) string {
+	if label, ok := ref.Fields["label"].(StringValue); ok && label.V != "" {
+		return ref.SignalName + ":" + label.V
+	}
+	return ref.SignalName
 }
 
 func containsString(ss []string, target string) bool {
@@ -170,7 +180,7 @@ func (v *Validator) checkProjectionPartitionMemberTypes(
 	membersByType := make(map[string][]string)
 	for _, member := range partition.Members {
 		sig := v.findSignalByName(member)
-		if sig == nil {
+		if sig == nil || isSupportedProjectionPartitionType(sig.SignalType) {
 			continue
 		}
 		membersByType[sig.SignalType] = append(membersByType[sig.SignalType], member)
@@ -178,28 +188,9 @@ func (v *Validator) checkProjectionPartitionMemberTypes(
 	if len(membersByType) == 0 {
 		return
 	}
-
-	if len(membersByType) == 1 {
-		for signalType, members := range membersByType {
-			if isSupportedProjectionPartitionType(signalType) {
-				return
-			}
-			v.addDiag(DiagConstraint, partition.Pos,
-				fmt.Sprintf(
-					"%s: members must use a supported runtime signal type (domain or embedding), found %s=%v",
-					context,
-					signalType,
-					members,
-				),
-				nil,
-			)
-			return
-		}
-	}
-
 	v.addDiag(DiagConstraint, partition.Pos,
 		fmt.Sprintf(
-			"%s: members must all share one supported runtime signal type (domain or embedding), found %s",
+			"%s: members must be domain signals, found %s",
 			context,
 			describeProjectionPartitionMemberTypes(membersByType),
 		),
@@ -230,23 +221,23 @@ func (v *Validator) checkProjectionPartitionCategoryDisjointness(
 	partition *ProjectionPartitionDecl,
 	context string,
 ) {
-	catOwner := make(map[string]string)
+	labelOwner := make(map[string]string)
 	for _, member := range partition.Members {
 		sig := v.findSignalByName(member)
-		if sig == nil {
+		if sig == nil || sig.SignalType != "domain" {
 			continue
 		}
-		for _, cat := range getMMLUCategories(sig) {
-			if existing, clash := catOwner[cat]; clash {
+		for _, label := range domainLabels(sig) {
+			if existing, clash := labelOwner[label]; clash {
 				v.addDiag(DiagWarning, partition.Pos,
 					fmt.Sprintf(
-						"%s: members %q and %q share MMLU category %q — "+
+						"%s: members %q and %q both match domain %q — "+
 							"violates partition disjointness",
-						context, member, existing, cat),
+						context, member, existing, label),
 					nil,
 				)
 			}
-			catOwner[cat] = member
+			labelOwner[label] = member
 		}
 	}
 }
@@ -263,48 +254,29 @@ func (v *Validator) checkProjectionPartitionSupportedDomainValues(
 		if sig == nil || sig.SignalType != "domain" {
 			continue
 		}
-		mmluCategories := getMMLUCategories(sig)
-		if len(mmluCategories) == 0 {
-			if config.IsSupportedRoutingDomainName(sig.Name) {
+		for _, label := range domainLabels(sig) {
+			if config.IsSupportedRoutingDomainName(label) {
 				continue
 			}
 			v.addDiag(
 				DiagConstraint,
 				partition.Pos,
 				fmt.Sprintf(
-					"%s: domain member %q must use a supported routing domain name (%s) or declare mmlu_categories explicitly%s",
+					"%s: domain member %q matches %q, which is not a domain; supported values: %s%s",
 					context,
 					member,
+					label,
 					strings.Join(config.SupportedRoutingDomainNames(), ", "),
-					formatDomainQuickFixSuffix(member),
+					formatDomainQuickFixSuffix(label),
 				),
-				domainQuickFix(member),
-			)
-			continue
-		}
-		for _, mmluCategory := range mmluCategories {
-			if config.IsSupportedRoutingDomainName(mmluCategory) {
-				continue
-			}
-			v.addDiag(
-				DiagConstraint,
-				partition.Pos,
-				fmt.Sprintf(
-					"%s: domain member %q has unsupported mmlu_categories value %q; supported values: %s%s",
-					context,
-					member,
-					mmluCategory,
-					strings.Join(config.SupportedRoutingDomainNames(), ", "),
-					formatDomainQuickFixSuffix(mmluCategory),
-				),
-				domainQuickFix(mmluCategory),
+				domainQuickFix(label),
 			)
 		}
 	}
 }
 
 func isSupportedProjectionPartitionType(signalType string) bool {
-	return signalType == "domain" || signalType == "embedding"
+	return signalType == "domain"
 }
 
 func describeProjectionPartitionMemberTypes(
@@ -379,46 +351,44 @@ func (v *Validator) checkProjectionPartitionImpossibleANDsInRoute(
 	route *RouteDecl,
 	memberToPartition map[string]string,
 ) {
+	// Distributing AND over OR can produce contradictory cross-products even
+	// when the original expression is satisfiable: (A OR B) AND (A OR B) still
+	// accepts A or B. An impossible-route constraint requires every alternative
+	// to contradict a partition; one viable alternative disproves that claim.
 	clauses := positiveConjunctionClauses(route.When)
 	seen := make(map[string]struct{})
-
+	var conflicts []string
 	for _, clause := range clauses {
 		partitionMembers := make(map[string]SignalRefExpr)
+		impossible := false
 		for _, ref := range clause {
 			partitionName, ok := memberToPartition[projectionPartitionMemberKey(ref.SignalType, ref.SignalName)]
 			if !ok {
 				continue
 			}
-
 			if existing, clash := partitionMembers[partitionName]; clash && existing.SignalName != ref.SignalName {
-				pair := []string{
-					projectionPartitionMemberKey(existing.SignalType, existing.SignalName),
-					projectionPartitionMemberKey(ref.SignalType, ref.SignalName),
-				}
+				impossible = true
+				pair := []string{projectionPartitionMemberKey(existing.SignalType, existing.SignalName), projectionPartitionMemberKey(ref.SignalType, ref.SignalName)}
 				sort.Strings(pair)
-				diagKey := route.Name + "|" + partitionName + "|" + strings.Join(pair, "|")
+				diagKey := partitionName + "|" + strings.Join(pair, "|")
 				if _, alreadyReported := seen[diagKey]; alreadyReported {
 					continue
 				}
 				seen[diagKey] = struct{}{}
-
-				v.addDiag(DiagConstraint, route.Pos,
-					fmt.Sprintf(
-						"ROUTE %q: WHEN clause ANDs PROJECTION partition %q members %s(%q) and %s(%q), but that partition declares them mutually exclusive",
-						route.Name,
-						partitionName,
-						existing.SignalType,
-						existing.SignalName,
-						ref.SignalType,
-						ref.SignalName,
-					),
-					nil,
-				)
+				conflicts = append(conflicts, fmt.Sprintf(
+					"ROUTE %q: WHEN clause ANDs PROJECTION partition %q members %s(%q) and %s(%q), but that partition declares them mutually exclusive",
+					route.Name, partitionName, existing.SignalType, existing.SignalName, ref.SignalType, ref.SignalName,
+				))
 				continue
 			}
-
 			partitionMembers[partitionName] = ref
 		}
+		if !impossible {
+			return
+		}
+	}
+	for _, message := range conflicts {
+		v.addDiag(DiagConstraint, route.Pos, message, nil)
 	}
 }
 
@@ -453,7 +423,9 @@ func positiveConjunctionClauses(expr BoolExpr) [][]SignalRefExpr {
 func (v *Validator) suggestSignalByName(name string) *QuickFix {
 	var candidates []string
 	for _, s := range v.prog.Signals {
-		candidates = append(candidates, s.Name)
+		if ref := signalReferenceName(s); ref != "" {
+			candidates = append(candidates, ref)
+		}
 	}
 	closest := suggestSimilar(name, candidates)
 	if closest == "" {
@@ -529,12 +501,12 @@ func (v *Validator) checkProjectionScoreInputProjectionRef(context string, pos P
 		return
 	}
 	switch input.ValueSource {
-	case "", "score":
+	case "", config.ProjectionValueSourceScore:
 		if !scoreNames[input.SignalName] {
 			v.addDiag(DiagWarning, pos,
 				fmt.Sprintf("%s: projection input %q references undeclared score", context, input.SignalName), nil)
 		}
-	case "confidence":
+	case config.ProjectionValueSourceConfidence:
 		if !v.isProjectionOutputDefined(input.SignalName) {
 			v.addDiag(DiagWarning, pos,
 				fmt.Sprintf("%s: projection input %q with value_source \"confidence\" references undeclared mapping output", context, input.SignalName), nil)
@@ -569,7 +541,13 @@ func (v *Validator) checkProjectionScoreInput(context string, pos Position, inpu
 		v.checkProjectionScoreInputProjectionRef(context, pos, input, scoreNames)
 		return
 	}
-	if !v.isSignalDefined(input.SignalType, input.SignalName) {
+	name := input.SignalName
+	if strings.EqualFold(input.SignalType, config.SignalTypeSystemOne) || config.IsApplicationSignalType(strings.ToLower(input.SignalType)) {
+		// A systemone or application input may read one option of its
+		// question: "<rule>:<option>".
+		name, _, _ = strings.Cut(name, ":")
+	}
+	if !v.isSignalDefined(input.SignalType, name) {
 		v.addDiag(
 			DiagWarning,
 			pos,
@@ -578,7 +556,7 @@ func (v *Validator) checkProjectionScoreInput(context string, pos Position, inpu
 		)
 	}
 	switch input.ValueSource {
-	case "", "binary", "confidence", "raw":
+	case "", config.ProjectionValueSourceBinary, config.ProjectionValueSourceConfidence, config.ProjectionValueSourceRaw:
 	default:
 		v.addDiag(
 			DiagConstraint,
@@ -596,29 +574,8 @@ func (v *Validator) checkProjectionScoreInput(context string, pos Position, inpu
 }
 
 func isProjectionInputTypeSupported(signalType string) bool {
-	switch signalType {
-	case config.SignalTypeKeyword,
-		config.SignalTypeEmbedding,
-		config.SignalTypeDomain,
-		config.SignalTypeFactCheck,
-		config.SignalTypeUserFeedback,
-		config.SignalTypeReask,
-		config.SignalTypePreference,
-		config.SignalTypeLanguage,
-		config.SignalTypeContext,
-		config.SignalTypeStructure,
-		config.SignalTypeComplexity,
-		config.SignalTypeModality,
-		config.SignalTypeAuthz,
-		config.SignalTypeJailbreak,
-		config.SignalTypePII,
-		config.SignalTypeKB,
-		config.ProjectionInputKBMetric,
-		config.SignalTypeProjection:
-		return true
-	default:
-		return false
-	}
+	return config.IsSupportedSignalType(signalType) ||
+		signalType == config.SignalTypeProjection
 }
 
 func (v *Validator) checkProjectionMapping(mapping *ProjectionMappingDecl, scoreNames map[string]bool, outputNames map[string]bool) {

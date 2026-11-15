@@ -2,7 +2,9 @@ package extproc
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
+	"sync/atomic"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -12,40 +14,90 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/cache"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/contextcompression"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/embedding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/fallback"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/kvtransfer"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/memory"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelservice"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ratelimit"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerruntime"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/graph"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection/lookuptable"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/services"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/tools"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/systemone"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/tokencount"
 	httputil "github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/http"
 )
 
 // OpenAIRouter is an Envoy ExtProc server that routes OpenAI API requests.
 type OpenAIRouter struct {
-	Config                *config.RouterConfig
-	CategoryDescriptions  []string
-	Classifier            *classification.Classifier
-	ClassificationService *services.ClassificationService
-	Cache                 cache.CacheBackend
-	ToolsDatabase         *tools.ToolsDatabase
-	ToolsRegistry         *tools.Registry // retriever strategy registry
-	toolSelectionDBMu     sync.Mutex
-	toolSelectionDBByPath map[string]*tools.ToolsDatabase
-	ResponseAPIFilter     *ResponseAPIFilter
-	ReplayRecorder        *routerreplay.Recorder
-	ReplayStoreShared     bool
+	// KVHandoff is an optional trusted deployment adapter; nil disables transfer.
+	KVHandoff KVHandoffPlanner
+
+	nativeExecutors map[string]*systemone.Executor
+	// signals is the signal runtime this router extracts signals with; a
+	// later generation can share it.
+	signals *signalRuntime
+	// decisionDecider answers decision selectors; nil uses the process-wide model runtime manager.
+	decisionDecider modelservice.Decider
+	// systemOneDecider answers decision selectors on systemone deployments.
+	systemOneDecider modelservice.Remote
+	// tokenizers loads the tokenizers that count prompts for the context
+	// window check; nil uses the process-wide registry.
+	tokenizers           *tokencount.Registry
+	decisionCards        map[string]modelservice.ModelCard
+	Embeddings           *embedding.Set
+	serviceEmbeddings    *embedding.Set
+	cacheEmbeddings      *embedding.Set
+	Config               *config.RouterConfig
+	CategoryDescriptions []string
+	Classifier           *classification.Classifier
+	// RecipeClassifiers selects the isolated classifier graph for each routing
+	// request. Classifier is the default-recipe accessor.
+	RecipeClassifiers      *classification.RecipeClassifiers
+	ClassificationService  *services.ClassificationService
+	Cache                  cache.CacheBackend
+	ResponseCache          *cache.ResponseCacheService
+	responseCacheMu        sync.Mutex
+	kvAddressRegistryStore kvtransfer.AddressRegistry
+	kvAddressRegistryMu    sync.Mutex
+	ContextCompression     *contextcompression.Service
+	CompressionRecovery    contextcompression.RecoveryStore
+	contextCompressionMu   sync.Mutex
+	// toolCatalogs are the catalogs the tools plugin's add mode chooses from,
+	// by tools_db_path, read when the generation was built.
+	toolCatalogs      map[string]*toolCatalog
+	ResponseAPIFilter *ResponseAPIFilter
+	ReplayRecorder    *routerreplay.Recorder
+	ReplayStoreShared bool
+	// ShadowDispatcher runs bounded, fail-open shadow model calls after the
+	// primary dispatch is finalized. nil disables router_replay shadows.
+	ShadowDispatcher *shadowDispatcher
 	// ModelSelector is the registry of advanced model selection algorithms
 	// initialized from config.IntelligentRouting.ModelSelection.
-	ModelSelector   *selection.Registry
-	LookupTable     lookuptable.LookupTable
-	ReplayRecorders map[string]*routerreplay.Recorder
-	MemoryStore     memory.Store
-	MemoryExtractor *memory.MemoryExtractor
+	ModelSelector *selection.Registry
+	// RecipeModelSelectors keeps mutable algorithm state (Elo, RL, ML adapters,
+	// and similar selectors) isolated even when recipes reuse decision names.
+	RecipeModelSelectors map[config.RecipeName]*selection.Registry
+	LookupTable          lookuptable.LookupTable
+	ReplayRecorders      map[string]*routerreplay.Recorder
+	MemoryStore          memory.Store
+	MemoryStatus         routerruntime.MemoryStatus
+	MemoryExtractor      *memory.MemoryExtractor
+	ProtocolCodecs       *protocolcodec.Registry
+	// hopCaller, when set, sends Looper hops instead of the configuration
+	// snapshot's upstream set.
+	hopCaller graph.Caller
+
+	memoryPersistence *memory.PersistenceRunner
 
 	// CredentialResolver resolves per-user LLM API keys from multiple sources
 	// (ext_authz injected headers -> static config fallback).
@@ -59,27 +111,76 @@ type OpenAIRouter struct {
 	// paths back through package-global API-server state.
 	RuntimeRegistry *routerruntime.Registry
 
+	// FallbackOrchestrator manages bounded execution and fallback across model candidates.
+	FallbackOrchestrator        *fallback.Orchestrator
+	RecipeFallbackOrchestrators map[config.RecipeName]*fallback.Orchestrator
+	fallbackCaller              fallbackTransportCaller
+
 	routerLearningMu      sync.Mutex
 	routerLearningRuntime *routerLearningRuntime
-	lookupTableCancel     func()
+	generation            *routerGeneration
+	// configVersion is the version of the configuration snapshot this router
+	// serves, 0 when it serves without the lifecycle.
+	configVersion atomic.Uint64
+	// extensions holds the decoded payloads of extension plugins by their
+	// configuration, so a generation decodes each one once.
+	extensions              sync.Map
+	lookupTableCancel       func()
+	routerSessionStateStore *sessiontelemetry.RouterSessionStateStoreSlot
+
+	// WorkflowStateService owns the shared workflow tool-state store so that
+	// pause/resume works across independent HTTP requests without leaking
+	// backend connections. Closed with the rest of the generation resources.
+	WorkflowStateService *looper.WorkflowStateService
+
+	resources *resourceScope
 }
 
-// Close releases background resources held by the router (e.g. lookup table
-// auto-save and periodic re-population goroutines).
 func (r *OpenAIRouter) Close() error {
 	if r == nil {
 		return nil
 	}
-	if r.lookupTableCancel != nil {
-		r.lookupTableCancel()
+	return r.resources.close()
+}
+
+func closeReplayRecorders(
+	replayRecorder *routerreplay.Recorder,
+	replayRecorders map[string]*routerreplay.Recorder,
+	replayStoreShared bool,
+) error {
+	if replayStoreShared {
+		if replayRecorder == nil {
+			return nil
+		}
+		return replayRecorder.Close()
 	}
-	return nil
+
+	seen := make(map[*routerreplay.Recorder]struct{}, len(replayRecorders)+1)
+	var errs []error
+	for _, recorder := range replayRecorders {
+		if recorder == nil {
+			continue
+		}
+		if _, duplicate := seen[recorder]; duplicate {
+			continue
+		}
+		seen[recorder] = struct{}{}
+		if err := recorder.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if replayRecorder != nil {
+		if _, duplicate := seen[replayRecorder]; !duplicate {
+			errs = append(errs, replayRecorder.Close())
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Ensure OpenAIRouter implements the ext_proc calls.
 var _ ext_proc.ExternalProcessorServer = (*OpenAIRouter)(nil)
 
-const routerReplayAPIBasePath = "/v1/router_replay"
+const routerReplayAPIBasePath = "/api/v1/observability/replays"
 
 // createJSONResponseWithBody creates a direct response with pre-marshaled JSON
 // body. When responsePath is non-empty, the v0.4 keystone headers
@@ -114,38 +215,6 @@ func (r *OpenAIRouter) createJSONResponseWithBody(statusCode int, jsonBody []byt
 	}
 }
 
-// createSSEResponseWithBody creates a direct response with pre-marshaled SSE
-// (text/event-stream) body. Used when the original client request requested
-// streaming (stream: true) but the response is generated by modality routing
-// (e.g. image generation) rather than a streaming model backend.
-func (r *OpenAIRouter) createSSEResponseWithBody(statusCode int, sseBody []byte, responsePath string) *ext_proc.ProcessingResponse {
-	setHeaders := []*core.HeaderValueOption{
-		{
-			Header: &core.HeaderValue{
-				Key:      "content-type",
-				RawValue: []byte("text/event-stream; charset=utf-8"),
-			},
-		},
-	}
-	if responsePath != "" {
-		setHeaders = append(setHeaders, httputil.KeystoneHeaderOptions(responsePath)...)
-	}
-
-	return &ext_proc.ProcessingResponse{
-		Response: &ext_proc.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: &ext_proc.ImmediateResponse{
-				Status: &typev3.HttpStatus{
-					Code: statusCodeToImmediateResponseCode(statusCode),
-				},
-				Headers: &ext_proc.HeaderMutation{
-					SetHeaders: setHeaders,
-				},
-				Body: sseBody,
-			},
-		},
-	}
-}
-
 // createJSONResponse creates a direct response with JSON content.
 func (r *OpenAIRouter) createJSONResponse(statusCode int, data interface{}) *ext_proc.ProcessingResponse {
 	jsonData, err := json.Marshal(data)
@@ -161,10 +230,21 @@ func (r *OpenAIRouter) createJSONResponse(statusCode int, data interface{}) *ext
 
 // createErrorResponse creates a direct error response.
 func (r *OpenAIRouter) createErrorResponse(statusCode int, message string) *ext_proc.ProcessingResponse {
+	return r.createErrorResponseOnPath(statusCode, message, headers.ResponsePathError)
+}
+
+// createErrorResponseOnPath creates a direct error response that names
+// responsePath, such as a guard's refusal on the blocked path.
+func (r *OpenAIRouter) createErrorResponseOnPath(statusCode int, message, responsePath string) *ext_proc.ProcessingResponse {
+	statusCode = errorResponseStatusCode(statusCode)
+	errorType := "invalid_request_error"
+	if statusCode >= 500 {
+		errorType = "api_error"
+	}
 	errorResp := map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": message,
-			"type":    "invalid_request_error",
+			"type":    errorType,
 			"code":    statusCode,
 		},
 	}
@@ -176,7 +256,7 @@ func (r *OpenAIRouter) createErrorResponse(statusCode int, message string) *ext_
 		statusCode = 500
 	}
 
-	return r.createJSONResponseWithBody(statusCode, jsonData, headers.ResponsePathError)
+	return r.createJSONResponseWithBody(statusCode, jsonData, responsePath)
 }
 
 // shouldClearRouteCache checks if route cache should be cleared.
@@ -184,31 +264,32 @@ func (r *OpenAIRouter) shouldClearRouteCache() bool {
 	return r.Config.ClearRouteCache
 }
 
-// LoadToolsDatabase loads tools from file after embedding models are initialized.
-func (r *OpenAIRouter) LoadToolsDatabase() error {
-	if !r.ToolsDatabase.IsEnabled() {
+func (r *OpenAIRouter) fallbackOrchestratorForContext(ctx *RequestContext) *fallback.Orchestrator {
+	if r == nil {
 		return nil
 	}
-
-	if r.Config.Tools.ToolsDBPath == "" {
-		logging.Warnf("Tools database enabled but no tools file path configured; skipping load")
-		return nil
+	orch := r.FallbackOrchestrator
+	if ctx != nil && ctx.Routing.RecipeName() != "" && r.RecipeFallbackOrchestrators != nil {
+		if recipe, ok := r.RecipeFallbackOrchestrators[ctx.Routing.RecipeName()]; ok && recipe != nil {
+			orch = recipe
+		}
 	}
-
-	if err := r.ToolsDatabase.LoadToolsFromFile(r.Config.Tools.ToolsDBPath); err != nil {
-		return err
-	}
-
-	// Wire the default embedding retriever into the registry now that
-	// the database is loaded and embeddings are available.
-	r.ToolsRegistry = tools.NewDefaultRegistry(r.ToolsDatabase)
-
-	return nil
+	return orch.For(fallbackOverrides(ctx)...)
 }
 
-func (r *OpenAIRouter) RegisterToolStrategy(name string, retriever tools.ToolRetriever) {
-	if r.ToolsRegistry == nil {
-		r.ToolsRegistry = tools.NewRegistry()
+// fallbackOverrides are the layers a request sets over its recipe's fallback
+// policy, the least specific first: the matched decision's, then, for a
+// request-graph hop, its step's.
+func fallbackOverrides(ctx *RequestContext) []*fallback.FallbackOverride {
+	if ctx == nil {
+		return nil
 	}
-	r.ToolsRegistry.Register(name, retriever)
+	var overrides []*fallback.FallbackOverride
+	if ctx.VSRSelectedDecision != nil {
+		overrides = append(overrides, ctx.VSRSelectedDecision.Fallback)
+	}
+	if ctx.Hop != nil {
+		overrides = append(overrides, ctx.Hop.Fallback)
+	}
+	return overrides
 }

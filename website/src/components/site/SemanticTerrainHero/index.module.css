@@ -1,0 +1,185 @@
+.masthead {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  min-height: max(660px, 100vh);
+  min-height: max(660px, 100svh);
+  overflow: hidden;
+  background: var(--paper);
+}
+
+/* The ocean fills the masthead behind the copy and paints its own ground: porcelain in light, black water at night. */
+.ocean {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+}
+
+/* Night's black water fades into the dark paper where the masthead meets the next section. */
+:global([data-theme='dark']) .masthead::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: auto 0 0;
+  height: 120px;
+  background: linear-gradient(180deg, rgba(18, 20, 25, 0), var(--paper));
+  pointer-events: none;
+}
+
+.inner {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: min(100% - 2 * var(--gut), var(--wrap));
+  margin-inline: auto;
+  padding: calc(var(--site-header-height) + clamp(20px, 3.5vh, 44px)) 0 clamp(220px, 34svh, 380px);
+  text-align: center;
+}
+
+.masthead .title {
+  margin: 0;
+  color: var(--ink);
+  font: 500 clamp(60px, 8.6vw, 132px) / 0.92 var(--serif);
+  letter-spacing: -0.034em;
+  text-wrap: balance;
+}
+
+/* The accent words in italic, from the fast side's ember into the slow side's indigo. */
+.accent {
+  display: block;
+  padding-right: 0.04em;
+  color: #7a3a5e;
+  font-style: italic;
+}
+
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .accent {
+    background: var(--duo-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+.masthead .slogan {
+  max-width: 30em;
+  margin: clamp(22px, 3.4vh, 34px) 0 0;
+  color: #2a2f3a;
+  font: 500 clamp(24px, 2.5vw, 36px) / 1.2 var(--serif);
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+}
+
+:global([data-theme='dark']) .masthead .slogan {
+  color: var(--ink-2);
+}
+
+.slogan em {
+  color: var(--ember-text);
+  font-style: italic;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: clamp(30px, 4.6vh, 44px);
+}
+
+.masthead .quiet {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+.quiet a {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: var(--hair-2);
+  text-underline-offset: 0.2em;
+  transition: color 0.2s, text-decoration-color 0.2s;
+}
+
+.quiet a:hover,
+.quiet a:focus-visible {
+  color: var(--ink);
+  text-decoration-color: var(--ember);
+}
+
+.duration {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+/* The title is there from the first paint; the lines under it rise. */
+.inner > :not(.title) {
+  animation: rise 1.1s var(--ease) both;
+}
+
+.inner > .slogan {
+  animation-delay: 0.15s;
+}
+
+.inner > .actions {
+  animation-delay: 0.25s;
+}
+
+.inner > .quiet {
+  animation-delay: 0.35s;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+:global(html[lang='zh-Hans']) .masthead .title {
+  font-size: clamp(48px, 7vw, 108px);
+  letter-spacing: 0;
+  line-height: 1.1;
+}
+
+:global(html[lang='zh-Hans']) .masthead .slogan {
+  letter-spacing: 0;
+}
+
+@media (max-width: 600px) {
+  .inner {
+    padding: calc(var(--site-header-height) + 36px) 0 clamp(190px, 28svh, 240px);
+  }
+
+  .masthead .title {
+    font-size: clamp(46px, 13.5vw, 72px);
+    line-height: 0.95;
+  }
+
+  :global(html[lang='zh-Hans']) .masthead .title {
+    font-size: clamp(38px, 11vw, 56px);
+  }
+
+  .masthead .slogan {
+    font-size: clamp(21px, 6vw, 26px);
+  }
+
+  .actions {
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .inner > * {
+    animation: none;
+  }
+}

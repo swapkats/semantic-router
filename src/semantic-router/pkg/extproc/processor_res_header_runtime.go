@@ -19,6 +19,7 @@ import (
 type responseHeaderOutcome struct {
 	statusCode   int
 	isSuccessful bool
+	bodyStreamed bool
 }
 
 func (r *OpenAIRouter) handleLooperResponseHeaders(
@@ -29,13 +30,18 @@ func (r *OpenAIRouter) handleLooperResponseHeaders(
 		return nil
 	}
 
-	statusCode := 200
-	if v != nil && v.ResponseHeaders != nil && v.ResponseHeaders.Headers != nil {
-		statusCode = getStatusFromHeaders(v.ResponseHeaders.Headers)
+	outcome := evaluateResponseHeaderOutcome(v, ctx)
+	ctx.UpstreamStatusCode = outcome.statusCode
+	r.updateRouterReplayStatus(ctx, outcome.statusCode, ctx.IsStreamingResponse)
+	// Internal hops still own a provider transport boundary. Preserve status
+	// and streaming mode so their response can be translated back to Chat.
+	var mutation *ext_proc.HeaderMutation
+	if requiresClientResponseRewrite(ctx) || ctx.IsStreamingResponse {
+		mutation = &ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}}
 	}
-
-	r.updateRouterReplayStatus(ctx, statusCode, false)
-	return buildResponseHeadersContinueResponse(nil, false)
+	// Body mode follows the provider, not the client: a JSON answer forced into
+	// streamed reads is split by transport and cannot be bridged back.
+	return buildResponseHeadersContinueResponse(mutation, outcome.bodyStreamed)
 }
 
 func evaluateResponseHeaderOutcome(
@@ -47,12 +53,14 @@ func evaluateResponseHeaderOutcome(
 		return outcome
 	}
 
-	if ctx != nil {
-		ctx.IsStreamingResponse = isStreamingContentType(v.ResponseHeaders.Headers)
-	}
-
 	outcome.statusCode = getStatusFromHeaders(v.ResponseHeaders.Headers)
 	outcome.isSuccessful = outcome.statusCode >= 200 && outcome.statusCode < 300
+	outcome.bodyStreamed = outcome.isSuccessful && isStreamingContentType(v.ResponseHeaders.Headers)
+	if ctx != nil {
+		ctx.UpstreamBodyStreamed = outcome.bodyStreamed
+		ctx.IsStreamingResponse = outcome.isSuccessful &&
+			(isStreamingContentType(v.ResponseHeaders.Headers) || isResponseAPIStreamRequest(ctx))
+	}
 	recordResponseHeaderErrorMetrics(ctx, outcome.statusCode)
 	return outcome
 }
@@ -67,7 +75,7 @@ func recordResponseHeaderErrorMetrics(ctx *RequestContext, statusCode int) {
 	}
 }
 
-func finishUpstreamResponseSpan(ctx *RequestContext, outcome responseHeaderOutcome) {
+func annotateUpstreamResponseSpan(ctx *RequestContext, outcome responseHeaderOutcome) {
 	if ctx == nil || ctx.UpstreamSpan == nil {
 		return
 	}
@@ -76,26 +84,28 @@ func finishUpstreamResponseSpan(ctx *RequestContext, outcome responseHeaderOutco
 	if !outcome.isSuccessful && outcome.statusCode != 0 {
 		ctx.UpstreamSpan.SetStatus(codes.Error, "upstream request failed")
 	}
-
-	ctx.UpstreamSpan.End()
-	ctx.UpstreamSpan = nil
 }
 
 func maybeRecordResponseHeaderTTFT(ctx *RequestContext) {
-	if ctx == nil ||
-		ctx.IsStreamingResponse ||
-		ctx.TTFTRecorded ||
-		ctx.ProcessingStartTime.IsZero() ||
-		ctx.RequestModel == "" {
+	if ctx == nil || ctx.ProcessingStartTime.IsZero() {
+		return
+	}
+	recordNonStreamingFirstResponse(ctx, time.Since(ctx.ProcessingStartTime))
+}
+
+// recordNonStreamingFirstResponse records how long the request's model took
+// to answer a non-streaming response.
+func recordNonStreamingFirstResponse(ctx *RequestContext, elapsed time.Duration) {
+	if ctx.IsStreamingResponse || ctx.TTFTRecorded || ctx.RequestModel == "" {
 		return
 	}
 
-	ttft := time.Since(ctx.ProcessingStartTime).Seconds()
+	ttft := elapsed.Seconds()
 	if ttft <= 0 {
 		return
 	}
 
-	metrics.RecordModelTTFT(ctx.RequestModel, ttft)
+	metrics.RecordModelFirstResponseObservation(ctx.RequestModel, ttft)
 	ctx.TTFTSeconds = ttft
 	ctx.TTFTRecorded = true
 	latency.UpdateTTFT(ctx.RequestModel, ttft)
@@ -126,6 +136,47 @@ func buildResponseHeadersContinueResponse(
 		}
 	}
 	return response
+}
+
+func buildResponseStreamingMutation(
+	ctx *RequestContext,
+	outcome responseHeaderOutcome,
+) *ext_proc.HeaderMutation {
+	if !outcome.isSuccessful || ctx == nil || !ctx.IsStreamingResponse {
+		return nil
+	}
+	// Streaming headers reach the client before body translation or usage
+	// filtering can determine its final size, including same-wire Chat. A
+	// provider's length describes its own bytes and cannot frame that output.
+	mutation := &ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}}
+	if isResponseAPIStreamRequest(ctx) {
+		mutation.SetHeaders = []*core.HeaderValueOption{{
+			Header: &core.HeaderValue{
+				Key: "content-type", RawValue: []byte("text/event-stream; charset=utf-8"),
+			},
+			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		}}
+	}
+	return mutation
+}
+
+func isResponseAPIStreamRequest(ctx *RequestContext) bool {
+	return isResponseAPIRequest(ctx) && ctx.SemanticRequest != nil && ctx.SemanticRequest.Stream
+}
+
+func mergeHeaderMutations(mutations ...*ext_proc.HeaderMutation) *ext_proc.HeaderMutation {
+	merged := &ext_proc.HeaderMutation{}
+	for _, mutation := range mutations {
+		if mutation == nil {
+			continue
+		}
+		merged.SetHeaders = append(merged.SetHeaders, mutation.GetSetHeaders()...)
+		merged.RemoveHeaders = append(merged.RemoveHeaders, mutation.GetRemoveHeaders()...)
+	}
+	if len(merged.SetHeaders) == 0 && len(merged.RemoveHeaders) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // getStatusFromHeaders extracts :status pseudo-header value as integer.

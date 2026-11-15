@@ -13,6 +13,8 @@ export interface DecisionRule {
   rules?: unknown[]
   modelRefs?: unknown[]
   plugins?: unknown[]
+  routingScope?: string
+  routingEntrypoints?: string[]
   [key: string]: unknown
 }
 
@@ -20,25 +22,35 @@ export interface RouterConfig {
   signals?: Record<string, SignalConfig[]>
   decisions?: DecisionRule[]
   providers?: {
-    defaults?: {
-      default_model?: string
-    }
     models?: Array<{
       name?: string
       backend_refs?: Array<{ name?: string }>
-      endpoints?: Array<{ name?: string }>
-      preferred_endpoints?: string[]
       [key: string]: unknown
     }>
-    vllm_endpoints?: unknown[]
     [key: string]: unknown
   }
   routing?: {
+    model_bindings?: Record<string, unknown>
     signals?: Record<string, SignalConfig[]>
     decisions?: DecisionRule[]
   }
-  vllm_endpoints?: Array<{ name?: string }>
-  plugins?: Record<string, unknown>
+  default_recipe?: { name: string; description?: string }
+  entrypoints?: Array<{
+    api?: 'chat' | 'systemone'
+    model_names: string[]
+    recipe: string
+  }>
+  recipes?: Array<{
+    name: string
+    description?: string
+    routing: {
+      model_bindings?: Record<string, unknown>
+      signals?: Record<string, SignalConfig[]>
+      projections?: Record<string, unknown>
+      decisions?: DecisionRule[]
+      strategy?: string
+    }
+  }>
   global?: Record<string, unknown>
   [key: string]: unknown
 }

@@ -8,7 +8,8 @@ spec:
   defaultModel: "qwen-2.5-32b"
   models:
     - name: "qwen-2.5-32b"
-      reasoningFamily: "qwen3"
+      reasoning:
+        family: "qwen3"
       pricing:
         inputTokenPrice: 0.000002    # $2 per 1M - with header mutation
         outputTokenPrice: 0.000004   # $4 per 1M
@@ -17,7 +18,8 @@ spec:
           description: "API routing specialist"
 
     - name: "qwen-2.5-72b"
-      reasoningFamily: "qwen3"
+      reasoning:
+        family: "qwen3"
       pricing:
         inputTokenPrice: 0.000003    # $3 per 1M - advanced routing
         outputTokenPrice: 0.000006   # $6 per 1M
@@ -38,15 +40,11 @@ spec:
         operator: "OR"
         keywords: ["security", "vulnerability", "exploit", "hack"]
         caseSensitive: false
-
-    embeddings:
       - name: "threat_detection"
-        threshold: 0.82
-        candidates:
-          - "I found a security vulnerability in the system"
-          - "There's a potential exploit that needs attention"
-          - "We need to patch this security issue"
-        aggregationMethod: "max"
+        operator: "OR"
+        keywords: ["I found a security vulnerability in the system", "There's a potential exploit that needs attention", "We need to patch this security issue"]
+        caseSensitive: false
+
 
   decisions:
     - name: "security_alert"
@@ -57,7 +55,7 @@ spec:
         conditions:
           - type: "keyword"
             name: "security"
-          - type: "embedding"
+          - type: "keyword"
             name: "threat_detection"
       modelRefs:
         - model: "qwen-2.5-72b"

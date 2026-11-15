@@ -1,12 +1,12 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
 import (
+	"context"
 	"testing"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerruntime"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/vectorstore"
 )
 
@@ -100,31 +100,9 @@ func TestRuntimeRegistrySuppressesLegacyVectorGlobalsUntilPublished(t *testing.T
 	}
 }
 
-func TestRuntimeRegistrySuppressesLegacySelectionGlobalUntilPublished(t *testing.T) {
-	globalRegistry := selection.NewRegistry()
-	originalRegistry := selection.GlobalRegistry
-	selection.GlobalRegistry = globalRegistry
-	t.Cleanup(func() {
-		selection.GlobalRegistry = originalRegistry
-	})
-
-	registry := routerruntime.NewRegistry(nil)
-	apiServer := &ClassificationAPIServer{runtimeRegistry: registry}
-
-	if got := apiServer.currentSelectionRegistry(); got != nil {
-		t.Fatalf("currentSelectionRegistry() = %v, want nil before runtime publication", got)
-	}
-
-	runtimeRegistry := selection.NewRegistry()
-	registry.SetModelSelector(runtimeRegistry)
-	if got := apiServer.currentSelectionRegistry(); got != runtimeRegistry {
-		t.Fatalf("currentSelectionRegistry() = %v, want runtime registry %v", got, runtimeRegistry)
-	}
-}
-
 type fakeRuntimeEmbedder struct{}
 
-func (fakeRuntimeEmbedder) Embed(_ string) ([]float32, error) {
+func (fakeRuntimeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
 	return []float32{1, 0}, nil
 }
 

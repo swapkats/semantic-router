@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -213,41 +214,6 @@ func TestClassificationService_BasicFunctionality(t *testing.T) {
 	})
 }
 
-func TestBuildIntentResponseFromSignals_IncludesExtendedMatchedSignals(t *testing.T) {
-	service := &ClassificationService{}
-	req := IntentRequest{}
-	signals := &classification.SignalResults{
-		MatchedModalityRules:   []string{"AR"},
-		MatchedAuthzRules:      []string{"premium_tier"},
-		MatchedJailbreakRules:  []string{"jailbreak:block"},
-		MatchedPIIRules:        []string{"pii:email"},
-		MatchedReaskRules:      []string{"likely_dissatisfied"},
-		MatchedEventRules:      []string{"critical_payment_event"},
-		MatchedProjectionRules: []string{"balance_reasoning"},
-	}
-	decisionResult := &decision.DecisionResult{
-		Decision: &config.Decision{
-			Name: "projection_route",
-			ModelRefs: []config.ModelRef{{
-				Model: "qwen3-8b",
-			}},
-		},
-		Confidence: 0.91,
-	}
-
-	response := service.buildIntentResponseFromSignals(signals, decisionResult, "projection_route", 0.91, 12, req)
-	require.NotNil(t, response)
-	require.NotNil(t, response.MatchedSignals)
-
-	assert.Equal(t, []string{"AR"}, response.MatchedSignals.Modality)
-	assert.Equal(t, []string{"premium_tier"}, response.MatchedSignals.Authz)
-	assert.Equal(t, []string{"jailbreak:block"}, response.MatchedSignals.Jailbreak)
-	assert.Equal(t, []string{"pii:email"}, response.MatchedSignals.PII)
-	assert.Equal(t, []string{"likely_dissatisfied"}, response.MatchedSignals.Reask)
-	assert.Equal(t, []string{"critical_payment_event"}, response.MatchedSignals.Event)
-	assert.Equal(t, []string{"balance_reasoning"}, response.MatchedSignals.Projection)
-}
-
 func TestBuildEvalResponse_ProjectionSignalsIncludedInUsedMatchedAndUnmatched(t *testing.T) {
 	routerConfig := &config.RouterConfig{
 		IntelligentRouting: config.IntelligentRouting{
@@ -267,6 +233,13 @@ func TestBuildEvalResponse_ProjectionSignalsIncludedInUsedMatchedAndUnmatched(t 
 			Decisions: []config.Decision{
 				{
 					Name: "reasoning_route",
+					Algorithm: &config.AlgorithmConfig{
+						Type: "remom",
+					},
+					Plugins: []config.DecisionPlugin{
+						{Type: "response_cache"},
+						{Type: "system_prompt"},
+					},
 					Rules: config.RuleCombination{
 						Operator: "AND",
 						Conditions: []config.RuleNode{{
@@ -291,7 +264,12 @@ func TestBuildEvalResponse_ProjectionSignalsIncludedInUsedMatchedAndUnmatched(t 
 		Decision: &routerConfig.Decisions[0],
 	}
 
-	response := service.buildEvalResponse("reason carefully", signals, decisionResult)
+	response := service.buildEvalResponse(
+		"reason carefully",
+		signals,
+		decisionResult,
+		service.classifier,
+	)
 	require.NotNil(t, response)
 	require.NotNil(t, response.DecisionResult)
 	require.NotNil(t, response.DecisionResult.UsedSignals)
@@ -301,21 +279,29 @@ func TestBuildEvalResponse_ProjectionSignalsIncludedInUsedMatchedAndUnmatched(t 
 	assert.Equal(t, []string{"balance_reasoning"}, response.DecisionResult.UsedSignals.Projection)
 	assert.Equal(t, []string{"balance_reasoning"}, response.DecisionResult.MatchedSignals.Projection)
 	assert.Equal(t, []string{"balance_medium"}, response.DecisionResult.UnmatchedSignals.Projection)
+	assert.Equal(t, "remom", response.DecisionResult.Algorithm)
+	assert.Equal(t, []string{"response_cache", "system_prompt"}, response.DecisionResult.Plugins)
 }
 
 func TestBuildEvalResponse_IncludesSignalValues(t *testing.T) {
 	service := &ClassificationService{}
 	signals := &classification.SignalResults{
-		MatchedStructureRules: []string{"many_questions"},
-		Metrics:               &classification.SignalMetricsCollection{},
-		SignalConfidences:     map[string]float64{"structure:many_questions": 1},
-		SignalValues:          map[string]float64{"structure:many_questions": 4},
+		MatchedKeywordRules: []string{"many_questions"},
+		Metrics:             &classification.SignalMetricsCollection{},
+		SignalValues:        map[string]float64{"keyword:many_questions": 4},
+		SignalErrors:        map[string]string{"classifier:risk": "timeout"},
 	}
 
-	response := service.buildEvalResponse("why? why? why? why?", signals, nil)
+	response := service.buildEvalResponse(
+		"why? why? why? why?",
+		signals,
+		nil,
+		nil,
+	)
 	require.NotNil(t, response)
 	require.NotNil(t, response.SignalValues)
-	assert.Equal(t, 4.0, response.SignalValues["structure:many_questions"])
+	assert.Equal(t, 4.0, response.SignalValues["keyword:many_questions"])
+	assert.Equal(t, "timeout", response.SignalErrors["classifier:risk"])
 }
 
 // Benchmark tests for performance validation
@@ -532,14 +518,14 @@ func TestGetRecommendedModel_EmptyModelRefs(t *testing.T) {
 func TestDetectPII_EdgeCases(t *testing.T) {
 	t.Run("Empty_text_returns_error", func(t *testing.T) {
 		service := &ClassificationService{classifier: nil}
-		_, err := service.DetectPII(PIIRequest{Text: ""})
+		_, err := service.DetectPII(context.Background(), PIIRequest{Text: ""})
 		require.Error(t, err)
 		assert.Equal(t, "text cannot be empty", err.Error())
 	})
 
 	t.Run("Nil_classifier_returns_placeholder", func(t *testing.T) {
 		service := &ClassificationService{classifier: nil}
-		resp, err := service.DetectPII(PIIRequest{Text: "hello"})
+		resp, err := service.DetectPII(context.Background(), PIIRequest{Text: "hello"})
 		require.NoError(t, err)
 		assert.False(t, resp.HasPII)
 		assert.Empty(t, resp.Entities)
@@ -548,7 +534,7 @@ func TestDetectPII_EdgeCases(t *testing.T) {
 }
 
 func TestBuildPIIResponse_NoDetections(t *testing.T) {
-	resp := newPIIResponseTestService().buildPIIResponse("hello world", []classification.PIIDetection{}, nil)
+	resp := newPIIResponseTestService().buildPIIResponse("hello world", []piiDetection{}, nil)
 
 	assert.False(t, resp.HasPII)
 	assert.Empty(t, resp.Entities)
@@ -564,8 +550,8 @@ func TestBuildPIIResponse_DefaultOptions(t *testing.T) {
 	assert.Len(t, resp.Entities, 2)
 	assert.Equal(t, "[DETECTED]", resp.Entities[0].Value)
 	assert.Equal(t, "[DETECTED]", resp.Entities[1].Value)
-	assert.Equal(t, 0, resp.Entities[0].StartPos)
-	assert.Equal(t, 0, resp.Entities[0].EndPos)
+	assert.Nil(t, resp.Entities[0].StartPos)
+	assert.Nil(t, resp.Entities[0].EndPos)
 	assert.Empty(t, resp.MaskedText)
 	assert.Equal(t, "block", resp.SecurityRecommendation)
 }
@@ -601,8 +587,9 @@ func TestBuildPIIResponse_ReturnPositionsOption(t *testing.T) {
 			detections[:1],
 			&PIIOptions{ReturnPositions: true},
 		)
-		assert.Equal(t, 13, resp.Entities[0].StartPos)
-		assert.Equal(t, 29, resp.Entities[0].EndPos)
+		require.NotNil(t, resp.Entities[0].StartPos)
+		assert.Equal(t, 13, *resp.Entities[0].StartPos)
+		assert.Equal(t, 29, *resp.Entities[0].EndPos)
 	})
 
 	t.Run("disabled", func(t *testing.T) {
@@ -611,8 +598,8 @@ func TestBuildPIIResponse_ReturnPositionsOption(t *testing.T) {
 			detections[:1],
 			&PIIOptions{ReturnPositions: false},
 		)
-		assert.Equal(t, 0, resp.Entities[0].StartPos)
-		assert.Equal(t, 0, resp.Entities[0].EndPos)
+		assert.Nil(t, resp.Entities[0].StartPos)
+		assert.Nil(t, resp.Entities[0].EndPos)
 	})
 }
 
@@ -647,7 +634,7 @@ func TestBuildPIIResponse_MaskEntities(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
 		resp := service.buildPIIResponse(
 			"Contact alice@test.com please",
-			[]classification.PIIDetection{
+			[]piiDetection{
 				{EntityType: "EMAIL", Start: 8, End: 22, Text: "alice@test.com", Confidence: 0.95},
 			},
 			&PIIOptions{MaskEntities: true},
@@ -659,7 +646,7 @@ func TestBuildPIIResponse_MaskEntities(t *testing.T) {
 	t.Run("same_entity_twice", func(t *testing.T) {
 		resp := service.buildPIIResponse(
 			"Email alice@test.com and again alice@test.com",
-			[]classification.PIIDetection{
+			[]piiDetection{
 				{EntityType: "EMAIL", Start: 6, End: 20, Text: "alice@test.com", Confidence: 0.95},
 				{EntityType: "EMAIL", Start: 31, End: 45, Text: "alice@test.com", Confidence: 0.93},
 			},
@@ -673,7 +660,7 @@ func TestBuildPIIResponse_MaskEntities(t *testing.T) {
 	t.Run("different_texts_same_type", func(t *testing.T) {
 		resp := service.buildPIIResponse(
 			"Email alice@test.com and bob@test.com",
-			[]classification.PIIDetection{
+			[]piiDetection{
 				{EntityType: "EMAIL", Start: 6, End: 20, Text: "alice@test.com", Confidence: 0.95},
 				{EntityType: "EMAIL", Start: 25, End: 37, Text: "bob@test.com", Confidence: 0.92},
 			},
@@ -688,7 +675,7 @@ func TestBuildPIIResponse_MaskEntities(t *testing.T) {
 func TestBuildPIIResponse_CombinedOptions(t *testing.T) {
 	resp := newPIIResponseTestService().buildPIIResponse(
 		"Alice alice@test.com",
-		[]classification.PIIDetection{
+		[]piiDetection{
 			{EntityType: "PERSON", Start: 0, End: 5, Text: "Alice", Confidence: 0.88},
 			{EntityType: "EMAIL", Start: 6, End: 20, Text: "alice@test.com", Confidence: 0.95},
 		},
@@ -704,8 +691,9 @@ func TestBuildPIIResponse_CombinedOptions(t *testing.T) {
 	entity := resp.Entities[0]
 	assert.Equal(t, "EMAIL", entity.Type)
 	assert.Equal(t, "alice@test.com", entity.Value)
-	assert.Equal(t, 6, entity.StartPos)
-	assert.Equal(t, 20, entity.EndPos)
+	require.NotNil(t, entity.StartPos)
+	assert.Equal(t, 6, *entity.StartPos)
+	assert.Equal(t, 20, *entity.EndPos)
 	assert.Equal(t, "[EMAIL_0]", entity.MaskedValue)
 	assert.Equal(t, "Alice [EMAIL_0]", resp.MaskedText)
 }
@@ -714,8 +702,8 @@ func newPIIResponseTestService() *ClassificationService {
 	return &ClassificationService{}
 }
 
-func samplePIIResponseDetections() []classification.PIIDetection {
-	return []classification.PIIDetection{
+func samplePIIResponseDetections() []piiDetection {
+	return []piiDetection{
 		{EntityType: "EMAIL", Start: 13, End: 29, Text: "alice@test.com", Confidence: 0.95},
 		{EntityType: "PERSON", Start: 0, End: 5, Text: "Alice", Confidence: 0.88},
 		{EntityType: "PHONE", Start: 37, End: 49, Text: "555-123-4567", Confidence: 0.75},
@@ -723,3 +711,25 @@ func samplePIIResponseDetections() []classification.PIIDetection {
 }
 
 const samplePIIResponseText = "Alice reached alice@test.com at tel 555-123-4567"
+
+func TestBuildEvalResponse_IncludesDecisionRanking(t *testing.T) {
+	service := &ClassificationService{}
+	signals := &classification.SignalResults{
+		Metrics: &classification.SignalMetricsCollection{},
+		Diagnostics: decision.EvaluationDiagnostics{
+			Ranking: &decision.RankingTrace{
+				Strategy:   "priority",
+				Winner:     "law_route",
+				DecidedBy:  "priority",
+				Fallback:   "keyword_route reported no comparable score",
+				Candidates: 2,
+			},
+		},
+	}
+
+	response := service.buildEvalResponse("why?", signals, nil, nil)
+	require.NotNil(t, response)
+	require.NotNil(t, response.DecisionRanking, "the eval response must report how the decision was ranked")
+	assert.Equal(t, "law_route", response.DecisionRanking.Winner)
+	assert.Equal(t, "keyword_route reported no comparable score", response.DecisionRanking.Fallback)
+}

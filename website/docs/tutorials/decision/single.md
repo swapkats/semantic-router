@@ -2,9 +2,8 @@
 
 ## Overview
 
-Use `config/decision/single/` when one signal is enough to pick a route.
-
-This is the cleanest entry point for a route that has one authoritative detector.
+A single-condition decision is the simplest route policy: one signal or
+projection output determines whether the route is eligible.
 
 ## Key Advantages
 
@@ -17,11 +16,11 @@ This is the cleanest entry point for a route that has one authoritative detector
 
 Some routes do not need a boolean tree. Forcing them into a larger `AND` or `OR` structure adds noise and makes simple policy harder to review.
 
-`single/` solves that by keeping the route focused on one decisive match.
+A single-condition decision keeps the route focused on one decisive match.
 
 ## When to Use
 
-Use `single/` when:
+Use a single-condition decision when:
 
 - one domain signal is authoritative
 - one safety signal should block immediately
@@ -29,22 +28,28 @@ Use `single/` when:
 
 ## Configuration
 
-Source fragment: `config/decision/single/domain-business.yaml`
-
 ```yaml
-routing:
-  decisions:
-    - name: business_route
-      description: Route business and management questions.
-      priority: 110
-      rules:
-        operator: AND
-        conditions:
-          - type: domain
-            name: business
-      modelRefs:
-        - model: qwen2.5:3b
-          use_reasoning: false
+recipes:
+  - name: default
+    decisions:
+      - name: business_route
+        description: Route business and management questions.
+        priority: 110
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: business
+        modelRefs:
+          - model: qwen2.5:3b
+            use_reasoning: false
 ```
 
-Even for a single condition, keep the route named and reusable. If the policy becomes more complex later, you can promote it to `and/`, `or/`, or `composite/` without changing the surrounding config layout.
+Even for a single condition, keep the route named and reusable. If the policy
+becomes more complex later, add explicit boolean groups without changing the
+surrounding route structure.
+
+The referenced signal must be declared in the same recipe. A single learned
+signal remains probabilistic, so use trusted identity or deterministic policy
+for authorization-sensitive routing. See a complete example:
+[`config/fragments/decision/single/domain-business.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/decision/single/domain-business.yaml).

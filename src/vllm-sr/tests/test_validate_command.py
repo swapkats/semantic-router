@@ -1,61 +1,704 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-from cli.commands.validate import _projection_summary_lines, _signal_summary_lines
+import pytest
+from cli.catalog_provider_projection import provider_projection_errors
+from cli.commands.validate import (
+    _aggregate_projection_summary_lines,
+    _aggregate_signal_summary_lines,
+    _projection_summary_lines,
+    _signal_summary_lines,
+)
+from cli.config_contract import PROJECTION_FAMILY_SPECS, SIGNAL_FAMILY_SPECS
+from cli.main import main
+from cli.parser import parse_user_config
+from click.testing import CliRunner
 
 
 def test_signal_summary_lines_cover_v03_signal_surface():
     signals = SimpleNamespace(
-        keywords=[object()],
-        embeddings=[object()],
-        domains=[object()],
-        fact_check=[object()],
-        user_feedbacks=[object()],
-        reasks=[object()],
-        preferences=[object()],
-        language=[object()],
-        context=[object()],
-        structure=[object()],
-        complexity=[object()],
-        modality=[object()],
-        role_bindings=[object()],
-        jailbreak=[object()],
-        pii=[object()],
-        kb=[object()],
-        conversation=[object()],
-        events=[object()],
+        **{spec.signal_attr: [object()] for spec in SIGNAL_FAMILY_SPECS}
     )
 
-    lines = _signal_summary_lines(signals)
-
-    assert "  Keyword signals: 1" in lines
-    assert "  Embedding signals: 1" in lines
-    assert "  Domains: 1" in lines
-    assert "  Fact check signals: 1" in lines
-    assert "  User feedback signals: 1" in lines
-    assert "  Reask signals: 1" in lines
-    assert "  Preference signals: 1" in lines
-    assert "  Language signals: 1" in lines
-    assert "  Context signals: 1" in lines
-    assert "  Structure signals: 1" in lines
-    assert "  Complexity signals: 1" in lines
-    assert "  Modality signals: 1" in lines
-    assert "  Authz signals: 1" in lines
-    assert "  Jailbreak signals: 1" in lines
-    assert "  PII signals: 1" in lines
-    assert "  Knowledge-base signals: 1" in lines
-    assert "  Conversation signals: 1" in lines
-    assert "  Event signals: 1" in lines
+    assert _signal_summary_lines(signals) == [
+        f"  {spec.display_name}: 1" for spec in SIGNAL_FAMILY_SPECS
+    ]
 
 
 def test_projection_summary_lines_cover_v03_projection_surface():
     projections = SimpleNamespace(
-        partitions=[object()],
-        scores=[object()],
-        mappings=[object()],
+        **{spec.projection_attr: [object()] for spec in PROJECTION_FAMILY_SPECS}
     )
 
     assert _projection_summary_lines(projections) == [
-        "  Projection partitions: 1",
+        f"  Projection {spec.display_name.lower()}: 1"
+        for spec in PROJECTION_FAMILY_SPECS
+    ]
+
+
+def test_aggregate_summary_lines_include_recipe_owned_routing():
+    default = SimpleNamespace(
+        signals=SimpleNamespace(keywords=[]),
+        projections=SimpleNamespace(scores=[], mappings=[]),
+    )
+    recipe = SimpleNamespace(
+        signals=SimpleNamespace(keywords=[object(), object()]),
+        projections=SimpleNamespace(scores=[object()], mappings=[object()]),
+    )
+    profiles = [("default", default), ("accuracy-first", recipe)]
+
+    keyword_label = next(
+        spec.display_name
+        for spec in SIGNAL_FAMILY_SPECS
+        if spec.signal_attr == "keywords"
+    )
+    assert _aggregate_signal_summary_lines(profiles) == [f"  {keyword_label}: 2"]
+    assert _aggregate_projection_summary_lines(profiles) == [
         "  Projection scores: 1",
         "  Projection mappings: 1",
     ]
+
+
+def _write_config(tmp_path, text: str):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    return config_path
+
+
+def test_provider_projection_validation_is_structural_and_non_mutating(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("VALIDATION_ONLY_OPENAI_API_KEY", raising=False)
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+providers:
+  models:
+    - name: frontier
+      catalog: openai/gpt-5.4
+      backend_refs:
+        - provider: openai
+          auth: {api_key_env: VALIDATION_ONLY_OPENAI_API_KEY}
+recipes:
+  - name: default
+""",
+    )
+    user_config = parse_user_config(str(config_path), log_summary=False)
+    authored_config = user_config.model_dump()
+
+    assert provider_projection_errors(user_config) == []
+    assert user_config.model_dump() == authored_config
+
+
+def test_validate_command_preserves_backendless_external_gateway_metadata(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: claude-metadata-only
+      api_format: anthropic
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Configuration is valid" in result.output
+
+
+def test_validate_command_accepts_a_facts_only_default_model(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+providers:
+  defaults:
+    model: private-model
+  models:
+    - name: private-model
+      description: Metadata-only routing model
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Configuration is valid" in result.output
+
+
+def test_validate_command_accepts_pii_rule_without_predicate(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+providers:
+  defaults:
+    model: private-model
+  models:
+    - name: private-model
+recipes:
+  - name: default
+    signals:
+      pii:
+        - name: contact_details
+          ignore_labels: [EMAIL_ADDRESS]
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    rule = parse_user_config(str(config_path)).default_recipe.signals.pii[0]
+    assert rule.predicate is None
+
+
+def test_validate_command_accepts_name_only_external_gateway_provider_model(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: bare
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_validate_command_accepts_backendless_explicit_zero_pricing(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: free-model
+      pricing:
+        prompt_per_1m: 0
+        completion_per_1m: 0
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Configuration is valid" in result.output
+
+
+def test_validate_command_rejects_blank_model_identity(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: " "
+      api_format: openai
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "Provider model name cannot be empty" in result.output
+
+
+def test_validate_command_rejects_blank_provider_model_identity(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers: {models: [{name: ' '}]}
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "Provider model name cannot be empty" in result.output
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_error"),
+    (
+        (
+            "ftp://example.com/v1#fragment",
+            "endpoint scheme 'ftp' is unsupported",
+        ),
+        (
+            "https://example.com/v1#fragment",
+            "endpoint userinfo and fragments are not allowed",
+        ),
+        (
+            "https://example.com/v1?region=west",
+            "endpoint query parameters are not supported by Envoy routing",
+        ),
+    ),
+)
+def test_validate_command_rejects_invalid_backend_url(tmp_path, url, expected_error):
+    config_path = _write_config(
+        tmp_path,
+        f"""
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: local-model
+      api_format: openai
+      backend_refs:
+        - provider: vllm
+          endpoint: {url}
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert expected_error in result.output
+
+
+@pytest.mark.parametrize(
+    ("backend_refs", "expected_error"),
+    (
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example/v1
+          auth: {api_key_env: KEY_A}
+        - provider: vllm
+          endpoint: http://b.example/custom
+          auth: {api_key_env: KEY_A}
+""",
+            "base path differ",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example/v1
+          auth: {api_key_env: KEY_A}
+        - provider: vllm
+          endpoint: http://b.example/v1
+          auth: {api_key_env: KEY_B}
+""",
+            "credential source differ",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example/v1
+        - provider: sglang
+          endpoint: http://b.example/v1
+""",
+            "provider differ",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example/v1
+        - provider: vllm
+          endpoint: https://a.example/v1
+""",
+            "URL scheme",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example/v1
+          headers:
+            x-region: east
+        - provider: vllm
+          endpoint: http://b.example/v1
+          headers:
+            x-region: west
+""",
+            "headers differ",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: https://a.example/v1
+        - provider: vllm
+          endpoint: https://b.example/v1
+""",
+            "TLS server name differ",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: https://127.0.0.1/v1
+""",
+            "HTTPS endpoint must use a DNS hostname",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example:not-a-port/v1
+""",
+            "has an invalid endpoint port",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example:0/v1
+""",
+            "expected 1..65535",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: a.example:65536/v1
+""",
+            "expected 1..65535",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: http://a.example:65536/v1
+""",
+            "has an invalid endpoint port",
+        ),
+        (
+            """
+        - provider: vllm
+          endpoint: a.example:-1/v1
+""",
+            "expected 1..65535",
+        ),
+        (
+            """
+        - name: replica
+          provider: vllm
+          endpoint: http://a.example/v1
+        - name: replica
+          provider: vllm
+          endpoint: http://b.example/v1
+""",
+            "name 'replica' is duplicated",
+        ),
+    ),
+)
+def test_validate_command_reuses_envoy_backend_group_validation(
+    tmp_path, backend_refs, expected_error
+):
+    config_path = _write_config(
+        tmp_path,
+        f"""
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: local-model
+      api_format: openai
+      backend_refs:
+{backend_refs}
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert expected_error in result.output
+
+
+def test_validate_command_rejects_backendless_router_owned_model(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+providers:
+  models:
+    - name: local-model
+      api_format: openai
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "must define backend_refs with an explicit Provider ID" in result.output
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected_error"),
+    (
+        (
+            """
+    - name: frontier
+      catalog: openai/gpt-5.4
+      backend_refs:
+        - provider: anthropic
+""",
+            "provider 'anthropic' has no catalog mapping for model 'openai/gpt-5.4'",
+        ),
+        (
+            """
+    - name: private-deployment
+      provider_model_id: deployment-name
+      api_format: openai
+      backend_refs:
+        - provider: azure-openai
+""",
+            "requires endpoint because provider 'azure-openai' has no default",
+        ),
+    ),
+)
+def test_validate_command_rejects_provider_projection_errors(
+    tmp_path, model_config, expected_error
+):
+    config_path = _write_config(
+        tmp_path,
+        f"""
+version: v0.5
+listeners: []
+providers:
+  models:
+{model_config}
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "Configuration validation failed" in result.output
+    assert expected_error in result.output
+
+
+def test_validate_command_names_the_apis_an_api_format_may_name(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """
+version: v0.5
+listeners: []
+providers:
+  models:
+    - name: frontier
+      catalog: openai/gpt-5.4
+      api_format: bogus
+      backend_refs:
+        - provider: openai
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 1
+    assert (
+        "api_format: 'bogus' is not one of ['chat_completions', 'responses', 'messages'"
+        in " ".join(result.output.split())
+    )
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    (
+        """
+    - name: frontier
+      catalog: openai/gpt-5.4
+      backend_refs:
+        - provider: openai
+""",
+        """
+    - name: local-model
+      api_format: openai
+      backend_refs:
+        - provider: vllm
+          endpoint: http://127.0.0.1:8000/v1
+""",
+        """
+    - name: local-model
+      api_format: openai
+      backend_refs:
+        - provider: vllm
+          endpoint: http://[::1]:8000/v1
+""",
+        """
+    - name: local-model
+      api_format: openai
+      backend_refs:
+        - provider: vllm
+          endpoint: "[::1]:9123/v1"
+          protocol: HTTP
+""",
+        """
+    - name: local-model
+      api_format: openai
+      backend_refs:
+        - provider: vllm
+          endpoint: api.example.test:9443/v1
+          protocol: HTTPS
+""",
+    ),
+)
+def test_validate_command_accepts_sparse_builtin_and_custom_models(
+    tmp_path, model_config
+):
+    config_path = _write_config(
+        tmp_path,
+        f"""
+version: v0.5
+providers:
+  defaults:
+    model: {"frontier" if "catalog:" in model_config else "local-model"}
+  models:
+{model_config}
+recipes:
+  - name: default
+""",
+    )
+
+    result = CliRunner().invoke(
+        main, ["config", "validate", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Configuration is valid" in result.output
+
+
+def test_validate_command_accepts_non_ascii_config_under_ascii_locale(tmp_path):
+    config_content = "version: v0.5\n# Description: Router configuration \u2014 Decision & Latency Profile \u201cexperimental\u201d\n# Comment: \u6a21\u578b\u914d\u7f6e\nlisteners: []\nproviders:\n  defaults:\n    model: local-model\n  models:\n    - name: local-model\n      api_format: openai\n      backend_refs:\n        - provider: vllm\n          endpoint: http://127.0.0.1:8000/v1\n          auth:\n            api_key_env: TEST_API_KEY\nrecipes:\n  - name: default\n"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(config_content, encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{project_root}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else str(project_root)
+    )
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    env["PYTHONUTF8"] = "0"
+    env["PYTHONCOERCECLOCALE"] = "0"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    # The CLI reads the file here; --offline keeps the check off whatever
+    # Router image the host happens to have.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cli.main",
+            "config",
+            "validate",
+            "--config",
+            str(config_path),
+            "--offline",
+        ],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    assert "Configuration is valid" in result.stdout
+
+    router_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cli.main",
+            "config",
+            "router",
+            "--config",
+            str(config_path),
+        ],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert (
+        router_result.returncode == 0
+    ), f"STDOUT:\n{router_result.stdout}\nSTDERR:\n{router_result.stderr}"
+    assert router_result.stdout == config_content
+
+    # Verify runtime_support env resolution also works under ASCII locale
+    test_script = (
+        "import sys\n"
+        "from cli.commands.runtime_support import config_env_references, required_config_env_references\n"
+        f"refs = config_env_references(r'{config_path}')\n"
+        f"req_refs = required_config_env_references(r'{config_path}')\n"
+        "assert 'TEST_API_KEY' in refs, f'Expected TEST_API_KEY in refs: {refs}'\n"
+        "assert 'TEST_API_KEY' in req_refs, f'Expected TEST_API_KEY in req_refs: {req_refs}'\n"
+        "print('RUNTIME_SUPPORT_OK')\n"
+    )
+    support_result = subprocess.run(
+        [sys.executable, "-c", test_script],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert (
+        support_result.returncode == 0
+    ), f"STDOUT:\n{support_result.stdout}\nSTDERR:\n{support_result.stderr}"
+    assert "RUNTIME_SUPPORT_OK" in support_result.stdout

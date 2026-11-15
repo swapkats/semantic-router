@@ -1,0 +1,119 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/vllm-project/semantic-router/vllm-sr
+  tag: latest
+  pullPolicy: Never
+config:
+  version: v0.5
+  listeners: []
+  providers:
+    defaults:
+      model: openai/gpt-oss-20b
+    models:
+      - name: openai/gpt-oss-20b
+        backend_refs:
+          - name: provider-mocker
+            provider: vllm
+            endpoint: provider-mocker.default.svc.cluster.local:8000
+            weight: 1
+  recipes:
+    - name: default
+      decisions:
+        # Fact-checkable questions route here and, because the response carries
+        # tool context, trigger the remote hallucination check.
+        - name: fact_check_decision
+          description: Verify factual answers and run endpoint hallucination detection
+          priority: 100
+          rules:
+            operator: OR
+            conditions:
+              - type: fact_check
+                name: needs_fact_check
+          modelRefs:
+            - model: openai/gpt-oss-20b
+              use_reasoning: false
+          plugins:
+            - type: response_guard
+              configuration:
+                rules:
+                  - when:
+                      operator: AND
+                      conditions:
+                        - type: fact_check
+                          name: needs_fact_check
+                        - type: hallucination
+                          name: ungrounded_claims
+                    action: annotate
+                on_unknown: annotate
+        - name: default_decision
+          description: Default catch-all decision
+          priority: 1
+          rules:
+            operator: AND
+            conditions: []
+          modelRefs:
+            - model: openai/gpt-oss-20b
+              use_reasoning: false
+      signals:
+        fact_check:
+          # provider-mocker answers the chosen option with probability 0.97,
+          # so 0.9 separates its choice from the other option.
+          - name: needs_fact_check
+            description: Query contains factual claims that should be verified against context
+            predicate:
+              gte: 0.9
+          - name: no_fact_check_needed
+            description: Query is creative, code, or opinion based - no fact verification needed
+            labels: [NO_FACT_CHECK_NEEDED]
+            predicate:
+              gte: 0.9
+        # Checked from the model's answer against the tool context the request
+        # carried. The response_guard above annotates the answer on it.
+        hallucination:
+          - name: ungrounded_claims
+            description: Detect claims in the answer that the tool context does not support.
+  global:
+    router:
+      strategy: priority
+    services:
+      api:
+        batch_classification:
+          max_batch_size: 100
+          metrics:
+            enabled: true
+            detailed_goroutine_tracking: false
+            high_resolution_timing: false
+            sample_rate: 1.0
+      observability:
+        tracing:
+          enabled: false
+    integrations: {}
+    model_catalog:
+      # Remote deployment under test: provider-mocker's System One fixture
+      # (see its README) answers the hallucination rule's span question
+      # instead of an in-process model.
+      deployments:
+        fake-systemone:
+          provider: systemone
+          endpoint: http://provider-mocker.default.svc.cluster.local:8000/v1/systemone
+          model: e2e/fake-systemone
+          schema: vllm-sr/4.0
+          timeout_ms: 10000
+          capabilities:
+            question_types: [choice, noul, span]
+      bindings:
+        hallucination: fake-systemone
+        fact_check: fake-systemone
+# provider-mocker answers the fact-check and hallucination rules, so the
+# Router loads no local model.
+resources:
+  limits:
+    cpu: '2'
+    memory: 12Gi
+  requests:
+    cpu: 500m
+    memory: 2Gi
+
+# E2E/Kind: disable PVC for reliable CI (same as other e2e profiles).
+persistence:
+  enabled: false

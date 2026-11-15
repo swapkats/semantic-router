@@ -9,11 +9,61 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/apis/vllm.ai/v1alpha1"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
+
+func TestConvertDecisionPreservesNestedContextCompression(t *testing.T) {
+	converter := &CRDConverter{}
+	decision, err := converter.convertDecision(v1alpha1.Decision{
+		Name: "compressed",
+		Plugins: []v1alpha1.DecisionPlugin{{
+			Type: config.DecisionPluginContext,
+			Configuration: &runtime.RawExtension{Raw: []byte(`{
+				"enabled": true,
+				"compress": {
+					"mode": "auto",
+					"targets": {
+						"tool_outputs": {
+							"mode": "extractive",
+							"min_tokens": 2000,
+							"target_tokens": 1000
+						}
+					}
+				}
+			}`)},
+		}},
+	})
+	require.NoError(t, err)
+	require.Len(t, decision.Plugins, 1)
+	var pluginConfig config.ContextPluginConfig
+	require.NoError(
+		t,
+		config.UnmarshalPluginConfig(
+			decision.Plugins[0].Configuration,
+			&pluginConfig,
+		),
+	)
+	require.NotNil(t, pluginConfig.Compress)
+	require.NotNil(t, pluginConfig.Compress.Targets)
+	assert.Equal(t, 1000, pluginConfig.Compress.Targets.ToolOutputs.TargetTokens)
+}
+
+func TestConvertDecisionPreservesOnUnknown(t *testing.T) {
+	converter := &CRDConverter{}
+	decision, err := converter.convertDecision(v1alpha1.Decision{
+		Name: "guarded",
+		Signals: v1alpha1.SignalCombination{
+			Operator:  "AND",
+			OnUnknown: "fail_request",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, config.RuleOnUnknownFailRequest, decision.Rules.OnUnknown)
+}
 
 // TestConverterWithTestData tests the converter with input/output test data
 // This test reads YAML files from testdata/input, converts them, and writes output to testdata/output
@@ -213,26 +263,93 @@ func testDecision(
 	}
 }
 
-func TestCRDConverterConvertsEventSignals(t *testing.T) {
+func TestConvertProviderMetadataPreservesCachePricing(t *testing.T) {
+	cachedInputPrice := 0.0000001
+	cacheWritePrice := 0.00000125
+	converted := convertProviderMetadata([]v1alpha1.ModelConfig{{
+		Name: "gpt-5.6-luna",
+		Pricing: &v1alpha1.ModelPricing{
+			Currency:              "USD",
+			InputTokenPrice:       0.000001,
+			CachedInputTokenPrice: &cachedInputPrice,
+			CacheWriteTokenPrice:  &cacheWritePrice,
+			OutputTokenPrice:      0.000006,
+		},
+	}})
+
+	require.Len(t, converted, 1)
+	pricing := converted[0].Pricing
+	assert.Equal(t, "USD", pricing.Currency)
+	assert.InDelta(t, 1.0, pricing.PromptPer1M, 1e-12)
+	assert.InDelta(t, 0.1, pricing.CachedInputPer1M, 1e-12)
+	require.NotNil(t, pricing.CacheWritePer1M)
+	assert.InDelta(t, 1.25, *pricing.CacheWritePer1M, 1e-12)
+	assert.InDelta(t, 6.0, pricing.CompletionPer1M, 1e-12)
+}
+
+func TestConvertProviderMetadataUsesCatalogAndNestedReasoning(t *testing.T) {
+	converted := convertProviderMetadata([]v1alpha1.ModelConfig{
+		{
+			Name:    "frontier",
+			Catalog: "vendor/reasoner-v1",
+		},
+		{
+			Name: "private-reasoner",
+			Reasoning: &v1alpha1.ModelReasoning{
+				Type:      config.ReasoningFamilyTypeChatTemplateKwargs,
+				Parameter: "think_mode",
+				Levels:    []string{"low", "high"},
+				Default:   "high",
+			},
+		},
+	})
+
+	require.Len(t, converted, 2)
+	assert.Equal(t, "vendor/reasoner-v1", converted[0].Catalog)
+	assert.Nil(t, converted[0].Reasoning)
+	require.NotNil(t, converted[1].Reasoning)
+	assert.Equal(t, config.ReasoningFamilyTypeChatTemplateKwargs, converted[1].Reasoning.Type)
+	assert.Equal(t, "think_mode", converted[1].Reasoning.Parameter)
+	assert.Equal(t, []string{"low", "high"}, converted[1].Reasoning.Levels)
+	assert.Equal(t, "high", converted[1].Reasoning.Default)
+}
+
+func TestConvertProviderMetadataDeclaresEveryPoolModel(t *testing.T) {
+	models := convertProviderMetadata([]v1alpha1.ModelConfig{
+		{Name: "frontier", Catalog: "vendor/reasoner-v1", LoRAs: []v1alpha1.LoRAConfig{{Name: "expert"}}},
+		{Name: "private-model"},
+	})
+
+	require.Len(t, models, 2)
+	assert.Equal(t, "frontier", models[0].Name)
+	assert.Equal(t, "vendor/reasoner-v1", models[0].Catalog)
+	require.Len(t, models[0].LoRAs, 1)
+	assert.Equal(t, "expert", models[0].LoRAs[0].Name)
+	assert.Equal(t, "private-model", models[1].Name)
+}
+
+func TestCRDConverterConvertsKeywordCounts(t *testing.T) {
 	pool := testPoolWithModels(v1alpha1.ModelConfig{Name: "test-model"})
+	four, sixteen := 4.0, 16.0
 	route := &v1alpha1.IntelligentRoute{
 		Spec: v1alpha1.IntelligentRouteSpec{
 			Signals: v1alpha1.Signals{
-				Events: []v1alpha1.EventSignal{
+				Keywords: []v1alpha1.KeywordSignal{
 					{
-						Name:        "critical_payment_event",
-						Description: "Critical payment incident payload.",
-						EventTypes:  []string{"payment_failed"},
-						Severities:  []string{"critical"},
-						ActionCodes: []string{"TXN_DECLINE"},
-						Temporal:    true,
+						Name:        "many_questions",
+						Description: "Prompts that contain many explicit questions.",
+						Operator:    "OR",
+						Method:      "regex",
+						Keywords:    []string{`[?？]`},
+						Count:       &v1alpha1.NumericPredicate{GTE: &four},
 					},
+					{Name: "constraint_dense", Operator: "OR", Keywords: []string{"at most"}, Density: &v1alpha1.NumericPredicate{GT: &sixteen}},
 				},
 			},
 			Decisions: []v1alpha1.Decision{
 				testDecision(
 					[]v1alpha1.ModelRef{{Model: "test-model"}},
-					v1alpha1.SignalCondition{Type: "event", Name: "critical_payment_event"},
+					v1alpha1.SignalCondition{Type: "keyword", Name: "many_questions"},
 				),
 			},
 		},
@@ -243,25 +360,38 @@ func TestCRDConverterConvertsEventSignals(t *testing.T) {
 
 	outputConfig, err := NewCRDConverter().Convert(pool, route, &config.CanonicalConfig{})
 	require.NoError(t, err)
-	require.Len(t, outputConfig.Routing.Signals.EventRules, 1)
+	require.Len(t, outputConfig.Recipes[0].Signals.Keywords, 2)
 
-	eventRule := outputConfig.Routing.Signals.EventRules[0]
-	assert.Equal(t, "critical_payment_event", eventRule.Name)
-	assert.Equal(t, "Critical payment incident payload.", eventRule.Description)
-	assert.Equal(t, []string{"payment_failed"}, eventRule.EventTypes)
-	assert.Equal(t, []string{"critical"}, eventRule.Severities)
-	assert.Equal(t, []string{"TXN_DECLINE"}, eventRule.ActionCodes)
-	assert.True(t, eventRule.Temporal)
+	counted, dense := outputConfig.Recipes[0].Signals.Keywords[0], outputConfig.Recipes[0].Signals.Keywords[1]
+	assert.Equal(t, "Prompts that contain many explicit questions.", counted.Description)
+	assert.Equal(t, "regex", counted.Method)
+	assert.Equal(t, config.NumericPredicate{GTE: &four}, *counted.Count)
+	assert.Nil(t, counted.Density)
+	assert.Equal(t, config.NumericPredicate{GT: &sixteen}, *dense.Density)
 }
 
 // TestCRDValidationErrors tests that validation catches various error conditions
 func TestCRDValidationErrors(t *testing.T) {
-	testCases := []struct {
-		name      string
-		pool      *v1alpha1.IntelligentPool
-		route     *v1alpha1.IntelligentRoute
-		wantError string
-	}{
+	testCases := append(coreCRDValidationErrorCases(), reasoningCRDValidationErrorCases()...)
+	baseConfig := testValidationBaseConfig()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCRDs(tc.pool, tc.route, baseConfig)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantError)
+		})
+	}
+}
+
+type crdValidationErrorCase struct {
+	name      string
+	pool      *v1alpha1.IntelligentPool
+	route     *v1alpha1.IntelligentRoute
+	wantError string
+}
+
+func coreCRDValidationErrorCases() []crdValidationErrorCase {
+	return []crdValidationErrorCase{
 		{
 			name: "DuplicateKeywordSignal",
 			pool: testPoolWithModels(v1alpha1.ModelConfig{Name: "test-model"}),
@@ -286,22 +416,25 @@ func TestCRDValidationErrors(t *testing.T) {
 			wantError: "references unknown keyword signal: nonexistent",
 		},
 		{
-			name: "UnknownEventSignalReference",
+			name: "UnknownConversationSignalReference",
 			pool: testPoolWithModels(v1alpha1.ModelConfig{Name: "test-model"}),
 			route: &v1alpha1.IntelligentRoute{
 				Spec: v1alpha1.IntelligentRouteSpec{
 					Signals: v1alpha1.Signals{
-						Events: []v1alpha1.EventSignal{{Name: "critical_event"}},
+						Conversation: []v1alpha1.ConversationSignal{{
+							Name:    "has_tools",
+							Feature: v1alpha1.ConversationCRDFeature{Type: "exists", Source: v1alpha1.ConversationCRDSource{Type: "tool_definition"}},
+						}},
 					},
 					Decisions: []v1alpha1.Decision{
 						testDecision(
 							[]v1alpha1.ModelRef{{Model: "test-model"}},
-							v1alpha1.SignalCondition{Type: "event", Name: "missing_event"},
+							v1alpha1.SignalCondition{Type: "conversation", Name: "missing_conversation"},
 						),
 					},
 				},
 			},
-			wantError: "references unknown event signal: missing_event",
+			wantError: "references unknown conversation signal: missing_conversation",
 		},
 		{
 			name: "UnknownModelReference",
@@ -331,13 +464,67 @@ func TestCRDValidationErrors(t *testing.T) {
 			wantError: "references unknown LoRA nonexistent-lora",
 		},
 	}
+}
 
-	baseConfig := testValidationBaseConfig()
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateCRDs(tc.pool, tc.route, baseConfig)
-			assert.Error(t, err)
-			assert.Contains(t, err.Error(), tc.wantError)
-		})
+func reasoningCRDValidationErrorCases() []crdValidationErrorCase {
+	return []crdValidationErrorCase{
+		{
+			name: "UnknownReasoningFamily",
+			pool: testPoolWithModels(v1alpha1.ModelConfig{
+				Name:      "test-model",
+				Reasoning: &v1alpha1.ModelReasoning{Family: "unknown"},
+			}),
+			route:     testRouteWithKeywords(nil),
+			wantError: "references unknown reasoning family: unknown",
+		},
+		{
+			name: "MixedReasoningFamilyAndInlineFields",
+			pool: testPoolWithModels(v1alpha1.ModelConfig{
+				Name: "test-model",
+				Reasoning: &v1alpha1.ModelReasoning{
+					Family:    "qwen3",
+					Type:      config.ReasoningFamilyTypeChatTemplateKwargs,
+					Parameter: "enable_thinking",
+				},
+			}),
+			route:     testRouteWithKeywords(nil),
+			wantError: "reasoning family is mutually exclusive with inline reasoning fields",
+		},
 	}
+}
+
+func TestCRDConverterConvertsOpenEndedContextRule(t *testing.T) {
+	pool := testPoolWithModels(v1alpha1.ModelConfig{Name: "test-model"})
+	route := &v1alpha1.IntelligentRoute{
+		Spec: v1alpha1.IntelligentRouteSpec{
+			Signals: v1alpha1.Signals{
+				ContextRules: []v1alpha1.ContextRule{
+					{Name: "short_context", MinTokens: "0", MaxTokens: "8K"},
+					{Name: "overflow_context", MinTokens: "8001"},
+				},
+			},
+			Decisions: []v1alpha1.Decision{
+				testDecision(
+					[]v1alpha1.ModelRef{{Model: "test-model"}},
+					v1alpha1.SignalCondition{Type: "context", Name: "overflow_context"},
+				),
+			},
+		},
+	}
+
+	require.NoError(t, validateCRDs(pool, route, testValidationBaseConfig()))
+
+	outputConfig, err := NewCRDConverter().Convert(pool, route, &config.CanonicalConfig{})
+	require.NoError(t, err)
+	require.Len(t, outputConfig.Recipes[0].Signals.Context, 2)
+
+	overflow := outputConfig.Recipes[0].Signals.Context[1]
+	assert.Equal(t, "overflow_context", overflow.Name)
+	assert.Equal(t, config.TokenCount("8001"), overflow.MinTokens)
+	assert.False(t, overflow.MaxTokens.IsSet())
+
+	bounds, err := overflow.Bounds()
+	require.NoError(t, err)
+	assert.True(t, bounds.Unbounded)
+	assert.True(t, bounds.Matches(1<<40))
 }

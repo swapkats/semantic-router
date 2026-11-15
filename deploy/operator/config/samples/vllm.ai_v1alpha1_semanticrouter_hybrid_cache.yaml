@@ -14,7 +14,8 @@ spec:
   vllmEndpoints:
     - name: small-model
       model: qwen3-1.8b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: service
         service:
@@ -23,7 +24,8 @@ spec:
 
     - name: large-model
       model: llama3-70b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: service
         service:
@@ -53,19 +55,13 @@ spec:
 
   # Semantic router configuration
   config:
-    embedding_models:
-      mmbert_model_path: models/mom-embedding-ultra
-      use_cpu: true
-
-    # Semantic cache with Hybrid backend (HNSW + Milvus)
-    semantic_cache:
+    response_cache:
       enabled: true
       backend_type: hybrid
       similarity_threshold: "0.85"
       ttl_seconds: 3600
       max_entries: 5000
       eviction_policy: lru
-      embedding_model: mmbert
 
       # HNSW configuration for hybrid backend
       hnsw:
@@ -94,7 +90,7 @@ spec:
           description: "Hybrid cache backend storage"
           vector_field:
             name: embedding
-            dimension: 384  # For BERT embeddings
+            dimension: 768  # vela-embedding, embeddings.default, answers with at most 768
             metric_type: IP
           index:
             type: HNSW
@@ -108,36 +104,11 @@ spec:
           topk: 20
           consistency_level: Eventually  # Faster for hybrid usage
 
-        performance:
-          connection_pool:
-            max_connections: 20
-            max_idle_connections: 10
-            acquire_timeout: 30
-          batch:
-            insert_batch_size: 200
-            timeout: 60
-
-        data_management:
-          ttl:
-            enabled: true
-            timestamp_field: created_at
-            cleanup_interval: 1800
-          compaction:
-            enabled: true
-            interval: 43200  # Twice daily
-
         development:
           drop_collection_on_startup: false
           auto_create_collection: true
-          verbose_errors: false
 
     # Disable features that require additional models for this example
-    # Enable these features in production with proper model configuration
-    prompt_guard:
-      enabled: false
-
-    tools:
-      enabled: false
 
 ---
 # Secret for Milvus password (create separately)

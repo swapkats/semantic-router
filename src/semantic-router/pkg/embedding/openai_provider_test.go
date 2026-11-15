@@ -3,8 +3,10 @@ package embedding
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -180,17 +182,211 @@ func TestOpenAICompatibleProviderDimensionMismatch(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleProviderResponseLimit(t *testing.T) {
+	responseBody, err := json.Marshal(embeddingsResponse{
+		Data: []embeddingDatum{{Index: 0, Embedding: []float64{0.1, 0.2}}},
+	})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(responseBody)
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name             string
+		maxResponseBytes int64
+		wantErr          bool
+	}{
+		{name: "at limit", maxResponseBytes: int64(len(responseBody))},
+		{name: "one byte over", maxResponseBytes: int64(len(responseBody)) - 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, err := NewOpenAICompatibleProvider(OpenAICompatibleConfig{
+				BaseURL:           server.URL,
+				Model:             "embedding-model",
+				MaxResponseBytes:  tt.maxResponseBytes,
+				ExpectedDimension: 2,
+			})
+			if err != nil {
+				t.Fatalf("NewOpenAICompatibleProvider() error = %v", err)
+			}
+
+			embedding, err := provider.Embed(context.Background(), "hello")
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "response body exceeds limit") {
+					t.Fatalf("Embed() error = %v, want response limit error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Embed() error = %v", err)
+			}
+			if len(embedding) != 2 {
+				t.Fatalf("embedding length = %d, want 2", len(embedding))
+			}
+		})
+	}
+}
+
+func TestOpenAICompatibleProviderRejectsFloat32Overflow(t *testing.T) {
+	tests := []struct {
+		name        string
+		embedding   []float64
+		want        []float32
+		wantErrPart []string
+	}{
+		{
+			name:        "positive overflow",
+			embedding:   []float64{1e100, 0.25},
+			wantErrPart: []string{"embedding index 0", "component 0", "1e+100", "overflows float32"},
+		},
+		{
+			name:        "negative overflow",
+			embedding:   []float64{0.25, -1e100},
+			wantErrPart: []string{"embedding index 0", "component 1", "-1e+100", "overflows float32"},
+		},
+		{
+			name:      "largest finite float32",
+			embedding: []float64{math.MaxFloat32, 0.25},
+			want:      []float32{math.MaxFloat32, float32(0.25)},
+		},
+		{
+			name:      "smallest finite float32",
+			embedding: []float64{-math.MaxFloat32, -0.25},
+			want:      []float32{-math.MaxFloat32, float32(-0.25)},
+		},
+		{
+			// Slightly outside the float32 range but still rounds to the
+			// largest finite float32, so it must not be rejected by a
+			// magnitude threshold.
+			name:      "rounds down to largest finite float32",
+			embedding: []float64{3.4028235e38},
+			want:      []float32{math.MaxFloat32},
+		},
+		{
+			name:      "normal embedding unchanged",
+			embedding: []float64{0.1, -0.2, 0, 1.5},
+			want:      []float32{0.1, -0.2, 0, 1.5},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := json.Marshal(embeddingsResponse{Data: []embeddingDatum{{Index: 0, Embedding: tt.embedding}}})
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+
+			provider := newTestOpenAIProvider(t, OpenAICompatibleConfig{
+				BaseURL: server.URL,
+				Model:   "embedding-model",
+			})
+
+			embedding, err := provider.Embed(context.Background(), "hello")
+			if len(tt.wantErrPart) > 0 {
+				if err == nil {
+					t.Fatalf("Embed() error = nil, want error containing %q", tt.wantErrPart)
+				}
+				for _, part := range tt.wantErrPart {
+					if !strings.Contains(err.Error(), part) {
+						t.Fatalf("Embed() error = %v, want substring %q", err, part)
+					}
+				}
+				if embedding != nil {
+					t.Fatalf("Embed() embedding = %v, want nil on rejected conversion", embedding)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Embed() error = %v", err)
+			}
+			if !slices.Equal(embedding, tt.want) {
+				t.Fatalf("Embed() embedding = %v, want %v", embedding, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatibleProviderRejectsTrailingResponseData(t *testing.T) {
+	const validResponse = `{"data":[{"index":0,"embedding":[0.1,0.2]}]}`
+
+	tests := []struct {
+		name        string
+		body        string
+		wantErrPart string
+	}{
+		{name: "valid response", body: validResponse},
+		{name: "valid response with trailing newline", body: validResponse + "\n"},
+		{name: "valid response with trailing whitespace", body: validResponse + " \t\r\n"},
+		{name: "trailing garbage", body: validResponse + "garbage", wantErrPart: "unexpected trailing data"},
+		{name: "second json object", body: validResponse + `{"data":[]}`, wantErrPart: "unexpected second JSON value"},
+		{name: "second json object without whitespace", body: validResponse + "{}", wantErrPart: "unexpected second JSON value"},
+		{name: "second json array", body: validResponse + "\n[]", wantErrPart: "unexpected second JSON value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			provider := newTestOpenAIProvider(t, OpenAICompatibleConfig{
+				BaseURL:           server.URL,
+				Model:             "embedding-model",
+				ExpectedDimension: 2,
+			})
+
+			embedding, err := provider.Embed(context.Background(), "hello")
+			if tt.wantErrPart != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+					t.Fatalf("Embed() error = %v, want error containing %q", err, tt.wantErrPart)
+				}
+				if embedding != nil {
+					t.Fatalf("Embed() embedding = %v, want nil on rejected response", embedding)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Embed() error = %v", err)
+			}
+			if want := []float32{0.1, 0.2}; !slices.Equal(embedding, want) {
+				t.Fatalf("Embed() embedding = %v, want %v", embedding, want)
+			}
+		})
+	}
+}
+
 func TestNewOpenAICompatibleProviderValidatesConfig(t *testing.T) {
 	cases := []OpenAICompatibleConfig{
 		{Model: "embedding-model"},
 		{BaseURL: "localhost:8000", Model: "embedding-model"},
 		{BaseURL: "http://localhost:8000", Dimensions: 2, ExpectedDimension: 3},
+		{BaseURL: "http://localhost:8000", Model: "embedding-model", MaxResponseBytes: -1},
 		{BaseURL: "http://localhost:8000"},
 	}
 	for _, cfg := range cases {
 		if _, err := NewOpenAICompatibleProvider(cfg); err == nil {
 			t.Fatalf("NewOpenAICompatibleProvider(%+v) returned nil error", cfg)
 		}
+	}
+}
+
+func TestOpenAICompatibleProviderHonorsFractionalTimeout(t *testing.T) {
+	provider := newTestOpenAIProvider(t, OpenAICompatibleConfig{
+		BaseURL:        "http://localhost:8000",
+		Model:          "embedding-model",
+		TimeoutSeconds: 0.8,
+	})
+	if provider.timeout != 800*time.Millisecond {
+		t.Fatalf("timeout = %v, want 800ms", provider.timeout)
 	}
 }
 

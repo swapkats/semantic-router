@@ -30,14 +30,16 @@ spec:
     # RHOAI 3 KServe InferenceServices
     - name: llama3-8b
       model: llama3-8b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: kserve
         inferenceServiceName: llama-3-8b
 
     - name: qwen2-5-7b
       model: qwen2.5-7b
-      reasoningFamily: qwen3
+      reasoning:
+        family: qwen3
       backend:
         type: kserve
         inferenceServiceName: qwen-2-5-7b
@@ -45,7 +47,8 @@ spec:
   # ====================
   # Service Configuration
   # ====================
-  # Route points to Service API port (8080)
+  # The Route points to the Router's inference listener, Service port 8801
+  # (http-8801). Port 8080 serves the management API inside the Pod only.
   service:
     type: ClusterIP
     api:
@@ -76,47 +79,23 @@ spec:
       memory: 3Gi
     limits:
       cpu: 3000m
-      memory: 6Gi
+      memory: 12Gi
 
   # ====================
   # Semantic Router Configuration
   # ====================
   config:
     # Semantic cache for better performance
-    semantic_cache:
+    response_cache:
       enabled: true
       similarity_threshold: "0.85"
       max_entries: 5000
       ttl_seconds: 3600
       eviction_policy: lru
 
-    # Tools auto-selection
-    tools:
-      enabled: true
-      top_k: 3
-      similarity_threshold: "0.2"
-
-    # Prompt guard (jailbreak detection)
-    prompt_guard:
-      enabled: true
-      threshold: "0.7"
-
-    # Classifiers
-    classifier:
-      category_model:
-        threshold: "0.5"
-        use_cpu: true
-      pii_model:
-        threshold: "0.7"
-        use_cpu: true
 
     # Reasoning configuration
-    reasoning_families:
-      qwen3:
-        type: chat_template_kwargs
-        parameter: enable_thinking
-
-    default_reasoning_effort: medium
+    reasoning_effort: medium
 
   # ====================
   # Tools Database
@@ -154,24 +133,20 @@ spec:
   # ====================
   # Health Probes
   # ====================
+  # ProbeSpec only accepts timing/enable fields. The operator always probes
+  # TCP on the gRPC port; httpGet/path/port are not CR fields.
   startupProbe:
-    httpGet:
-      path: /health
-      port: 8080
+    enabled: true
     initialDelaySeconds: 10
     periodSeconds: 5
     failureThreshold: 30
 
   livenessProbe:
-    httpGet:
-      path: /health
-      port: 8080
+    enabled: true
     periodSeconds: 10
 
   readinessProbe:
-    httpGet:
-      path: /ready
-      port: 8080
+    enabled: true
     periodSeconds: 5
 
   # ====================

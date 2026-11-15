@@ -1,25 +1,82 @@
-//go:build !windows && cgo
+//go:build !windows
 
 package apiserver
 
 import (
+	"sync"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/admission"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/cache"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/contextcompression"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/memory"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelinventory"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/publicmodels"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerruntime"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/startupstatus"
 )
 
 // ClassificationAPIServer holds the server state and dependencies
 type ClassificationAPIServer struct {
-	classificationSvc     classificationService
-	config                *config.RouterConfig
-	runtimeConfig         *liveRuntimeConfig
-	runtimeRegistry       *routerruntime.Registry
-	configPath            string // path to the router config file (for read/update/rollback)
-	memoryStore           memory.Store
-	knowledgeBaseMapCache *knowledgeBaseMapCache
-	startupStateLoader    func() *startupstatus.State
+	classificationSvc    classificationService
+	previewAdmissionOnce sync.Once
+	previewAdmission     admission.Admissioner
+	configMu             sync.RWMutex
+	config               *config.RouterConfig
+	runtimeConfig        *liveRuntimeConfig
+	runtimeRegistry      *routerruntime.Registry
+	configPath           string // path to the router config file (for read/update/rollback)
+	gatewayMode          config.GatewayMode
+	memoryStore          memory.Store
+	startupStateLoader   func() *startupstatus.State
+	// The startup-status writer is created once during process bootstrap. Keep
+	// its storage contract stable across live config swaps so /ready does not
+	// start reading from a different backend after a successful reload.
+	startupStatusConfig     *config.StartupStatusConfig
+	responseCache           *cache.ResponseCacheService
+	contextCompression      *contextcompression.Service
+	compressionRecovery     contextcompression.RecoveryStore
+	managementAuditMu       sync.Mutex
+	managementAuditEntries  []managementAuditEntry
+	managementAuditLastHash string
+	managementAuditSequence uint64
+	// learningOutcomePolicy gates POST /api/v1/observability/outcomes (idempotency + rate limit).
+	learningOutcomePolicyOnce sync.Once
+	learningOutcomePolicy     *learningOutcomeIngestPolicy
+}
+
+func (s *ClassificationAPIServer) currentContextCompression() (
+	*contextcompression.Service,
+	contextcompression.RecoveryStore,
+	func(),
+) {
+	if s == nil {
+		return nil, nil, func() {}
+	}
+	if s.runtimeRegistry != nil {
+		service, recovery, release := s.runtimeRegistry.AcquireContextCompression()
+		if service != nil {
+			return service, recovery, release
+		}
+		release()
+		return nil, nil, func() {}
+	}
+	return s.contextCompression, s.compressionRecovery, func() {}
+}
+
+func (s *ClassificationAPIServer) currentResponseCache() (*cache.ResponseCacheService, func()) {
+	if s == nil {
+		return nil, func() {}
+	}
+	if s.runtimeRegistry != nil {
+		if service, release := s.runtimeRegistry.AcquireResponseCache(); service != nil {
+			return service, release
+		} else {
+			release()
+		}
+		return nil, func() {}
+	}
+	return s.responseCache, func() {}
 }
 
 type (
@@ -28,29 +85,15 @@ type (
 	ModelInfo          = modelinventory.ModelInfo
 	ModelRegistryInfo  = config.ModelRegistryInfo
 	SystemInfo         = modelinventory.SystemInfo
+	OpenAIModel        = publicmodels.OpenAIModel
+	OpenAIModelList    = publicmodels.OpenAIModelList
 )
-
-// OpenAIModel represents a single model in the OpenAI /v1/models response
-type OpenAIModel struct {
-	ID          string `json:"id"`
-	Object      string `json:"object"`
-	Created     int64  `json:"created"`
-	OwnedBy     string `json:"owned_by"`
-	Description string `json:"description,omitempty"` // Optional description for Chat UI
-	LogoURL     string `json:"logo_url,omitempty"`    // Optional logo URL for Chat UI
-	// Keeping the structure minimal; additional fields like permissions can be added later
-}
-
-// OpenAIModelList is the container for the models list response
-type OpenAIModelList struct {
-	Object string        `json:"object"`
-	Data   []OpenAIModel `json:"data"`
-}
 
 // BatchClassificationRequest represents a batch classification request
 type BatchClassificationRequest struct {
+	Recipe   string                 `json:"recipe,omitempty"`
 	Texts    []string               `json:"texts"`
-	TaskType string                 `json:"task_type,omitempty"` // "intent", "pii", "security", or "all"
+	TaskType string                 `json:"task_type,omitempty"` // "intent" (default), "pii", "security", or "all" (intent fields plus pii and security objects)
 	Options  *ClassificationOptions `json:"options,omitempty"`
 }
 
@@ -60,10 +103,34 @@ type BatchClassificationResult struct {
 	Confidence       float64            `json:"confidence"`
 	ProcessingTimeMs int64              `json:"processing_time_ms"`
 	Probabilities    map[string]float64 `json:"probabilities,omitempty"`
+	// PII and Security are only set for task_type "all".
+	PII      *BatchPIIResult      `json:"pii,omitempty"`
+	Security *BatchSecurityResult `json:"security,omitempty"`
+}
+
+// BatchPIIResult is the PII detection outcome for one text in an "all" batch.
+// Confidence is null when the model did not report scores, mirroring the
+// encoding of classification.PIIResult.
+type BatchPIIResult struct {
+	HasPII          bool     `json:"has_pii"`
+	PIITypes        []string `json:"pii_types,omitempty"`
+	Confidence      *float32 `json:"confidence"`
+	ScoresAvailable *bool    `json:"scores_available,omitempty"`
+}
+
+// BatchSecurityResult is the jailbreak detection outcome for one text in an
+// "all" batch. Confidence is null when the model did not report scores,
+// mirroring the encoding of classification.SecurityResult.
+type BatchSecurityResult struct {
+	IsJailbreak     bool     `json:"is_jailbreak"`
+	ThreatType      string   `json:"threat_type"`
+	Confidence      *float32 `json:"confidence"`
+	ScoresAvailable *bool    `json:"scores_available,omitempty"`
 }
 
 // BatchClassificationResponse represents the response from batch classification
 type BatchClassificationResponse struct {
+	Recipe           string                           `json:"recipe,omitempty"`
 	Results          []BatchClassificationResult      `json:"results"`
 	TotalCount       int                              `json:"total_count"`
 	ProcessingTimeMs int64                            `json:"processing_time_ms"`
@@ -84,84 +151,14 @@ type ClassificationOptions struct {
 	IncludeExplanation  bool    `json:"include_explanation,omitempty"`
 }
 
-// EmbeddingRequest represents a request for embedding generation
-type EmbeddingRequest struct {
-	Texts           []string `json:"texts"`
-	Model           string   `json:"model,omitempty"`            // "auto" (default), "qwen3", "gemma", "mmbert"
-	Dimension       int      `json:"dimension,omitempty"`        // Target dimension: 768 (default), 512, 256, 128, 64
-	TargetLayer     int      `json:"target_layer,omitempty"`     // Target layer for early exit (mmbert only): 3, 6, 11, 22 (0=full)
-	QualityPriority float32  `json:"quality_priority,omitempty"` // 0.0-1.0, default 0.5 (only used when model="auto")
-	LatencyPriority float32  `json:"latency_priority,omitempty"` // 0.0-1.0, default 0.5 (only used when model="auto")
-	SequenceLength  int      `json:"sequence_length,omitempty"`  // Optional, auto-detected if not provided
-}
-
-// EmbeddingResult represents a single embedding result
-type EmbeddingResult struct {
-	Text             string    `json:"text"`
-	Embedding        []float32 `json:"embedding"`
-	Dimension        int       `json:"dimension"`
-	ModelUsed        string    `json:"model_used"`
-	ProcessingTimeMs int64     `json:"processing_time_ms"`
-}
-
-// EmbeddingResponse represents the response from embedding generation
-type EmbeddingResponse struct {
-	Embeddings            []EmbeddingResult `json:"embeddings"`
-	TotalCount            int               `json:"total_count"`
-	TotalProcessingTimeMs int64             `json:"total_processing_time_ms"`
-	AvgProcessingTimeMs   float64           `json:"avg_processing_time_ms"`
-}
-
-// SimilarityRequest represents a request to calculate similarity between two texts
-type SimilarityRequest struct {
-	Text1           string  `json:"text1"`
-	Text2           string  `json:"text2"`
-	Model           string  `json:"model,omitempty"`            // "auto" (default), "qwen3", "gemma", "mmbert"
-	Dimension       int     `json:"dimension,omitempty"`        // Target dimension: 768 (default), 512, 256, 128, 64
-	TargetLayer     int     `json:"target_layer,omitempty"`     // Target layer for early exit (mmbert only): 3, 6, 11, 22 (0=full)
-	QualityPriority float32 `json:"quality_priority,omitempty"` // 0.0-1.0, only for "auto" model
-	LatencyPriority float32 `json:"latency_priority,omitempty"` // 0.0-1.0, only for "auto" model
-}
-
-// SimilarityResponse represents the response of a similarity calculation
-type SimilarityResponse struct {
-	ModelUsed        string  `json:"model_used"`         // "qwen3", "gemma", or "unknown"
-	Similarity       float32 `json:"similarity"`         // Cosine similarity score (-1.0 to 1.0)
-	ProcessingTimeMs float32 `json:"processing_time_ms"` // Processing time in milliseconds
-}
-
-// BatchSimilarityRequest represents a request to find top-k similar candidates for a query
-type BatchSimilarityRequest struct {
-	Query           string   `json:"query"`                      // Query text
-	Candidates      []string `json:"candidates"`                 // Array of candidate texts
-	TopK            int      `json:"top_k,omitempty"`            // Max number of matches to return (0 = return all)
-	Model           string   `json:"model,omitempty"`            // "auto" (default), "qwen3", "gemma", "mmbert"
-	Dimension       int      `json:"dimension,omitempty"`        // Target dimension: 768 (default), 512, 256, 128, 64
-	TargetLayer     int      `json:"target_layer,omitempty"`     // Target layer for early exit (mmbert only): 3, 6, 11, 22 (0=full)
-	QualityPriority float32  `json:"quality_priority,omitempty"` // 0.0-1.0, only for "auto" model
-	LatencyPriority float32  `json:"latency_priority,omitempty"` // 0.0-1.0, only for "auto" model
-}
-
-// BatchSimilarityMatch represents a single match in batch similarity matching
-type BatchSimilarityMatch struct {
-	Index      int     `json:"index"`      // Index of the candidate in the input array
-	Similarity float32 `json:"similarity"` // Cosine similarity score
-	Text       string  `json:"text"`       // The matched candidate text
-}
-
-// BatchSimilarityResponse represents the response of batch similarity matching
-type BatchSimilarityResponse struct {
-	Matches          []BatchSimilarityMatch `json:"matches"`            // Top-k matches, sorted by similarity (descending)
-	TotalCandidates  int                    `json:"total_candidates"`   // Total number of candidates processed
-	ModelUsed        string                 `json:"model_used"`         // "qwen3", "gemma", or "unknown"
-	ProcessingTimeMs float32                `json:"processing_time_ms"` // Processing time in milliseconds
-}
-
 // EndpointInfo represents information about an API endpoint
 type EndpointInfo struct {
-	Path        string `json:"path"`
-	Method      string `json:"method"`
-	Description string `json:"description"`
+	Path        string           `json:"path"`
+	Method      string           `json:"method"`
+	Description string           `json:"description"`
+	Permission  RoutePermission  `json:"permission"`
+	Sensitivity RouteSensitivity `json:"sensitivity"`
+	EndpointContract
 }
 
 // TaskTypeInfo represents information about a task type
@@ -175,4 +172,6 @@ type EndpointMetadata struct {
 	Path        string
 	Method      string
 	Description string
+	Parameters  []OpenAPIParameter
+	EndpointContract
 }

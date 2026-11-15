@@ -23,7 +23,7 @@ func TestWorkflowsDynamicExecutesPlannerBoundedWorkersAndSynthesis(t *testing.T)
 	defer server.Close()
 
 	req := workflowTestRequest()
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: req,
 		ModelRefs: []config.ModelRef{
 			{Model: "worker-a"},
@@ -70,7 +70,7 @@ func TestWorkflowsDynamicPlannerStripsToolAndFunctionSchemas(t *testing.T) {
 	server := newWorkflowToolSchemaServer(t)
 	defer server.Close()
 
-	_, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	_, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowMixedToolSchemasTestRequest(),
 		ModelRefs:       []config.ModelRef{{Model: "worker-a"}},
 		Algorithm: &config.AlgorithmConfig{
@@ -111,7 +111,7 @@ func TestWorkflowsDynamicUsesPlannerTokenBudgetSeparately(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	_, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs:       []config.ModelRef{{Model: "worker-a"}},
 		Algorithm: &config.AlgorithmConfig{
@@ -153,7 +153,7 @@ func TestWorkflowsDynamicUsesConfiguredFinalModel(t *testing.T) {
 	})
 	defer server.Close()
 
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs: []config.ModelRef{
 			{Model: "worker-a"},
@@ -211,11 +211,12 @@ func TestWorkflowsParallelStepReturnsAfterQuorum(t *testing.T) {
 	defer server.Close()
 
 	start := time.Now()
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs:       []config.ModelRef{{Model: "worker-a"}, {Model: "worker-b"}},
 		Algorithm: &config.AlgorithmConfig{
-			Type: "workflows",
+			Type:    "workflows",
+			OnError: config.WorkflowOnErrorSkip,
 			Workflows: &config.WorkflowsAlgorithmConfig{
 				Mode: config.WorkflowModeDynamic,
 				Planner: config.WorkflowPlannerConfig{
@@ -226,7 +227,6 @@ func TestWorkflowsParallelStepReturnsAfterQuorum(t *testing.T) {
 				MaxParallel:            2,
 				RoundTimeoutSeconds:    1,
 				MinSuccessfulResponses: 1,
-				OnError:                config.WorkflowOnErrorSkip,
 			},
 		},
 		DecisionName: "flow-quorum-test",
@@ -264,13 +264,14 @@ func TestWorkflowsFinalTimeoutFallsBackToWorkerResponse(t *testing.T) {
 	req.Messages = []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("Answer the multiple choice question with exactly one letter: A, B, C, or D."),
 	}
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest:    req,
 		OutputContract:     singleChoiceOutputContractForTest(),
 		OutputContractSpec: singleChoiceOutputContractSpecForTest(),
 		ModelRefs:          []config.ModelRef{{Model: "worker-a"}, {Model: "gpt-final"}},
 		Algorithm: &config.AlgorithmConfig{
-			Type: "workflows",
+			Type:    "workflows",
+			OnError: config.WorkflowOnErrorSkip,
 			Workflows: &config.WorkflowsAlgorithmConfig{
 				Mode: config.WorkflowModeDynamic,
 				Planner: config.WorkflowPlannerConfig{
@@ -279,7 +280,6 @@ func TestWorkflowsFinalTimeoutFallsBackToWorkerResponse(t *testing.T) {
 				MaxSteps:            2,
 				MaxParallel:         1,
 				RoundTimeoutSeconds: 1,
-				OnError:             config.WorkflowOnErrorSkip,
 			},
 		},
 		DecisionName: "flow-final-timeout-test",
@@ -318,7 +318,7 @@ func TestWorkflowsFinalTimeoutUsesSingleChoiceMajorityFallback(t *testing.T) {
 	req.Messages = []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("Answer the multiple choice question with exactly one letter: A, B, C, or D."),
 	}
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest:    req,
 		OutputContract:     singleChoiceOutputContractForTest(),
 		OutputContractSpec: singleChoiceOutputContractSpecForTest(),
@@ -329,7 +329,8 @@ func TestWorkflowsFinalTimeoutUsesSingleChoiceMajorityFallback(t *testing.T) {
 			{Model: "gpt-final"},
 		},
 		Algorithm: &config.AlgorithmConfig{
-			Type: "workflows",
+			Type:    "workflows",
+			OnError: config.WorkflowOnErrorSkip,
 			Workflows: &config.WorkflowsAlgorithmConfig{
 				Mode: config.WorkflowModeDynamic,
 				Planner: config.WorkflowPlannerConfig{
@@ -339,7 +340,6 @@ func TestWorkflowsFinalTimeoutUsesSingleChoiceMajorityFallback(t *testing.T) {
 				MaxParallel:            3,
 				RoundTimeoutSeconds:    1,
 				MinSuccessfulResponses: 3,
-				OnError:                config.WorkflowOnErrorSkip,
 			},
 		},
 		DecisionName: "flow-final-timeout-majority-test",
@@ -364,7 +364,7 @@ func TestWorkflowsStaticExecutesConfiguredRoles(t *testing.T) {
 	defer server.Close()
 
 	includeTrace := true
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs: []config.ModelRef{
 			{Model: "thinker-model"},
@@ -417,7 +417,7 @@ func TestWorkflowsDynamicRejectsPlannerModelOutsideModelRefs(t *testing.T) {
 	})
 	defer server.Close()
 
-	_, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	_, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs:       []config.ModelRef{{Model: "worker-a"}},
 		Algorithm: &config.AlgorithmConfig{
@@ -446,14 +446,15 @@ func TestWorkflowsDynamicFallsBackWhenPlannerJSONInvalidAndOnErrorSkip(t *testin
 	})
 	defer server.Close()
 
-	resp, err := NewWorkflowsLooper(&config.LooperConfig{Endpoint: server.URL}).Execute(context.Background(), &Request{
+	resp, err := workflowsHopsTo(server.URL).Execute(context.Background(), &Request{
 		OriginalRequest: workflowTestRequest(),
 		ModelRefs: []config.ModelRef{
 			{Model: "worker-a"},
 			{Model: "worker-b"},
 		},
 		Algorithm: &config.AlgorithmConfig{
-			Type: "workflows",
+			Type:    "workflows",
+			OnError: config.WorkflowOnErrorSkip,
 			Workflows: &config.WorkflowsAlgorithmConfig{
 				Mode: config.WorkflowModeDynamic,
 				Planner: config.WorkflowPlannerConfig{
@@ -461,7 +462,6 @@ func TestWorkflowsDynamicFallsBackWhenPlannerJSONInvalidAndOnErrorSkip(t *testin
 				},
 				MaxSteps:    3,
 				MaxParallel: 2,
-				OnError:     config.WorkflowOnErrorSkip,
 			},
 		},
 		DecisionName: "flow-test",
@@ -536,9 +536,9 @@ func TestParseWorkflowPlanRepairsInvalidStringEscapes(t *testing.T) {
 	}
 }
 
-func TestConfigureWorkflowPlannerRequestDisablesQwenThinking(t *testing.T) {
+func TestConfigureWorkflowPlannerRequestOnlySetsProtocolContract(t *testing.T) {
 	req := workflowTestRequest()
-	configureWorkflowPlannerRequest(req, "qwen/qwen3.6-rocm")
+	configureWorkflowPlannerRequest(req)
 	body, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal planner request: %v", err)
@@ -546,44 +546,21 @@ func TestConfigureWorkflowPlannerRequestDisablesQwenThinking(t *testing.T) {
 	if !strings.Contains(string(body), `"response_format":{"type":"json_object"}`) {
 		t.Fatalf("planner request missing JSON response format: %s", string(body))
 	}
-	if !strings.Contains(string(body), `"chat_template_kwargs":{"enable_thinking":false}`) {
-		t.Fatalf("planner request missing Qwen thinking control: %s", string(body))
+	if strings.Contains(string(body), `chat_template_kwargs`) {
+		t.Fatalf("planner request must not guess a provider reasoning dialect: %s", string(body))
 	}
 }
 
 func TestStripFusionToolUsePreservesPlannerExtraFields(t *testing.T) {
 	req := workflowTestRequest()
-	configureWorkflowPlannerRequest(req, "qwen/qwen3.6-rocm")
+	req.SetExtraFields(map[string]any{"provider_hint": "keep"})
 	stripped := stripFusionToolUse(req)
 	body, err := json.Marshal(stripped)
 	if err != nil {
 		t.Fatalf("marshal stripped request: %v", err)
 	}
-	if !strings.Contains(string(body), `"chat_template_kwargs":{"enable_thinking":false}`) {
+	if !strings.Contains(string(body), `"provider_hint":"keep"`) {
 		t.Fatalf("planner extra fields were not preserved: %s", string(body))
-	}
-}
-
-func TestApplyWorkflowModelReasoningControlUsesModelParamsFamily(t *testing.T) {
-	useReasoning := false
-	req := workflowTestRequest()
-	applyWorkflowModelReasoningControl(req, "worker-alias", &Request{
-		ModelRefs: []config.ModelRef{{
-			Model: "worker-alias",
-			ModelReasoningControl: config.ModelReasoningControl{
-				UseReasoning: &useReasoning,
-			},
-		}},
-		ModelParams: map[string]config.ModelParams{
-			"worker-alias": {ReasoningFamily: "qwen3"},
-		},
-	})
-	body, err := json.Marshal(req)
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	if !strings.Contains(string(body), `"chat_template_kwargs":{"enable_thinking":false}`) {
-		t.Fatalf("model reasoning control was not applied: %s", string(body))
 	}
 }
 
@@ -1092,6 +1069,28 @@ func TestValidateWorkflowPlanRejectsFutureAccessList(t *testing.T) {
 	err := validateWorkflowPlan(plan, []string{"worker-a"}, workflowsExecutionConfig{MaxSteps: 3, MaxParallel: 1})
 	if err == nil || !strings.Contains(err.Error(), "unknown or future step") {
 		t.Fatalf("expected future access_list error, got %v", err)
+	}
+}
+
+func TestValidateWorkflowPlanRejectsStepBelowConfiguredQuorum(t *testing.T) {
+	plan := &workflowPlan{Steps: []workflowPlanStep{{
+		ID:     "solve",
+		Models: []string{"worker-a"},
+		Prompt: "solve",
+	}}}
+	err := validateWorkflowPlan(
+		plan,
+		[]string{"worker-a", "worker-b"},
+		workflowsExecutionConfig{MaxSteps: 3, MaxParallel: 2, MinSuccessfulResponses: 2},
+	)
+	if err == nil || !strings.Contains(err.Error(), "fewer than min_successful_responses=2") {
+		t.Fatalf("expected workflow quorum error, got %v", err)
+	}
+}
+
+func TestWorkflowRoundMinSuccessfulDoesNotClampImpossibleQuorum(t *testing.T) {
+	if got := workflowRoundMinSuccessful(2, 3); got != 3 {
+		t.Fatalf("minimum successful responses = %d, want configured value 3", got)
 	}
 }
 

@@ -1,0 +1,366 @@
+"""Turning one `serve` request into the config the target will actually run.
+
+Both halves of that job live here. The local Docker half takes the runtime
+config lock, finishes any Recipe activation the last run left pending, and
+materializes this stack's active config under its private state root; the
+Kubernetes half deliberately keeps its translation in memory so a target-neutral
+transform never lands in the local active config path. Before replacing an
+existing Docker config, preparation stops its old consumers so the restart
+cannot also trigger a reload in the departing process.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+
+import yaml
+
+from cli import router_validation
+from cli.bootstrap import is_setup_mode_config
+from cli.commands.runtime_mode_config import apply_instance_options
+from cli.commands.runtime_observability import (
+    reconcile_runtime_tracing,
+    recover_runtime_tracing_projection,
+    validate_package_tracing_mode,
+)
+from cli.commands.runtime_paths import (
+    _runtime_config_output_path,
+    _same_document,
+    materialize_runtime_config,
+    recover_pending_runtime_config_projection,
+    resolve_state_root_dir,
+    write_journaled_runtime_config_projection,
+)
+from cli.commands.runtime_support import (
+    build_effective_config_bytes,
+    build_effective_config_document,
+    validate_config_recipe_env_bindings,
+    validate_setup_mode_flags,
+)
+from cli.commands.validate import ask_router, router_refusal
+from cli.container_images import pulled_this_run
+from cli.container_services import container_status_strict
+from cli.decision_model import (
+    decision_model_deployment,
+    gpu_requirement_error,
+    remote_decision_model,
+)
+from cli.gateway_mode import GATEWAY_ENV, resolve_gateway
+from cli.parser import parse_user_config
+from cli.recipe_activation_recovery import (
+    active_recipe_package_config_path,
+    active_recipe_package_for_stack,
+    recover_pending_recipe_activation_for_stack,
+)
+from cli.runtime_config_lock import acquire_runtime_config_lock
+from cli.runtime_lifecycle import stop_runtime_before_config_replacement
+from cli.runtime_stack import RuntimeStackLayout, resolve_runtime_stack
+from cli.utils import get_logger
+from cli.validator import validate_user_config
+
+log = get_logger(__name__)
+
+
+def _prepare_runtime_config_replacement(
+    effective_data: bytes,
+    stack_layout: RuntimeStackLayout,
+    *,
+    minimal: bool,
+    readonly: bool,
+    served_image: Callable[[], str],
+    models_dir: Path | None = None,
+) -> None:
+    # Validate the candidate without publishing it to the running file watcher.
+    # A restart owns the next generation; the departing process must not build it.
+    with tempfile.TemporaryDirectory(prefix="vllm-sr-config-") as directory:
+        candidate = Path(directory) / "config.yaml"
+        candidate.write_bytes(effective_data)
+        prepared = parse_user_config(str(candidate), log_summary=False)
+        errors = validate_user_config(prepared, log_summary=False)
+        if not errors and not is_setup_mode_config(candidate):
+            errors = _router_refusal(candidate, models_dir, served_image)
+        if errors:
+            raise ValueError("Invalid runtime config: " + "; ".join(map(str, errors)))
+        validate_setup_mode_flags(is_setup_mode_config(candidate), minimal, readonly)
+    stop_runtime_before_config_replacement(stack_layout)
+
+
+def _router_refusal(
+    candidate: Path, models_dir: Path | None, served_image: Callable[[], str]
+) -> list:
+    """Why the Router this serve starts would refuse the candidate, if it would.
+
+    The running config is only replaced by one the Router loads: its model
+    deployments, bindings and other load-time rules are the Router's to
+    check, and the image that checks them is the one this serve runs. When it
+    cannot run here the restart goes ahead, and the new Router refuses a bad
+    config at startup.
+    """
+
+    try:
+        image = served_image()
+    except router_validation.RouterValidationUnavailableError as error:
+        image, verdict, unavailable = "", None, str(error)
+    else:
+        verdict, unavailable = ask_router(
+            lambda: router_validation.validate_with_image(
+                candidate,
+                image,
+                gateway=resolve_gateway(os.getenv(GATEWAY_ENV)),
+                models_dir=models_dir,
+            )
+        )
+    if unavailable:
+        log.info(
+            f"The Router did not check the new config before the restart: {unavailable}"
+        )
+    return router_refusal(verdict, pulled=pulled_this_run(image))
+
+
+def _check_served_decision_model(
+    document: dict | None, platform: str | None, *, local_host: bool
+) -> None:
+    """Fail before startup when the config's decision model needs a GPU it lacks."""
+
+    if remote_decision_model(document):
+        return
+    try:
+        deployment = decision_model_deployment(document)
+    except ValueError as error:
+        raise ValueError(f"global.model_catalog.system.{error}") from error
+    error = gpu_requirement_error(
+        deployment, (platform or "").strip().lower(), local_host=local_host
+    )
+    if error:
+        raise ValueError(error)
+
+
+def _prepare_docker_runtime_config(
+    config_path: Path,
+    algorithm: str | None,
+    source_setup_mode: bool,
+    platform: str | None,
+    recipe_env_bindings: tuple[str, ...],
+    replace_active_config: bool,
+    *,
+    minimal: bool = False,
+    readonly: bool = False,
+    engine: bool = False,
+    available_devices: tuple[int, ...] = (),
+    model_options: dict | None = None,
+    observability: bool | None = None,
+    image: str | None = None,
+    router_image: str | None = None,
+    image_pull_policy: str | None = None,
+):
+    if observability is None:
+        observability = not minimal
+
+    def served_image() -> str:
+        return router_validation.served_router_image(
+            image=image,
+            router_image=router_image,
+            platform=platform,
+            pull_policy=image_pull_policy,
+        )
+
+    stack_layout = resolve_runtime_stack()
+    state_root_dir = Path(resolve_state_root_dir(str(config_path)))
+    effective_config_path = _runtime_config_output_path(
+        config_path,
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+    )
+    runtime_lock = acquire_runtime_config_lock(
+        runtime_config_path=effective_config_path,
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+        timeout_seconds=0,
+    )
+    try:
+        recover_pending_runtime_config_projection(effective_config_path)
+        recover_pending_recipe_activation_for_stack(
+            runtime_config_path=effective_config_path,
+            state_root_dir=state_root_dir,
+            stack_name=stack_layout.stack_name,
+            managed_container_names=stack_layout.runtime_container_names,
+            status_provider=container_status_strict,
+        )
+        package_active = active_recipe_package_for_stack(
+            state_root_dir=state_root_dir, stack_name=stack_layout.stack_name
+        )
+        source_candidate_selected = False
+        if package_active:
+            if replace_active_config:
+                raise ValueError(
+                    "--replace-active-config cannot replace an active Recipe "
+                    "package; change or deactivate that package through the "
+                    "Recipe workflow first"
+                )
+            # Authorize against what the package declares, not against what
+            # the CLI materialized. The runtime config also carries the CLI's
+            # own references -- this stack's generated storage credentials --
+            # which use reserved names an operator can neither bind nor need
+            # to. The package's immutable config.yaml is the authorization
+            # surface; validating the realized document would reject the
+            # CLI's own output. Falling back keeps the stricter superset when
+            # the authored file cannot be resolved.
+            validate_config_recipe_env_bindings(
+                active_recipe_package_config_path(
+                    state_root_dir=state_root_dir,
+                    stack_name=stack_layout.stack_name,
+                )
+                or effective_config_path,
+                recipe_env_bindings,
+            )
+            validate_package_tracing_mode(
+                effective_config_path, stack_layout, minimal=not observability
+            )
+        else:
+            recover_runtime_tracing_projection(effective_config_path)
+            effective_config_bytes = build_effective_config_bytes(
+                config_path, algorithm, source_setup_mode
+            )
+            effective_config_path = materialize_runtime_config(
+                config_path,
+                effective_config_bytes,
+                state_root_dir=state_root_dir,
+                stack_name=stack_layout.stack_name,
+                replace_active=replace_active_config,
+                preserve_unchanged_source=algorithm is None,
+                before_replace=lambda: _prepare_runtime_config_replacement(
+                    effective_config_bytes,
+                    stack_layout,
+                    minimal=minimal,
+                    readonly=readonly,
+                    served_image=served_image,
+                    models_dir=state_root_dir / "models",
+                ),
+            )
+            active_bytes = effective_config_path.read_bytes()
+            source_candidate_selected = active_bytes == effective_config_bytes or (
+                _same_document(active_bytes, effective_config_bytes)
+            )
+        candidate = yaml.safe_load(effective_config_path.read_bytes()) or {}
+        if apply_instance_options(
+            candidate,
+            engine=engine,
+            platform=platform or "cpu",
+            available_devices=available_devices,
+            model_options=model_options,
+        ):
+            candidate_bytes = yaml.safe_dump(candidate, sort_keys=False).encode("utf-8")
+            _prepare_runtime_config_replacement(
+                candidate_bytes,
+                stack_layout,
+                minimal=minimal,
+                readonly=readonly,
+                served_image=served_image,
+                models_dir=state_root_dir / "models",
+            )
+            write_journaled_runtime_config_projection(
+                effective_config_path, candidate_bytes
+            )
+        setup_mode = is_setup_mode_config(effective_config_path)
+        if not setup_mode:
+            _check_served_decision_model(
+                yaml.safe_load(effective_config_path.read_bytes()),
+                platform,
+                local_host=True,
+            )
+        if not setup_mode and not package_active:
+            reconcile_runtime_tracing(
+                effective_config_path,
+                stack_layout,
+                enable_observability=observability,
+                reset_projection=source_candidate_selected,
+                before_replace=lambda data: _prepare_runtime_config_replacement(
+                    data,
+                    stack_layout,
+                    minimal=minimal,
+                    readonly=readonly,
+                    served_image=served_image,
+                    models_dir=state_root_dir / "models",
+                ),
+            )
+        return effective_config_path, setup_mode, runtime_lock
+    except Exception:
+        runtime_lock.close()
+        raise
+
+
+def _prepare_effective_serve_config(
+    config_path: Path,
+    *,
+    resolved_target: str,
+    algorithm: str | None,
+    source_setup_mode: bool,
+    platform: str | None,
+    recipe_env_bindings: tuple[str, ...],
+    replace_active_config: bool,
+    minimal: bool = False,
+    readonly: bool = False,
+    engine: bool = False,
+    available_devices: tuple[int, ...] = (),
+    model_options: dict | None = None,
+    observability: bool | None = None,
+    image: str | None = None,
+    router_image: str | None = None,
+    image_pull_policy: str | None = None,
+):
+    """Prepare the target-specific active config and its optional runtime lock.
+
+    *minimal* leaves the Dashboard out; *observability* (default: not
+    *minimal*) starts the local tracing and metrics collectors. A Docker
+    config is checked by the Router image *image*, *router_image* and
+    *image_pull_policy* select, as the start does.
+    """
+
+    if resolved_target != "docker" and recipe_env_bindings:
+        raise ValueError(
+            "--recipe-env is supported only for local Docker Recipe packages"
+        )
+    if resolved_target != "docker" and replace_active_config:
+        raise ValueError(
+            "--replace-active-config is supported only for local Docker deployments"
+        )
+    if resolved_target == "docker":
+        effective_path, setup_mode, runtime_lock = _prepare_docker_runtime_config(
+            config_path,
+            algorithm,
+            source_setup_mode,
+            platform,
+            recipe_env_bindings,
+            replace_active_config,
+            minimal=minimal,
+            readonly=readonly,
+            engine=engine,
+            available_devices=available_devices,
+            model_options=model_options,
+            observability=observability,
+            image=image,
+            router_image=router_image,
+            image_pull_policy=image_pull_policy,
+        )
+        return effective_path, setup_mode, runtime_lock, None
+
+    # Kubernetes is an in-memory translation flow. Never publish its target-
+    # neutral transforms into the local Docker/Dashboard active config path.
+    effective_config_document = build_effective_config_document(
+        config_path,
+        algorithm,
+        source_setup_mode,
+        materialize_local_runtime=False,
+    )
+    apply_instance_options(
+        effective_config_document,
+        engine=engine,
+        platform=platform or "cpu",
+        available_devices=available_devices,
+        model_options=model_options,
+    )
+    _check_served_decision_model(effective_config_document, platform, local_host=False)
+    return config_path, source_setup_mode, None, effective_config_document

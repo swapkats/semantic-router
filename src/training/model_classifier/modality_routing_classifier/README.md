@@ -1,127 +1,179 @@
 # Modality Routing Classifier
 
-Trains an mmBERT-32K YaRN model with LoRA to classify user prompt intent into one of three response modalities:
+For the Vela workflow with source-group isolation and expanded output contracts,
+see [Vela Modality repair](VELA_REPAIR.md). This page describes the original
+training pipeline.
 
-| Label | Description | Example |
-|-------|-------------|---------|
-| **AR** | Text-only response (autoregressive LLM) | "What is the capital of France?" |
-| **DIFFUSION** | Image generation (diffusion model) | "A cyberpunk city at night, neon lights" |
-| **BOTH** | Text explanation + image/diagram | "Explain photosynthesis and show a diagram" |
+This pipeline trains a three-class prompt classifier:
 
-## Quick Start
+| Label | Intended response |
+|---|---|
+| `AR` | text |
+| `DIFFUSION` | generated image |
+| `BOTH` | text plus an image or diagram |
+
+The classifier predicts requested output modality, not whether an image model
+is available or whether image generation is safe for the prompt.
+
+## Environment
+
+This directory has its own uv project (`pyproject.toml` and `uv.lock`). Create
+the environment from the lock and run Python through it:
 
 ```bash
-# Basic training (uses template-generated BOTH class)
+uv sync --locked                          # training, evaluation and label_audit
+uv sync --locked --group dev              # also pytest, to run the tests
+uv run --group dev pytest                 # from this directory
+uv run python modality_routing_fixed_split_trainer.py --help
+```
+
+Optional groups: `audit` for the Claude API judge in `label_audit/`, and
+`exploration` for the SCX Router scripts in `exploration_lfm25_scx/`.
+
+On Linux the default `torch` wheel is a CUDA build, so no extra index is needed
+for a GPU host. `requirements.txt` and `requirements-lock.txt` are kept for the
+existing docs. Note that `run_training.sh` below still runs its own unpinned
+`pip install` and does not use this lock yet.
+
+## Train
+
+`run_training.sh` installs its Python packages, builds the dataset, trains an
+mmBERT LoRA adapter, and runs the script's inference demo:
+
+```bash
 bash run_training.sh
-
-# With vLLM synthesis for higher-quality BOTH class data
-VLLM_ENDPOINT=http://localhost:8000/v1 bash run_training.sh
-
-# Custom configuration
-MODEL=mmbert-32k EPOCHS=10 MAX_SAMPLES=10000 bash run_training.sh
 ```
 
-## Export a Fixed Dataset
+Environment variables such as `MODEL`, `EPOCHS`, `BATCH_SIZE`, `MAX_SAMPLES`,
+and `LEARNING_RATE` override its defaults. If `VLLM_ENDPOINT` is set, the script
+can synthesize examples for the `BOTH` class; review those examples before
+using them as labels.
 
-The training script builds modality data dynamically. If you want a reproducible
-dataset artifact for review or Hugging Face upload, export the complete
-`train / validation / test` splits first:
+For direct control:
 
 ```bash
-python src/training/model_classifier/modality_routing_classifier/export_modality_dataset.py \
-  --output-dir ./modality-routing-dataset \
+python modality_routing_bert_finetuning_lora.py \
+  --mode train \
+  --model mmbert-32k \
+  --max-samples 6000 \
+  --output-dir models/modality-router
+```
+
+Use `--help` for current LoRA, GPU, and synthesis options.
+
+## Export a Reviewable Dataset
+
+The exporter writes deterministic train, validation, and test JSONL files,
+label mappings, dataset statistics, export configuration, a dataset card, and a
+Hugging Face `DatasetDict`:
+
+```bash
+python export_modality_dataset.py \
+  --output-dir modality-routing-dataset \
   --max-samples 6000 \
   --overwrite
 ```
 
-With vLLM-generated BOTH examples:
+To add model-generated `BOTH` examples, pass `--vllm-endpoint`,
+`--vllm-model`, and `--synthesize-both`. Publishing with `--push-to-hub`
+requires `--repo-id` and an `HF_TOKEN`.
+
+The training script currently rebuilds and internally splits its dataset,
+whereas the exporter preserves the split returned by `prepare_datasets()`.
+Use the exported split for dataset review and reproducible evaluation.
+
+## Data and Evaluation
+
+The data loader draws text-only prompts from instruction datasets,
+image-generation prompts from DiffusionDB, and mixed-modality prompts from
+curated templates or optional synthesis. Check dataset revisions and class
+balance before every training run.
+
+Report per-class precision and recall, the confusion matrix, multilingual
+coverage, and failure cases such as requests that mention an image without
+asking to create one. Validate the exported adapter through the router's actual
+modality signal path before treating it as supported.
+
+## Same-run Evaluation Harness (#3856)
+
+`same_run_harness.py` and `same_run_pair.py` run a candidate and its baseline
+on the same frozen QSL one prompt at a time, then report latency, peak RSS,
+CPU seconds, and per-row routing output. Pairs are joined on `row_id` and must
+run on the same host.
+
+**Run BERT baseline:**
 
 ```bash
-python src/training/model_classifier/modality_routing_classifier/export_modality_dataset.py \
-  --output-dir ./modality-routing-dataset \
-  --max-samples 6000 \
-  --vllm-endpoint http://localhost:8000/v1 \
-  --vllm-model your-model \
-  --synthesize-both 2000 \
-  --overwrite
+python same_run_harness.py \
+  --qsl exported_modality_routing_dataset/test.jsonl \
+  --model vllm-sr/Vela-1.0-Encoder-307M-Modality \
+  --binding hf \
+  --role baseline \
+  --warmup 20 --max-length 256 --min-duration-s 60 \
+  --output same_run_bert_singlestream.json
 ```
 
-The exporter writes:
-
-- `train.jsonl`, `validation.jsonl`, `test.jsonl`
-- `README.md` dataset card
-- `label_mapping.json`
-- `dataset_stats.json`
-- `export_config.json`
-- `hf_dataset/` via `DatasetDict.save_to_disk()`
-
-These root files are upload-friendly if you want to create a Hugging Face dataset
-repo locally.
-
-To export and upload in one command:
+**Run candidate (e.g. DistilBERT):**
 
 ```bash
-HF_TOKEN=hf_xxx python src/training/model_classifier/modality_routing_classifier/export_modality_dataset.py \
-  --output-dir ./modality-routing-dataset \
-  --max-samples 6000 \
-  --repo-id your-name/modality-routing-dataset \
-  --push-to-hub \
-  --overwrite
+python same_run_harness.py \
+  --qsl exported_modality_routing_dataset/test.jsonl \
+  --model <your-checkpoint> \
+  --binding hf \
+  --role candidate \
+  --warmup 20 --max-length 256 --min-duration-s 60 \
+  --output same_run_distilbert_singlestream.json
 ```
 
-Note: the current training script still uses a legacy flow where it materializes
-the full dataset, merges `train + validation`, and then does an internal `80/20`
-re-split for training. The exporter preserves the original deterministic
-`train / validation / test` split from `prepare_datasets()`.
+**Pair the two runs (same host required):**
 
-## Datasets
+```bash
+python same_run_pair.py \
+  --baseline same_run_bert_singlestream.json \
+  --candidate same_run_distilbert_singlestream.json \
+  --output same_run_paired.json
+```
 
-### DIFFUSION class (image generation intent)
+The pair script exits non-zero and writes no output file if the two runs came
+from different machines (`cpu_model`, `core_count`, or `ram_gb` differ).
 
-- **DiffusionDB** (`poloclub/diffusiondb`): 1.8M unique real Stable Diffusion prompts
-  - ACL 2023 Best Paper Honorable Mention
-  - Real user prompts, not synthetic
+**Run production baseline (`--binding model-runtime`, `vllm-sr/Vela-1.0-Encoder-307M-Modality`):**
 
-### AR class (text-only intent)
+The production path serves models through a standalone HTTP service
+(`vllm-srun`, the model runtime that replaced the in-process native bindings
+in [#4512](https://github.com/vllm-project/semantic-router/pull/4512)).
+Install it once, from the repository root:
 
-- **OASST2** (`OpenAssistant/oasst2`): 135K instruction-following conversations (35+ languages)
-- **Alpaca** (`tatsu-lab/alpaca`): 52K instruction-following examples (Stanford)
-- **Dolly** (`databricks/databricks-dolly-15k`): 15K categorized instructions
+```bash
+pip install ./src/model-runtime
+```
 
-### BOTH class (mixed modality intent)
+Then run the harness — it spawns and manages its own `vllm-srun serve`
+subprocess for the run, and downloads the model from the Hub on first use (no
+token needed, it's public):
 
-- **vLLM Synthesis**: Use `--vllm-endpoint` to generate diverse BOTH prompts via LLM
-- **Seed examples**: 40+ curated examples across diverse domains
-- **Template generation**: Fallback template-based generation
+```bash
+python same_run_harness.py \
+  --qsl exported_modality_routing_dataset/test.jsonl \
+  --model vllm-sr/Vela-1.0-Encoder-307M-Modality \
+  --binding model-runtime \
+  --role baseline \
+  --warmup 20 --max-length 256 --min-duration-s 60 \
+  --output same_run_model_runtime_singlestream.json
+```
 
-## Architecture
+`cpu_s` and `peak_rss_mb` for this binding include the model-runtime
+subprocess's own resource usage, read from `/proc/<pid>` after every request
+(`run.includes_helper_resources: true`), since inference happens in that
+child process over HTTP, not in the Python harness itself.
 
-- **Base model**: mmBERT-32K YaRN (ModernBERT architecture, 32K context, 1800+ languages)
-- **Adaptation**: LoRA (Low-Rank Adaptation) on attention + MLP layers
-- **Target modules**: `attn.Wqkv`, `attn.Wo`, `mlp.Wi`, `mlp.Wo`
-- **Trainable parameters**: ~0.02% of total (99%+ reduction)
+Quality metrics (per-class precision, recall, threshold selection) are defined
+by [#3194](https://github.com/vllm-project/semantic-router/issues/3194). The
+harness emits `records[].label` and `records[].output` per row.
 
-## Training Arguments
+**Unit tests (no real-model download; spins up a tiny local `vllm-srun`
+fixture for the model-runtime adapter):**
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--model` | `mmbert-32k` | Base model |
-| `--lora-rank` | `32` | LoRA rank (capacity) |
-| `--lora-alpha` | `64` | LoRA alpha (2x rank) |
-| `--epochs` | `8` | Training epochs |
-| `--batch-size` | `32` | Batch size |
-| `--learning-rate` | `2e-5` | Learning rate |
-| `--max-samples` | `6000` | Total samples (2000 per class) |
-| `--vllm-endpoint` | None | vLLM endpoint for BOTH synthesis |
-| `--synthesize-both` | `0` | BOTH prompts to synthesize (auto: 2000 if endpoint set) |
-
-## Output
-
-The trained model is saved with:
-
-- `adapter_config.json` - LoRA adapter configuration
-- `adapter_model.safetensors` - LoRA weights
-- `label_mapping.json` - Label ID mapping
-- `modality_mapping.json` - Go/Rust compatibility mapping
-- `lora_config.json` - LoRA hyperparameters
-- `eval_results.json` - Final evaluation metrics
+```bash
+python test_same_run.py
+```

@@ -9,20 +9,64 @@ Provides common utilities for testing CLI commands including:
 Signed-off-by: vLLM-SR Team
 """
 
+import http.client
+import json
 import os
+import secrets
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 import unittest
 from contextlib import suppress
 from pathlib import Path
+from unittest.mock import patch
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import yaml
+from cli.instance_paths import cli_state_directory
+from cli.instance_setup import controller_request
+from cli.runtime_stack import DEFAULT_STACK_NAME, resolve_runtime_stack
 
 HTTP_STATUS_OK = 200
+AGENT_SMOKE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "config.agent-smoke.cpu.yaml"
+)
+CONTAINER_RUNTIME_SOCKETS = (
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+)
+CONTAINER_RUNTIME_CLIS = (
+    "containerd",
+    "crictl",
+    "ctr",
+    "docker",
+    "dockerd",
+    "nerdctl",
+    "podman",
+    "runc",
+)
+
+
+def stack_scoped_test_container_name(stack_name: str, base_name: str) -> str:
+    """Keep test-only containers inside the selected runtime stack namespace."""
+
+    if stack_name == DEFAULT_STACK_NAME:
+        return base_name
+    return f"{stack_name}-{base_name}"
+
+
+# Services whose store backends the CLI provisions locally. They are written
+# out in full rather than left to the canonical defaults: a test that rides on
+# a default is silently retargeted the day that default changes, and these two
+# exist to name Redis and Postgres specifically.
+MANAGED_STORAGE_SERVICES: dict[str, dict[str, object]] = {
+    "response_api": {"enabled": True, "store_backend": "redis"},
+    "router_replay": {"store_backend": "postgres"},
+}
 
 
 def _coerce_timeout_stream(value: str | bytes | None) -> str:
@@ -34,6 +78,15 @@ def _coerce_timeout_stream(value: str | bytes | None) -> str:
     return value
 
 
+def _api_only_global_config() -> dict[str, object]:
+    """Reuse the canonical smoke global block for API-only integration tests."""
+    smoke_config = yaml.safe_load(AGENT_SMOKE_CONFIG_PATH.read_text(encoding="utf-8"))
+    global_config = smoke_config.get("global")
+    if not isinstance(global_config, dict):
+        raise AssertionError(f"{AGENT_SMOKE_CONFIG_PATH} must define a global mapping")
+    return global_config
+
+
 class CLITestBase(unittest.TestCase):
     """Base class for vLLM-SR CLI tests."""
 
@@ -42,12 +95,22 @@ class CLITestBase(unittest.TestCase):
     ROUTER_CONTAINER_NAME = "vllm-sr-router-container"
     ENVOY_CONTAINER_NAME = "vllm-sr-envoy-container"
     DASHBOARD_CONTAINER_NAME = "vllm-sr-dashboard-container"
-    SIM_CONTAINER_NAME = "vllm-sr-sim-container"
+    SR_BENCH_CONTAINER_NAME = "vllm-sr-sr-bench-container"
+    REDIS_CONTAINER_NAME = "vllm-sr-redis"
+    POSTGRES_CONTAINER_NAME = "vllm-sr-postgres"
+    MILVUS_CONTAINER_NAME = "vllm-sr-milvus"
+    NETWORK_NAME = "vllm-sr-network"
+    DATA_NETWORK_NAME = "vllm-sr-data-network"
     AUXILIARY_CONTAINER_NAMES = (
         "vllm-sr-grafana",
         "vllm-sr-prometheus",
         "vllm-sr-jaeger",
     )
+
+    # One-shot container a test drives to probe a network from the inside.
+    # Named rather than anonymous so a probe that outlives its test is still
+    # removed by the class-level cleanup.
+    PROBE_CONTAINER_NAME = "vllm-sr-cli-test-probe"
 
     # Default timeout for CLI commands
     DEFAULT_TIMEOUT = 60
@@ -58,23 +121,81 @@ class CLITestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test class - ensure clean state."""
+        if not os.getenv("VLLM_SR_STACK_NAME", "").strip():
+            # Lifecycle locks and container names are host-wide, not cwd-scoped.
+            # Keep independent test processes away from each other and live stacks.
+            environment = patch.dict(
+                os.environ,
+                {"VLLM_SR_STACK_NAME": f"cli-test-{secrets.token_hex(6)}"},
+            )
+            environment.start()
+            cls.addClassCleanup(environment.stop)
+        cls.runtime_stack = resolve_runtime_stack()
+        stack_name = cls.runtime_stack.stack_name
+        cls.CONTAINER_NAME = (
+            "vllm-sr-container"
+            if stack_name == DEFAULT_STACK_NAME
+            else f"{stack_name}-vllm-sr-container"
+        )
+        cls.ROUTER_CONTAINER_NAME = cls.runtime_stack.router_container_name
+        cls.ENVOY_CONTAINER_NAME = cls.runtime_stack.envoy_container_name
+        cls.DASHBOARD_CONTAINER_NAME = cls.runtime_stack.dashboard_container_name
+        cls.SR_BENCH_CONTAINER_NAME = cls.runtime_stack.sr_bench_container_name
+        cls.REDIS_CONTAINER_NAME = cls.runtime_stack.redis_container_name
+        cls.POSTGRES_CONTAINER_NAME = cls.runtime_stack.postgres_container_name
+        cls.MILVUS_CONTAINER_NAME = cls.runtime_stack.milvus_container_name
+        cls.NETWORK_NAME = cls.runtime_stack.network_name
+        cls.DATA_NETWORK_NAME = cls.runtime_stack.data_network_name
+        cls.PROBE_CONTAINER_NAME = stack_scoped_test_container_name(
+            stack_name, "vllm-sr-cli-test-probe"
+        )
+        cls.AUXILIARY_CONTAINER_NAMES = (
+            cls.runtime_stack.grafana_container_name,
+            cls.runtime_stack.prometheus_container_name,
+            cls.runtime_stack.jaeger_container_name,
+            cls.runtime_stack.redis_container_name,
+            cls.runtime_stack.postgres_container_name,
+            cls.runtime_stack.milvus_container_name,
+        )
+
         # Detect container runtime
         cls.container_runtime = cls._detect_container_runtime()
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Using container runtime: {cls.container_runtime}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Ensure no leftover container from previous tests
         cls._cleanup_container()
 
     @classmethod
     def tearDownClass(cls):
-        """Clean up after all tests."""
+        """Clean up after all tests; no instance controller or data volume may
+        outlive them."""
+        leaked = cls._stack_controllers()
         cls._cleanup_container()
+        kept = cls._stack_volumes()
+        if leaked:
+            raise AssertionError(
+                "instance controllers outlived the tests of stack "
+                f"{cls.runtime_stack.stack_name}: {[str(path) for _, path in leaked]}"
+            )
+        if kept:
+            raise AssertionError(
+                "data volumes outlived the tests of stack "
+                f"{cls.runtime_stack.stack_name}: {kept}"
+            )
 
     def setUp(self):
         """Set up each test - create temp directory."""
-        self.test_dir = tempfile.mkdtemp(prefix="vllm-sr-cli-test-")
+        self.test_dir = str(
+            Path(tempfile.mkdtemp(prefix="vllm-sr-cli-test-")).resolve()
+        )
+        environment = patch.dict(
+            os.environ,
+            {"VLLM_SR_STATE_ROOT_DIR": self.test_dir},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.original_dir = os.getcwd()
         os.chdir(self.test_dir)
         print(f"\nTest directory: {self.test_dir}")
@@ -82,6 +203,15 @@ class CLITestBase(unittest.TestCase):
     def tearDown(self):
         """Clean up after each test."""
         os.chdir(self.original_dir)
+        if os.getenv("RUN_INTEGRATION_TESTS", "").lower() == "true":
+            # The worker owns an open journal in this test's temporary store.
+            # Stop it before deleting the store or starting another workspace.
+            self._cleanup_container()
+            self.assertEqual(
+                self._explicit_container_status(self.SR_BENCH_CONTAINER_NAME),
+                "not found",
+                "Managed worker cleanup failed; preserving its evidence directory",
+            )
         # Clean up temp directory
         try:
             shutil.rmtree(self.test_dir)
@@ -115,6 +245,12 @@ class CLITestBase(unittest.TestCase):
             return "docker"
         if shutil.which("podman"):
             return "podman"
+        if os.getenv("RUN_INTEGRATION_TESTS", "").lower() != "true":
+            # Unit-only suites mock container commands at their behavioral
+            # seams. Keep a deterministic command name so those tests can run
+            # inside the precommit image, which intentionally has no runtime
+            # client or daemon.
+            return "docker"
         raise RuntimeError("Neither docker nor podman was found in PATH")
 
     @staticmethod
@@ -139,14 +275,23 @@ class CLITestBase(unittest.TestCase):
 
     @classmethod
     def _cleanup_container(cls):
-        """Stop and remove any existing vllm-sr container."""
+        """Stop and remove any existing vllm-sr container.
+
+        The stack's instance controller goes first, as `vllm-sr stop` stops
+        it: `serve` starts it in a session of its own, so removing the
+        containers alone leaves it running. The stack's data volumes go last,
+        once no container mounts them: `vllm-sr stop` keeps them for the next
+        serve, and a test stack never returns.
+        """
+        cls._stop_stack_controllers()
         runtime = cls.container_runtime
         managed_container_names = (
             cls.CONTAINER_NAME,
             cls.ROUTER_CONTAINER_NAME,
             cls.ENVOY_CONTAINER_NAME,
             cls.DASHBOARD_CONTAINER_NAME,
-            cls.SIM_CONTAINER_NAME,
+            cls.SR_BENCH_CONTAINER_NAME,
+            cls.PROBE_CONTAINER_NAME,
             *cls.AUXILIARY_CONTAINER_NAMES,
         )
         for container_name in managed_container_names:
@@ -156,6 +301,114 @@ class CLITestBase(unittest.TestCase):
             ):
                 with suppress(Exception):
                     cls._run_subprocess(command, timeout=30)
+        for volume in cls._stack_volumes():
+            with suppress(Exception):
+                cls._run_subprocess([runtime, "volume", "rm", volume], timeout=30)
+
+    @classmethod
+    def _stack_volumes(cls) -> list[str]:
+        """The data volumes of this test stack, which `serve` names after its
+        containers.
+
+        Only a class that set up its own test stack has them; the default
+        stack's volumes may hold a developer's own data.
+        """
+        stack = getattr(cls, "runtime_stack", None)
+        if stack is None or stack.stack_name == DEFAULT_STACK_NAME:
+            return []
+        try:
+            listing = cls._run_subprocess(
+                [cls.container_runtime, "volume", "ls", "-q"], timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if listing.returncode != 0:
+            return []
+        prefix = f"{stack.stack_name}-vllm-sr-"
+        return [name for name in listing.stdout.split() if name.startswith(prefix)]
+
+    @classmethod
+    def _stack_controllers(cls) -> list[tuple[int, Path]]:
+        """The running instance controllers of this test stack: (pid, directory).
+
+        Only a class that set up its own test stack has one; the base class's
+        default names are the default stack's, which may be a developer's own.
+        """
+        if getattr(cls, "runtime_stack", None) is None:
+            return []
+        try:
+            listing = subprocess.run(
+                ["ps", "-A", "-o", "pid=,args="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        controllers = []
+        for line in listing.splitlines():
+            pid, _, arguments = line.strip().partition(" ")
+            if "cli.instance_controller --directory " not in arguments:
+                continue
+            directory = Path(arguments.rsplit("--directory ", 1)[1].strip())
+            if cls._is_stack_instance(directory):
+                controllers.append((int(pid), directory))
+        return controllers
+
+    @classmethod
+    def _is_stack_instance(cls, directory: Path) -> bool:
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text())
+        except (OSError, ValueError):
+            return False
+        layout = manifest.get("layout") or {}
+        return layout.get("stack_name") == cls.runtime_stack.stack_name
+
+    @classmethod
+    def _stop_stack_controllers(cls) -> None:
+        """Stop this stack's instance controllers, as `vllm-sr stop` does, and
+        remove the state `serve` keeps for them: a test stack never returns,
+        and `vllm-sr stop` keeps that state for the next serve."""
+        if getattr(cls, "runtime_stack", None) is None:
+            return
+        for pid, directory in cls._stack_controllers():
+            try:
+                controller_request(directory, "/shutdown", {"stop": True})
+                signals = (None, signal.SIGTERM, signal.SIGKILL)
+            except (OSError, ValueError, http.client.HTTPException):
+                # Unreachable, or refusing while a mode change is in progress.
+                signals = (signal.SIGTERM, signal.SIGKILL)
+            for signal_number in signals:
+                if signal_number is not None:
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal_number)
+                if cls._process_exited(pid, timeout=10):
+                    break
+            shutil.rmtree(directory, ignore_errors=True)
+        try:
+            instances = list((cli_state_directory() / "instances").iterdir())
+        except (OSError, ValueError):
+            instances = []
+        for directory in instances:
+            if cls._is_stack_instance(directory):
+                shutil.rmtree(directory, ignore_errors=True)
+
+    @staticmethod
+    def _process_exited(pid: int, *, timeout: float) -> bool:
+        """Whether *pid* is gone or a zombie its still-running parent keeps."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                return True
+            time.sleep(0.1)
+        return False
 
     def _explicit_container_status(self, container_name: str) -> str:
         """Get the status of one managed container."""
@@ -163,25 +416,20 @@ class CLITestBase(unittest.TestCase):
             result = self._run_subprocess(
                 [
                     self.container_runtime,
-                    "ps",
-                    "-a",
-                    "--filter",
-                    f"name={container_name}",
+                    "container",
+                    "inspect",
                     "--format",
-                    "{{.Status}}",
+                    "{{.State.Status}}",
+                    container_name,
                 ],
                 timeout=10,
             )
-            status = result.stdout.strip()
-            if not status:
+            if result.returncode != 0:
                 return "not found"
-            if "Up" in status:
-                return "running"
-            if "Exited" in status:
-                return "exited"
-            if "Paused" in status:
-                return "paused"
-            return "unknown"
+            status = result.stdout.strip().lower()
+            if status in {"running", "created", "exited", "paused"}:
+                return status
+            return status or "unknown"
         except Exception as e:
             print(f"Failed to get container status: {e}")
             return "error"
@@ -277,11 +525,52 @@ class CLITestBase(unittest.TestCase):
         port: int = 8888,
         model_name: str = "test-model",
         endpoint: str = "host.docker.internal:8000",
+        provider: str | None = "vllm",
+        api_key_env: str | None = None,
+        api_only: bool = False,
+        managed_storage: bool = False,
+        skip_processing: bool = False,
+        looper: bool = False,
     ) -> str:
-        """Write a minimal runnable canonical v0.3 config into the temp workspace."""
+        """Write a minimal runnable canonical v0.5 config into the temp workspace.
+
+        *endpoint* is host:port over http, or a full URL. *managed_storage*
+        asks for the service backends this CLI provisions locally, which is
+        what makes `serve` start Redis and Postgres.
+        """
         config_path = Path(self.test_dir) / "config.yaml"
+        backend_ref: dict[str, object] = {
+            "name": "primary",
+            "weight": 100,
+            "endpoint": endpoint,
+        }
+        if "://" not in endpoint:
+            backend_ref["protocol"] = "http"
+        if provider is not None:
+            backend_ref["provider"] = provider
+        if api_key_env is not None:
+            backend_ref["auth"] = {"api_key_env": api_key_env}
+
+        decision: dict[str, object] = {
+            "name": "default-route",
+            "description": "Default route for CLI test coverage",
+            "priority": 100,
+            "rules": {"operator": "AND", "conditions": []},
+            "modelRefs": [{"model": model_name, "use_reasoning": False}],
+        }
+        if looper:
+            decision["algorithm"] = {
+                "type": "remom",
+                "on_error": "fail",
+                "remom": {
+                    "breadth_schedule": [1],
+                    "model_distribution": "first_only",
+                    "min_successful_responses": 1,
+                },
+            }
+
         config = {
-            "version": "v0.3",
+            "version": "v0.5",
             "listeners": [
                 {
                     "name": "test-listener",
@@ -292,37 +581,38 @@ class CLITestBase(unittest.TestCase):
             ],
             "providers": {
                 "defaults": {
-                    "default_model": model_name,
-                    "default_reasoning_effort": "medium",
+                    "model": model_name,
+                    "reasoning_effort": "medium",
                 },
                 "models": [
                     {
                         "name": model_name,
                         "provider_model_id": model_name,
-                        "backend_refs": [
-                            {
-                                "name": "primary",
-                                "weight": 100,
-                                "endpoint": endpoint,
-                                "protocol": "http",
-                            }
-                        ],
+                        "backend_refs": [backend_ref],
                     }
                 ],
             },
-            "routing": {
-                "modelCards": [{"name": model_name}],
-                "decisions": [
-                    {
-                        "name": "default-route",
-                        "description": "Default route for CLI test coverage",
-                        "priority": 100,
-                        "rules": {"operator": "AND", "conditions": []},
-                        "modelRefs": [{"model": model_name, "use_reasoning": False}],
-                    }
-                ],
-            },
+            "recipes": [{"name": "default", "decisions": [decision]}],
         }
+        if api_only:
+            config["global"] = _api_only_global_config()
+        if skip_processing:
+            global_config = config.setdefault("global", {})
+            global_config.setdefault("router", {})["skip_processing"] = {
+                "enabled": True
+            }
+        if managed_storage:
+            global_config = config.get("global")
+            if not isinstance(global_config, dict):
+                global_config = {}
+                config["global"] = global_config
+            global_config["services"] = {
+                service_key: dict(service_config)
+                for service_key, service_config in MANAGED_STORAGE_SERVICES.items()
+            }
+            global_config["plugins"] = [
+                {"type": "router_replay", "configuration": {"enabled": True}}
+            ]
         config_path.write_text(
             yaml.safe_dump(config, sort_keys=False),
             encoding="utf-8",
@@ -433,6 +723,7 @@ class CLITestBase(unittest.TestCase):
         result = self._run_subprocess(
             [
                 self.container_runtime,
+                "container",
                 "inspect",
                 "--format",
                 format_string,
@@ -441,6 +732,92 @@ class CLITestBase(unittest.TestCase):
             timeout=timeout,
         )
         return result.returncode, result.stdout, result.stderr
+
+    def assert_dashboard_holds_no_container_runtime(self) -> None:
+        """The Dashboard mounts no runtime socket and its image has no container CLI.
+
+        `vllm-sr serve` owns the stack; the Dashboard reads status from HTTP
+        probes and the stack's files, and logs from the spool.
+        """
+        code, mounts, stderr = self.inspect_container(
+            "{{json .Mounts}}", container_name=self.DASHBOARD_CONTAINER_NAME
+        )
+        self.assertEqual(code, 0, stderr)
+        destinations = {mount["Destination"] for mount in json.loads(mounts)}
+        self.assertFalse(destinations & set(CONTAINER_RUNTIME_SOCKETS), destinations)
+        found = self._run_subprocess(
+            [
+                self.container_runtime,
+                "exec",
+                self.DASHBOARD_CONTAINER_NAME,
+                "sh",
+                "-c",
+                'for name in "$@"; do command -v "$name" || true; done',
+                "sh",
+                *CONTAINER_RUNTIME_CLIS,
+            ],
+            timeout=30,
+        )
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual(
+            found.stdout.strip(), "", "the Dashboard image has a container CLI"
+        )
+
+    def container_networks(self, container_name: str) -> set[str]:
+        """Return the networks *container_name* is currently attached to."""
+        result = self._run_subprocess(
+            [
+                self.container_runtime,
+                "container",
+                "inspect",
+                "--format",
+                "{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}",
+                container_name,
+            ],
+            timeout=10,
+        )
+        if result.returncode != 0:
+            self.fail(
+                f"Could not inspect the networks of {container_name}: "
+                f"{result.stderr.strip() or f'exit code {result.returncode}'}"
+            )
+        return set(result.stdout.split())
+
+    def run_network_probe(
+        self,
+        *,
+        network_name: str,
+        image: str,
+        shell_command: str,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run *shell_command* from a throwaway container on *network_name*.
+
+        The probe has to run from inside a network, because that is the only
+        vantage point from which "can this workload reach that store" has an
+        answer: the host reaches a published port either way.
+        """
+        with suppress(Exception):
+            self._run_subprocess(
+                [self.container_runtime, "rm", "-f", self.PROBE_CONTAINER_NAME],
+                timeout=30,
+            )
+        return self._run_subprocess(
+            [
+                self.container_runtime,
+                "run",
+                "--rm",
+                "--name",
+                self.PROBE_CONTAINER_NAME,
+                "--network",
+                network_name,
+                image,
+                "sh",
+                "-c",
+                shell_command,
+            ],
+            timeout=timeout,
+        )
 
     def image_exists(self, image_name: str) -> bool:
         """Check if a container image exists locally."""
@@ -466,11 +843,11 @@ class CLITestBase(unittest.TestCase):
 
     def print_test_header(self, name: str, description: str | None = None):
         """Print a formatted test header."""
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"TEST: {name}")
         if description:
             print(f"Description: {description}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     def print_test_result(self, passed: bool, message: str = ""):
         """Print test result with pass/fail indicator."""

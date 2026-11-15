@@ -1,5 +1,6 @@
 import React from 'react'
 import Translate from '@docusaurus/Translate'
+import { committerActivityEntries } from './committerActivity.generated'
 
 export interface MemberLink {
   label: string
@@ -16,26 +17,84 @@ export interface TeamMember {
   externalLinks?: MemberLink[]
   bio: React.ReactNode
   expertise?: React.ReactNode[]
-  memberType: 'steering' | 'committer'
+  memberType: 'steering' | 'maintainer' | 'committer' | 'emeritus'
+  steeringTrack?: 'industry' | 'academic'
 }
 
 export const steeringCommitteeMembers: TeamMember[] = [
   {
     name: 'Xunzhuo Liu',
-    role: <Translate id="team.members.XunzhuoLiu.role">LLM Routing @ vLLM</Translate>,
+    role: <Translate id="team.members.XunzhuoLiu.role">@AMD</Translate>,
     avatar: '/img/team/xunzhuo.png',
     github: 'https://github.com/Xunzhuo',
     linkedin: 'http://linkedin.com/in/bitliu',
     externalLinks: [
       { label: 'Website', href: 'https://www.liuxunzhuo.com/' },
     ],
-    bio: <Translate id="team.members.XunzhuoLiu.bio">LLM routing builder at vLLM.</Translate>,
+    bio: <Translate id="team.members.XunzhuoLiu.bio">Building the Mixture-of-Models for the next era of computing.</Translate>,
     expertise: [
       <Translate id="team.members.XunzhuoLiu.expertise.routing">LLM routing</Translate>,
       <Translate id="team.members.XunzhuoLiu.expertise.gateway">Kubernetes AI Gateway</Translate>,
       <Translate id="team.members.XunzhuoLiu.expertise.opensource">Open-source infrastructure</Translate>,
     ],
-    memberType: 'steering',
+    memberType: 'maintainer',
+    steeringTrack: 'industry',
+  },
+  {
+    name: 'Huamin Chen',
+    role: <Translate id="team.members.HuaminChen.role">@Microsoft</Translate>,
+    avatar: '/img/team/huamin.png',
+    github: 'https://github.com/rootfs',
+    linkedin: 'https://www.linkedin.com/in/huaminchen',
+    externalLinks: [
+      { label: 'Hugging Face', href: 'https://huggingface.co/HuaminChen' },
+    ],
+    bio: <Translate id="team.members.HuaminChen.bio">Long-term incubator of frontier infrastructure and AI systems across cloud-native platforms, open-source ecosystems, and model-serving stacks.</Translate>,
+    expertise: [
+      <Translate id="team.members.HuaminChen.expertise.cloud">Cloud-native platforms</Translate>,
+      <Translate id="team.members.HuaminChen.expertise.serving">Model-serving stacks</Translate>,
+      <Translate id="team.members.HuaminChen.expertise.ecosystem">Open-source ecosystems</Translate>,
+    ],
+    memberType: 'maintainer',
+    steeringTrack: 'industry',
+  },
+  {
+    name: 'Kun-Tai Wu',
+    role: <Translate id="team.members.WUKUNTAI-0211.role">Associate Research Scientist</Translate>,
+    company: 'Delta Electronics',
+    avatar: 'https://github.com/WUKUNTAI-0211.png',
+    github: 'https://github.com/WUKUNTAI-0211',
+    linkedin: 'https://www.linkedin.com/in/kun-tai-wu/',
+    bio: <Translate id="team.members.WUKUNTAI-0211.bio">Software engineer building AI infrastructure for large-scale LLM serving and agents, with a background in computer vision.</Translate>,
+    expertise: [
+      <Translate id="team.members.WUKUNTAI-0211.expertise.infrastructure">LLM infrastructure</Translate>,
+      <Translate id="team.members.WUKUNTAI-0211.expertise.agents">AI agents</Translate>,
+      <Translate id="team.members.WUKUNTAI-0211.expertise.vision">Computer vision</Translate>,
+    ],
+    memberType: 'maintainer',
+  },
+  {
+    name: 'Aayush Saini',
+    role: <Translate id="team.members.AayushSaini101.role">Senior Software Engineer, Data and AI</Translate>,
+    company: 'Red Hat',
+    avatar: 'https://github.com/AayushSaini101.png',
+    github: 'https://github.com/AayushSaini101',
+    linkedin: 'https://www.linkedin.com/in/aayush-sainii/',
+    bio: <Translate id="team.members.AayushSaini101.bio">Senior software engineer building enterprise AI agents, GSoC mentor, and AsyncAPI Technical Steering Committee member.</Translate>,
+    expertise: [
+      <Translate id="team.members.AayushSaini101.expertise.enterprise">Enterprise AI</Translate>,
+      <Translate id="team.members.AayushSaini101.expertise.mentorship">Open-source mentorship</Translate>,
+      <Translate id="team.members.AayushSaini101.expertise.asyncapi">Event-driven APIs</Translate>,
+    ],
+    memberType: 'maintainer',
+  },
+  {
+    name: 'FAUST',
+    role: <Translate id="team.members.FAUST-BENCHOU.role">Cloud-native Open Source Contributor</Translate>,
+    avatar: 'https://github.com/FAUST-BENCHOU.png',
+    github: 'https://github.com/FAUST-BENCHOU',
+    bio: <Translate id="team.members.FAUST-BENCHOU.bio">Cloud-native contributor working on Kubernetes orchestration and LLM serving across Karmada, Volcano, and Kthena. LFX mentor for Kthena.</Translate>,
+    memberType: 'maintainer',
   },
   {
     name: 'Bowei He',
@@ -52,6 +111,7 @@ export const steeringCommitteeMembers: TeamMember[] = [
       <Translate id="team.members.BoweiHe.expertise.hunyuan">Tencent Hunyuan LLM</Translate>,
     ],
     memberType: 'steering',
+    steeringTrack: 'academic',
   },
   {
     name: 'Yankai Chen',
@@ -69,40 +129,25 @@ export const steeringCommitteeMembers: TeamMember[] = [
       <Translate id="team.members.YankaiChen.expertise.mining">Knowledge mining</Translate>,
     ],
     memberType: 'steering',
+    steeringTrack: 'academic',
   },
   {
-    name: 'Fuyuan Lyu',
-    role: <Translate id="team.members.FuyuanLyu.role">PhD Candidate @ McGill University / Mila</Translate>,
-    avatar: 'https://agentic-in.ai/people/fuyuan-lv.jpeg',
-    linkedin: 'https://www.linkedin.com/in/fuyuan-lyu-560756167/',
+    name: 'Haolun Wu',
+    role: <Translate id="team.members.HaolunWu.role">Governor General's Gold Medal · PhD @ McGill / Mila · Visiting Scholar @ Stanford</Translate>,
+    avatar: 'https://haolun-wu.github.io/assets/img/abobu2.jpg',
+    linkedin: 'https://www.linkedin.com/in/haolun-wu-23ba08133/',
     externalLinks: [
-      { label: 'Website', href: 'https://fuyuanlyu.github.io/' },
-      { label: 'Google Scholar', href: 'https://scholar.google.com/citations?user=dOjmAVQAAAAJ&hl=en' },
+      { label: 'Website', href: 'https://haolun-wu.github.io/' },
+      { label: 'Google Scholar', href: 'https://scholar.google.com/citations?user=-KcBDLcAAAAJ&hl=en' },
     ],
-    bio: <Translate id="team.members.FuyuanLyu.bio">Research in data-centric AI, automatic feature selection, and automatic labeling for deep learning and foundation models.</Translate>,
+    bio: <Translate id="team.members.HaolunWu.bio">Researcher in trustworthy AI and learning from feedback, with academic experience across McGill, Mila, and Stanford.</Translate>,
     expertise: [
-      <Translate id="team.members.FuyuanLyu.expertise.data">Data-centric AI</Translate>,
-      <Translate id="team.members.FuyuanLyu.expertise.features">Automatic feature selection</Translate>,
-      <Translate id="team.members.FuyuanLyu.expertise.labeling">Automatic labeling</Translate>,
+      <Translate id="team.members.HaolunWu.expertise.feedback">Learning from feedback</Translate>,
+      <Translate id="team.members.HaolunWu.expertise.trustworthy">Trustworthy AI</Translate>,
+      <Translate id="team.members.HaolunWu.expertise.alignment">AI alignment</Translate>,
     ],
     memberType: 'steering',
-  },
-  {
-    name: 'Huamin Chen',
-    role: <Translate id="team.members.HuaminChen.role">@Microsoft</Translate>,
-    avatar: '/img/team/huamin.png',
-    github: 'https://github.com/rootfs',
-    linkedin: 'https://www.linkedin.com/in/huaminchen',
-    externalLinks: [
-      { label: 'Hugging Face', href: 'https://huggingface.co/HuaminChen' },
-    ],
-    bio: <Translate id="team.members.HuaminChen.bio">Long-term incubator of frontier infrastructure and AI systems across cloud-native platforms, open-source ecosystems, and model-serving stacks.</Translate>,
-    expertise: [
-      <Translate id="team.members.HuaminChen.expertise.cloud">Cloud-native platforms</Translate>,
-      <Translate id="team.members.HuaminChen.expertise.serving">Model-serving stacks</Translate>,
-      <Translate id="team.members.HuaminChen.expertise.ecosystem">Open-source ecosystems</Translate>,
-    ],
-    memberType: 'steering',
+    steeringTrack: 'academic',
   },
   {
     name: 'Steve Liu',
@@ -120,16 +165,138 @@ export const steeringCommitteeMembers: TeamMember[] = [
       <Translate id="team.members.SteveLiu.expertise.cps">Cyber-physical systems</Translate>,
     ],
     memberType: 'steering',
+    steeringTrack: 'academic',
+  },
+  {
+    name: 'Wilson Wu',
+    role: <Translate id="team.members.wilsonwu.role">Cloud-Native / AI Engineer</Translate>,
+    avatar: 'https://github.com/wilsonwu.png',
+    github: 'https://github.com/wilsonwu',
+    linkedin: 'https://www.linkedin.com/in/iwilsonwu/',
+    externalLinks: [
+      { label: 'Website', href: 'https://wilsonwu.me/' },
+    ],
+    bio: <Translate id="team.members.wilsonwu.bio">Cloud-native and AI engineer building enterprise solutions and open-source AI infrastructure.</Translate>,
+    memberType: 'maintainer',
+  },
+  {
+    name: 'Park Soobin',
+    role: <Translate id="team.members.subin9.role">Forward Deployed Engineer</Translate>,
+    company: 'Rebellions',
+    avatar: 'https://github.com/subin9.png',
+    github: 'https://github.com/subin9',
+    linkedin: 'https://linkedin.com/in/soobinpark1',
+    bio: <Translate id="team.members.subin9.bio">Forward Deployed Engineer at Rebellions, combining machine learning engineering and solution architecture to bring LLM inference to NPUs.</Translate>,
+    memberType: 'maintainer',
+  },
+  {
+    name: 'Theo Hsiung',
+    role: <Translate id="team.members.theohsiung.role">Associate Research Scientist</Translate>,
+    company: 'Delta Electronics',
+    avatar: 'https://github.com/theohsiung.png',
+    github: 'https://github.com/theohsiung',
+    linkedin: 'https://www.linkedin.com/in/theohsiung/',
+    bio: <Translate id="team.members.theohsiung.bio">AI researcher and software engineer working across AI for science, LLM systems, agentic infrastructure, and computer vision.</Translate>,
+    memberType: 'maintainer',
+  },
+  {
+    name: 'Ádám Kovács',
+    role: <Translate id="team.members.adaamko.role">Co-founder & CTO</Translate>,
+    company: 'KR Labs',
+    avatar: 'https://github.com/adaamko.png',
+    github: 'https://github.com/adaamko',
+    linkedin: 'https://www.linkedin.com/in/adaamko/',
+    bio: <Translate id="team.members.adaamko.bio">Co-founder and CTO of KR Labs, working on open-source NLP tools for transparent and trustworthy AI. His experience spans academic research and production NLP systems.</Translate>,
+    memberType: 'maintainer',
   },
 ]
+
+export const industryTrackMembers = steeringCommitteeMembers.filter(
+  member => member.steeringTrack === 'industry',
+)
+
+export const academicTrackMembers = steeringCommitteeMembers.filter(
+  member => member.steeringTrack === 'academic',
+)
+
+export const maintainerMembers = steeringCommitteeMembers.filter(
+  member => member.memberType === 'maintainer',
+)
+
+export function getTeamMemberBadge(
+  member: TeamMember,
+  context: 'team' | 'steering' = 'team',
+): React.ReactNode {
+  if (context === 'steering' && member.steeringTrack === 'industry') {
+    return <Translate id="team.track.industry.title">Industry Track</Translate>
+  }
+
+  if (context === 'steering' && member.steeringTrack === 'academic') {
+    return <Translate id="team.track.academic.title">Academic Track</Translate>
+  }
+
+  if (member.memberType === 'maintainer') {
+    return <Translate id="team.badge.maintainer">Maintainer</Translate>
+  }
+
+  if (member.memberType === 'committer') {
+    return <Translate id="team.badge.committer">Committer</Translate>
+  }
+
+  if (member.memberType === 'emeritus') {
+    return <Translate id="team.badge.emeritus">Emeritus Committer</Translate>
+  }
+
+  return <Translate id="team.badge.steering">Steering Committee</Translate>
+}
+
 export const topNewContributorMembers: TeamMember[] = [
   {
-    name: 'FAUST',
-    role: <Translate id="team.members.FAUST-BENCHOU.role">Cloud-native Open Source Contributor</Translate>,
-    company: 'Tongji University',
-    avatar: 'https://github.com/FAUST-BENCHOU.png',
-    github: 'https://github.com/FAUST-BENCHOU',
-    bio: <Translate id="team.members.FAUST-BENCHOU.bio">Cloud-native open source contributor across Karmada and Volcano.</Translate>,
+    name: 'Guan-Ming Chiu',
+    role: <Translate id="team.members.guan404ming.role">Software Engineering Intern</Translate>,
+    company: 'Quid',
+    avatar: 'https://github.com/guan404ming.png',
+    github: 'https://github.com/guan404ming',
+    linkedin: 'https://www.linkedin.com/in/guanmingchiu',
+    externalLinks: [
+      { label: 'Website', href: 'https://guan404ming.com/' },
+    ],
+    bio: <Translate id="team.members.guan404ming.bio">Software engineering intern at Quid and graduate student at National Taiwan University, focused on machine learning systems. An Apache Airflow and Apache TVM Committer and PyTorch Collaborator.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Abhinav Mahajan',
+    role: <Translate id="team.members.abhinav-m22.role">Software Engineer</Translate>,
+    company: 'Barclays',
+    avatar: 'https://github.com/abhinav-m22.png',
+    github: 'https://github.com/abhinav-m22',
+    linkedin: 'https://www.linkedin.com/in/abhinav-mahajan-b805b022a/',
+    bio: <Translate id="team.members.abhinav-m22.bio">Software engineer at Barclays building reliable backend services. Contributes to open-source infrastructure for LLMs and AI agents, with a focus on system design and production reliability.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Anup Sharma',
+    role: <Translate id="team.members.TwilightTechie.role">Engineering</Translate>,
+    company: 'Sarvam AI',
+    avatar: 'https://github.com/TwilightTechie.png',
+    github: 'https://github.com/TwilightTechie',
+    linkedin: 'https://www.linkedin.com/in/anup-sharma1/',
+    externalLinks: [
+      { label: 'Website', href: 'https://twilighttechie.github.io/' },
+    ],
+    bio: <Translate id="team.members.TwilightTechie.bio">Software engineer at Sarvam AI, with interests in LLM inference, model serving, and intelligent request routing.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Alex Jia',
+    role: <Translate id="team.members.yaojiejia.role">Software & Data Engineer</Translate>,
+    avatar: 'https://github.com/yaojiejia.png',
+    github: 'https://github.com/yaojiejia',
+    linkedin: 'https://www.linkedin.com/in/alex-jia-yaojie/',
+    externalLinks: [
+      { label: 'Website', href: 'https://www.alexjiaa.com/' },
+    ],
+    bio: <Translate id="team.members.yaojiejia.bio">Software and data engineer studying at NYU, focused on scalable systems and data pipelines. Contributes to Apache Hudi and has worked on SQLancer through Google Summer of Code.</Translate>,
     memberType: 'committer',
   },
   {
@@ -167,35 +334,73 @@ export const topNewContributorMembers: TeamMember[] = [
     memberType: 'committer',
   },
   {
-    name: 'WUKUNTAI',
-    role: <Translate id="team.members.WUKUNTAI-0211.role">Software Engineer</Translate>,
-    company: 'DELTA ELECTRONICS, INC.',
-    avatar: 'https://github.com/WUKUNTAI-0211.png',
-    github: 'https://github.com/WUKUNTAI-0211',
-    bio: <Translate id="team.members.WUKUNTAI-0211.bio">Software engineer at Delta Electronics in Taiwan.</Translate>,
-    memberType: 'committer',
-  },
-  {
-    name: 'Aayush Saini',
-    role: <Translate id="team.members.AayushSaini101.role">SDE, Data and AI</Translate>,
-    company: 'Red Hat',
-    avatar: 'https://github.com/AayushSaini101.png',
-    github: 'https://github.com/AayushSaini101',
-    bio: <Translate id="team.members.AayushSaini101.bio">SDE in Red Hat Data and AI, GSoC 2025 participant, and AsyncAPI Steering Committee member.</Translate>,
-    memberType: 'committer',
-  },
-  {
-    name: 'siloteemu',
-    role: <Translate id="team.members.siloteemu.role">Open Source Contributor</Translate>,
-    avatar: 'https://github.com/siloteemu.png',
+    name: 'Teemu Kuusisto',
+    role: <Translate id="team.members.siloteemu.role">SMTS, Silo AI</Translate>,
+    company: 'AMD',
+    avatar: '/img/team/teemu.jpg',
     github: 'https://github.com/siloteemu',
-    bio: <Translate id="team.members.siloteemu.bio">Open-source contributor on GitHub.</Translate>,
+    linkedin: 'https://fi.linkedin.com/in/teemu-kuusisto-1a7512150',
+    bio: <Translate id="team.members.siloteemu.bio">Open-source contributor to vLLM Semantic Router.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Akshay Viswanathan',
+    role: <Translate id="team.members.akshayv.role">PMTS, Silo AI</Translate>,
+    company: 'AMD',
+    avatar: 'https://github.com/akshayv.png',
+    github: 'https://github.com/akshayv',
+    bio: <Translate id="team.members.akshayv.bio">Open-source contributor to vLLM Semantic Router.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Yincheng Ren',
+    role: <Translate id="team.members.Peterren.role">Software Engineer</Translate>,
+    company: 'Meta',
+    avatar: 'https://github.com/Peterren.png',
+    github: 'https://github.com/Peterren',
+    linkedin: 'https://www.linkedin.com/in/yincheng-ren/',
+    bio: <Translate id="team.members.Peterren.bio">Software engineer focused on large-scale recommendation systems, backend engineering, LLM deployment, and inference.</Translate>,
     memberType: 'committer',
   },
 ]
 
-export const committerMembers: TeamMember[] = [
+export const allCommitterMembers: TeamMember[] = [
   ...topNewContributorMembers,
+  {
+    name: 'Haoyu Jing',
+    role: <Translate id="team.members.PharosEast.role">Individual Contributor</Translate>,
+    avatar: 'https://github.com/PharosEast.png',
+    github: 'https://github.com/PharosEast',
+    bio: <Translate id="team.members.PharosEast.bio">Open source contributor to vLLM Semantic Router.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'ZiY1Ming',
+    role: <Translate id="team.members.Zi-Yi-Ming.role">Individual Contributor</Translate>,
+    avatar: 'https://github.com/Zi-Yi-Ming.png',
+    github: 'https://github.com/Zi-Yi-Ming',
+    bio: <Translate id="team.members.Zi-Yi-Ming.bio">Open source contributor to vLLM Semantic Router.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Stefan Wang',
+    role: <Translate id="team.members.1fanwang.role">AI Infrastructure</Translate>,
+    company: 'LinkedIn',
+    avatar: 'https://github.com/1fanwang.png',
+    github: 'https://github.com/1fanwang',
+    linkedin: 'https://www.linkedin.com/in/stefanyifanwang/',
+    bio: <Translate id="team.members.1fanwang.bio">Works across AI, agent, and data infrastructure, with recent work in vLLM, Ray, and data systems.</Translate>,
+    memberType: 'committer',
+  },
+  {
+    name: 'Binbin Zhang',
+    role: <Translate id="team.members.Bevisy.role">Container R&D Engineer</Translate>,
+    company: 'Telecom Cloud',
+    avatar: 'https://github.com/Bevisy.png',
+    github: 'https://github.com/Bevisy',
+    bio: <Translate id="team.members.Bevisy.bio">Kata Containers maintainer working on Kubernetes and container infrastructure.</Translate>,
+    memberType: 'committer',
+  },
   {
     name: 'Chen Wang',
     role: <Translate id="team.members.ChenWang.role">Senior Staff Research Scientist</Translate>,
@@ -403,3 +608,24 @@ export const committerMembers: TeamMember[] = [
     memberType: 'committer',
   },
 ]
+
+const committerStatusByLogin = new Map(
+  committerActivityEntries.map(entry => [entry.login.toLowerCase(), entry.status]),
+)
+
+function getGithubLogin(member: TeamMember): string | undefined {
+  return member.github?.match(/github\.com\/([^/?#]+)/i)?.[1]?.toLowerCase()
+}
+
+function isEmeritusCommitter(member: TeamMember): boolean {
+  const login = getGithubLogin(member)
+  return login ? committerStatusByLogin.get(login) === 'emeritus' : false
+}
+
+export const committerMembers = allCommitterMembers.filter(
+  member => !isEmeritusCommitter(member),
+)
+
+export const emeritusCommitterMembers = allCommitterMembers
+  .filter(isEmeritusCommitter)
+  .map(member => ({ ...member, memberType: 'emeritus' as const }))

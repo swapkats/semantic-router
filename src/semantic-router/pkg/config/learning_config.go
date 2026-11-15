@@ -1,6 +1,10 @@
 package config
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
+)
 
 const (
 	// RouterLearningScopeConversation protects one agent conversation while
@@ -28,8 +32,9 @@ const (
 )
 
 const (
-	routerLearningDefaultSessionHeader      = "x-session-id"
-	routerLearningDefaultConversationHeader = "x-conversation-id"
+	routerLearningDefaultConversationHeader = headers.XConversationID
+
+	defaultProtectionReleaseMinUserTurnsBetween = 2
 )
 
 // RouterLearningConfig is the public cross-request routing intelligence
@@ -39,6 +44,23 @@ type RouterLearningConfig struct {
 	Enabled    bool                           `yaml:"enabled,omitempty"`
 	Adaptation RouterLearningAdaptationConfig `yaml:"adaptation,omitempty"`
 	Protection RouterLearningProtectionConfig `yaml:"protection,omitempty"`
+	StateStore RouterLearningStateStoreConfig `yaml:"state_store,omitempty"`
+}
+
+// RouterLearningStateStoreConfig configures optional shared protection state.
+type RouterLearningStateStoreConfig struct {
+	Backend    string                              `yaml:"backend,omitempty"`
+	TTLSeconds int                                 `yaml:"ttl_seconds,omitempty"`
+	TimeoutMS  int                                 `yaml:"timeout_ms,omitempty"`
+	Redis      RouterLearningRedisStateStoreConfig `yaml:"redis,omitempty"`
+}
+
+// RouterLearningRedisStateStoreConfig configures Redis connectivity.
+type RouterLearningRedisStateStoreConfig struct {
+	Address   string `yaml:"address,omitempty"`
+	Password  string `yaml:"password,omitempty"`
+	Database  int    `yaml:"database,omitempty"`
+	KeyPrefix string `yaml:"key_prefix,omitempty"`
 }
 
 // RouterLearningAdaptationConfig configures online model-choice learning.
@@ -50,14 +72,24 @@ type RouterLearningAdaptationConfig struct {
 
 // RouterLearningProtectionConfig configures online stability protection.
 type RouterLearningProtectionConfig struct {
-	Enabled  *bool                          `yaml:"enabled,omitempty"`
-	Scope    string                         `yaml:"scope,omitempty"`
-	Identity RouterLearningIdentityConfig   `yaml:"identity,omitempty"`
-	Tuning   RouterLearningProtectionTuning `yaml:"tuning,omitempty"`
+	Enabled  *bool                                 `yaml:"enabled,omitempty"`
+	Scope    string                                `yaml:"scope,omitempty"`
+	Identity RouterLearningIdentityConfig          `yaml:"identity,omitempty"`
+	Tuning   RouterLearningProtectionTuning        `yaml:"tuning,omitempty"`
+	Release  RouterLearningProtectionReleaseConfig `yaml:"release,omitempty"`
+}
+
+// RouterLearningProtectionReleaseConfig lets a client ask, on one request, for
+// a fresh decision on its protection key without changing session identity.
+type RouterLearningProtectionReleaseConfig struct {
+	Enabled             *bool   `yaml:"enabled,omitempty"`
+	Header              *string `yaml:"header,omitempty"`
+	MinUserTurnsBetween *int    `yaml:"min_user_turns_between,omitempty"`
 }
 
 // RouterLearningIdentityConfig declares where protection reads stable client
-// identity. The runtime currently uses the session and conversation keys.
+// identity. The runtime uses the session and conversation keys, and the agent
+// key when one is configured.
 type RouterLearningIdentityConfig struct {
 	Headers RouterLearningIdentityHeadersConfig `yaml:"headers,omitempty"`
 }
@@ -67,8 +99,15 @@ type RouterLearningIdentityConfig struct {
 // runtime; future identity needs should add typed fields instead of accepting
 // arbitrary header keys.
 type RouterLearningIdentityHeadersConfig struct {
+	// Session names the header protection reads the session id from. Unset,
+	// protection keys on the session id the request pins: x-vsr-session-id,
+	// or a header global.router.headers.session_id_headers accepts.
 	Session      *string `yaml:"session,omitempty"`
 	Conversation *string `yaml:"conversation,omitempty"`
+	// Agent names an optional header that identifies one agent inside a
+	// session, such as a delegated subagent. Requests that carry it are held
+	// per agent; requests without it keep the session or conversation key.
+	Agent *string `yaml:"agent,omitempty"`
 }
 
 // RouterLearningProtectionTuning exposes the stable protection knobs.
@@ -77,6 +116,75 @@ type RouterLearningProtectionTuning struct {
 	MinTurnsBeforeSwitch *int     `yaml:"min_turns_before_switch,omitempty"`
 	SwitchMargin         *float64 `yaml:"switch_margin,omitempty"`
 	StabilityWeight      *float64 `yaml:"stability_weight,omitempty"`
+
+	ProgressGate *ProgressGateTuning `yaml:"progress_gate,omitempty"`
+}
+
+// ProgressGateTuning gates session model switches on recent-window progress
+// evidence. Omitting the section leaves existing session behaviour unchanged.
+type ProgressGateTuning struct {
+	Enabled       *bool  `yaml:"enabled,omitempty"`
+	Mode          string `yaml:"mode,omitempty" jsonschema:"enum=observe,enum=enforce"`
+	CalibrationID string `yaml:"calibration_id,omitempty"`
+
+	WindowSize                *int     `yaml:"window_size,omitempty" jsonschema:"minimum=1,maximum=256"`
+	WindowTTLSeconds          *int     `yaml:"window_ttl_seconds,omitempty" jsonschema:"minimum=1,maximum=86400"`
+	MinWindowOutcomes         *int     `yaml:"min_window_outcomes,omitempty" jsonschema:"minimum=0"`
+	MinConsecutiveRegressions *int     `yaml:"min_consecutive_regressions,omitempty" jsonschema:"minimum=0"`
+	MinConsecutiveRecoveries  *int     `yaml:"min_consecutive_recoveries,omitempty" jsonschema:"minimum=0"`
+	CooldownSeconds           *float64 `yaml:"cooldown_seconds,omitempty" jsonschema:"minimum=0"`
+	MaxSwitchesPerWindow      *int     `yaml:"max_switches_per_window,omitempty" jsonschema:"minimum=0,maximum=256"`
+}
+
+// ProgressGateConfig is the resolved policy shared by validation and execution.
+type ProgressGateConfig struct {
+	Enabled                   bool
+	Mode                      string
+	CalibrationID             string
+	WindowSize                int
+	WindowTTLSeconds          int
+	MinWindowOutcomes         int
+	MinConsecutiveRegressions int
+	MinConsecutiveRecoveries  int
+	CooldownSeconds           float64
+	MaxSwitchesPerWindow      int
+}
+
+func (tuning *ProgressGateTuning) EffectiveConfig() ProgressGateConfig {
+	cfg := ProgressGateConfig{
+		Mode: "observe", WindowSize: 8, WindowTTLSeconds: 900,
+		MinWindowOutcomes: 3, MinConsecutiveRegressions: 2,
+		MinConsecutiveRecoveries: 2, CooldownSeconds: 120, MaxSwitchesPerWindow: 2,
+	}
+	if tuning == nil {
+		return cfg
+	}
+	if tuning.Enabled != nil {
+		cfg.Enabled = *tuning.Enabled
+	}
+	if mode := strings.TrimSpace(tuning.Mode); mode != "" {
+		cfg.Mode = mode
+	}
+	cfg.CalibrationID = strings.TrimSpace(tuning.CalibrationID)
+	for _, field := range []struct {
+		from *int
+		to   *int
+	}{
+		{tuning.WindowSize, &cfg.WindowSize},
+		{tuning.WindowTTLSeconds, &cfg.WindowTTLSeconds},
+		{tuning.MinWindowOutcomes, &cfg.MinWindowOutcomes},
+		{tuning.MinConsecutiveRegressions, &cfg.MinConsecutiveRegressions},
+		{tuning.MinConsecutiveRecoveries, &cfg.MinConsecutiveRecoveries},
+		{tuning.MaxSwitchesPerWindow, &cfg.MaxSwitchesPerWindow},
+	} {
+		if field.from != nil {
+			*field.to = *field.from
+		}
+	}
+	if tuning.CooldownSeconds != nil {
+		cfg.CooldownSeconds = *tuning.CooldownSeconds
+	}
+	return cfg
 }
 
 // DecisionAdaptationsConfig lets one matched decision control globally enabled
@@ -132,6 +240,26 @@ func (cfg RouterLearningProtectionConfig) EffectiveScope() string {
 	return cfg.Scope
 }
 
+func (cfg RouterLearningProtectionReleaseConfig) EffectiveEnabled() bool {
+	return cfg.Enabled == nil || *cfg.Enabled
+}
+
+func (cfg RouterLearningProtectionReleaseConfig) EffectiveHeader() string {
+	if cfg.Header != nil {
+		if value := strings.ToLower(strings.TrimSpace(*cfg.Header)); value != "" {
+			return value
+		}
+	}
+	return headers.VSRProtectionRelease
+}
+
+func (cfg RouterLearningProtectionReleaseConfig) EffectiveMinUserTurnsBetween() int {
+	if cfg.MinUserTurnsBetween != nil {
+		return *cfg.MinUserTurnsBetween
+	}
+	return defaultProtectionReleaseMinUserTurnsBetween
+}
+
 func (cfg RouterLearningProtectionConfig) HeaderName(key string) string {
 	switch key {
 	case "session":
@@ -140,7 +268,7 @@ func (cfg RouterLearningProtectionConfig) HeaderName(key string) string {
 				return value
 			}
 		}
-		return routerLearningDefaultSessionHeader
+		return ""
 	case "conversation":
 		if cfg.Identity.Headers.Conversation != nil {
 			if value := strings.TrimSpace(*cfg.Identity.Headers.Conversation); value != "" {
@@ -148,6 +276,11 @@ func (cfg RouterLearningProtectionConfig) HeaderName(key string) string {
 			}
 		}
 		return routerLearningDefaultConversationHeader
+	case "agent":
+		if cfg.Identity.Headers.Agent != nil {
+			return strings.TrimSpace(*cfg.Identity.Headers.Agent)
+		}
+		return ""
 	default:
 		return ""
 	}

@@ -1,19 +1,19 @@
 package config
 
+import "github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+
 // LooperConfig defines configuration for multi-model execution.
 type LooperConfig struct {
-	Endpoint         string              `yaml:"endpoint"`
-	GRPCMaxMsgSizeMB int                 `yaml:"grpc_max_msg_size_mb,omitempty"`
-	TimeoutSeconds   int                 `yaml:"timeout_seconds,omitempty"`
-	RetryCount       int                 `yaml:"retry_count,omitempty"`
-	Headers          map[string]string   `yaml:"headers,omitempty"`
-	ReMoM            ReMoMRuntimeConfig  `yaml:"remom,omitempty"`
-	Fusion           FusionRuntimeConfig `yaml:"fusion,omitempty"`
-	Flow             FlowRuntimeConfig   `yaml:"flow,omitempty"`
-}
-
-func (l *LooperConfig) IsEnabled() bool {
-	return l.Endpoint != ""
+	// EntrypointModels is the resolved virtual-model inventory for recursion guards.
+	EntrypointModels []string `yaml:"-"`
+	// Endpoint points a connector client built in code at a chat completions
+	// URL; the Router's Loopers make their model calls in process.
+	Endpoint           string            `yaml:"-"`
+	GRPCMaxMsgSizeMB   int               `yaml:"grpc_max_msg_size_mb,omitempty"`
+	MaxResponseBytesMB int               `yaml:"max_response_bytes_mb,omitempty"`
+	TimeoutSeconds     int               `yaml:"timeout_seconds,omitempty"`
+	Headers            map[string]string `yaml:"headers,omitempty"`
+	Flow               FlowRuntimeConfig `yaml:"flow,omitempty"`
 }
 
 func (l *LooperConfig) GetTimeout() int {
@@ -23,11 +23,34 @@ func (l *LooperConfig) GetTimeout() int {
 	return l.TimeoutSeconds
 }
 
+// grpcEnvelopeHeadroomBytes leaves room for the ExtProc message fields that
+// travel with a request body.
+const grpcEnvelopeHeadroomBytes = 1 << 20
+
+// defaultGRPCMaxMsgSize admits every body the protocol codec accepts, because
+// Envoy sends a buffered request body to ExtProc as a single message.
+var defaultGRPCMaxMsgSize = llmprotocol.DefaultPolicy().Limits.BodyBytes + grpcEnvelopeHeadroomBytes
+
 func (l *LooperConfig) GetGRPCMaxMsgSize() int {
 	if l.GRPCMaxMsgSizeMB <= 0 {
-		return 4 * 1024 * 1024
+		return defaultGRPCMaxMsgSize
 	}
 	return l.GRPCMaxMsgSizeMB * 1024 * 1024
+}
+
+// DefaultMaxResponseBytes caps a single upstream model response body when no
+// explicit max_response_bytes_mb is configured (32 MiB). A single chat
+// completion never approaches this, but it bounds a huge or malicious upstream
+// response so it cannot exhaust router memory.
+const DefaultMaxResponseBytes int64 = 32 * 1024 * 1024
+
+// GetMaxResponseBytes returns the per-response read ceiling in bytes, falling
+// back to DefaultMaxResponseBytes when unset or non-positive.
+func (l *LooperConfig) GetMaxResponseBytes() int64 {
+	if l.MaxResponseBytesMB <= 0 {
+		return DefaultMaxResponseBytes
+	}
+	return int64(l.MaxResponseBytesMB) * 1024 * 1024
 }
 
 // RedisConfig defines the complete configuration structure for Redis cache backend.
@@ -65,12 +88,9 @@ type RedisConfig struct {
 	Development struct {
 		DropIndexOnStartup bool `json:"drop_index_on_startup" yaml:"drop_index_on_startup"`
 		AutoCreateIndex    bool `json:"auto_create_index" yaml:"auto_create_index"`
-		VerboseErrors      bool `json:"verbose_errors" yaml:"verbose_errors"`
 	} `json:"development" yaml:"development"`
 	Logging struct {
-		Level          string `json:"level" yaml:"level"`
-		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
-		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
+		Level string `json:"level" yaml:"level"`
 	} `json:"logging" yaml:"logging"`
 }
 
@@ -109,12 +129,9 @@ type ValkeyConfig struct {
 	Development struct {
 		DropIndexOnStartup bool `json:"drop_index_on_startup" yaml:"drop_index_on_startup"`
 		AutoCreateIndex    bool `json:"auto_create_index" yaml:"auto_create_index"`
-		VerboseErrors      bool `json:"verbose_errors" yaml:"verbose_errors"`
 	} `json:"development" yaml:"development"`
 	Logging struct {
-		Level          string `json:"level" yaml:"level"`
-		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
-		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
+		Level string `json:"level" yaml:"level"`
 	} `json:"logging" yaml:"logging"`
 }
 
@@ -160,53 +177,34 @@ type MilvusConfig struct {
 		TopK             int    `json:"topk" yaml:"topk"`
 		ConsistencyLevel string `json:"consistency_level" yaml:"consistency_level"`
 	} `json:"search" yaml:"search"`
-	Performance struct {
-		ConnectionPool struct {
-			MaxConnections     int `json:"max_connections" yaml:"max_connections"`
-			MaxIdleConnections int `json:"max_idle_connections" yaml:"max_idle_connections"`
-			AcquireTimeout     int `json:"acquire_timeout" yaml:"acquire_timeout"`
-		} `json:"connection_pool" yaml:"connection_pool"`
-		Batch struct {
-			InsertBatchSize int `json:"insert_batch_size" yaml:"insert_batch_size"`
-			Timeout         int `json:"timeout" yaml:"timeout"`
-		} `json:"batch" yaml:"batch"`
-	} `json:"performance" yaml:"performance"`
-	DataManagement struct {
-		TTL struct {
-			Enabled         bool   `json:"enabled" yaml:"enabled"`
-			TimestampField  string `json:"timestamp_field" yaml:"timestamp_field"`
-			CleanupInterval int    `json:"cleanup_interval" yaml:"cleanup_interval"`
-		} `json:"ttl" yaml:"ttl"`
-		Compaction struct {
-			Enabled  bool `json:"enabled" yaml:"enabled"`
-			Interval int  `json:"interval" yaml:"interval"`
-		} `json:"compaction" yaml:"compaction"`
-	} `json:"data_management" yaml:"data_management"`
 	Logging struct {
-		Level          string `json:"level" yaml:"level"`
-		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
-		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
+		Level string `json:"level" yaml:"level"`
 	} `json:"logging" yaml:"logging"`
 	Development struct {
 		DropCollectionOnStartup bool `json:"drop_collection_on_startup" yaml:"drop_collection_on_startup"`
 		AutoCreateCollection    bool `json:"auto_create_collection" yaml:"auto_create_collection"`
-		VerboseErrors           bool `json:"verbose_errors" yaml:"verbose_errors"`
 	} `json:"development" yaml:"development"`
 }
 
-type SemanticCache struct {
-	BackendType         string        `yaml:"backend_type,omitempty"`
-	Enabled             bool          `yaml:"enabled"`
-	SimilarityThreshold *float32      `yaml:"similarity_threshold,omitempty"`
-	MaxEntries          int           `yaml:"max_entries,omitempty"`
-	TTLSeconds          int           `yaml:"ttl_seconds,omitempty"`
-	EvictionPolicy      string        `yaml:"eviction_policy,omitempty"`
-	Redis               *RedisConfig  `yaml:"redis,omitempty"`
-	Valkey              *ValkeyConfig `yaml:"valkey,omitempty"`
-	Milvus              *MilvusConfig `yaml:"milvus,omitempty"`
-	Qdrant              *QdrantConfig `yaml:"qdrant,omitempty"`
-	EmbeddingModel      string        `yaml:"embedding_model,omitempty"`
+// ResponseCacheStoreConfig says where the response cache keeps entries. A
+// response_cache plugin turns caching on.
+type ResponseCacheStoreConfig struct {
+	BackendType string `yaml:"backend_type,omitempty"`
+	// InUse is set at load when a response_cache plugin uses the store.
+	InUse          bool          `yaml:"-" json:"-"`
+	MaxEntries     int           `yaml:"max_entries,omitempty"`
+	TTLSeconds     int           `yaml:"ttl_seconds"`
+	EvictionPolicy string        `yaml:"eviction_policy,omitempty"`
+	Redis          *RedisConfig  `yaml:"redis,omitempty"`
+	Valkey         *ValkeyConfig `yaml:"valkey,omitempty"`
+	Milvus         *MilvusConfig `yaml:"milvus,omitempty"`
+	Qdrant         *QdrantConfig `yaml:"qdrant,omitempty"`
+	// Embedding names the deployment semantic reuse embeds with.
+	Embedding *EmbeddingBinding `yaml:"embedding,omitempty"`
 }
+
+// SemanticCache is retained for source compatibility.
+type SemanticCache = ResponseCacheStoreConfig
 
 // QdrantConfig defines the complete configuration structure for Qdrant cache backend.
 type QdrantConfig struct {
@@ -218,25 +216,48 @@ type QdrantConfig struct {
 	CollectionName string `yaml:"collection_name,omitempty"`
 }
 
+// DefaultMemorySimilarityThreshold applies when no memory similarity threshold is configured.
+const DefaultMemorySimilarityThreshold float32 = 0.70
+
+// MemoryConfig says where memories are kept and how they are recalled by
+// default. A context plugin's memory source turns memory on.
 type MemoryConfig struct {
-	Enabled                    bool                       `yaml:"enabled,omitempty"`
-	Backend                    string                     `yaml:"backend,omitempty"`
-	AutoStore                  bool                       `yaml:"auto_store,omitempty"`
-	DisabledRoutes             []string                   `yaml:"disabled_routes,omitempty"`
-	DisabledModels             []string                   `yaml:"disabled_models,omitempty"`
-	Milvus                     MemoryMilvusConfig         `yaml:"milvus,omitempty"`
-	Valkey                     *MemoryValkeyConfig        `yaml:"valkey,omitempty"`
-	Qdrant                     *MemoryQdrantConfig        `yaml:"qdrant,omitempty"`
-	RedisCache                 *MemoryRedisCacheConfig    `yaml:"redis_cache,omitempty"`
-	EmbeddingModel             string                     `yaml:"embedding_model,omitempty"`
-	ExtractionBatchSize        int                        `yaml:"extraction_batch_size,omitempty"`
-	DefaultRetrievalLimit      int                        `yaml:"default_retrieval_limit,omitempty"`
-	DefaultSimilarityThreshold float32                    `yaml:"default_similarity_threshold,omitempty"`
-	HybridSearch               bool                       `yaml:"hybrid_search,omitempty"`
-	HybridMode                 string                     `yaml:"hybrid_mode,omitempty"`
-	AdaptiveThreshold          bool                       `yaml:"adaptive_threshold,omitempty"`
-	QualityScoring             MemoryQualityScoringConfig `yaml:"quality_scoring,omitempty"`
-	Reflection                 MemoryReflectionConfig     `yaml:"reflection,omitempty"`
+	// InUse is set at load when a context plugin recalls memories.
+	InUse          bool                    `yaml:"-" json:"-"`
+	Backend        string                  `yaml:"backend,omitempty"`
+	AutoStore      bool                    `yaml:"auto_store,omitempty"`
+	DisabledRoutes []string                `yaml:"disabled_routes,omitempty"`
+	DisabledModels []string                `yaml:"disabled_models,omitempty"`
+	Milvus         MemoryMilvusConfig      `yaml:"milvus,omitempty"`
+	Valkey         *MemoryValkeyConfig     `yaml:"valkey,omitempty"`
+	Qdrant         *MemoryQdrantConfig     `yaml:"qdrant,omitempty"`
+	RedisCache     *MemoryRedisCacheConfig `yaml:"redis_cache,omitempty"`
+	// Embedding names the deployment memories are embedded with.
+	Embedding                  *EmbeddingBinding       `yaml:"embedding,omitempty"`
+	DefaultRetrievalLimit      int                     `yaml:"default_retrieval_limit"`
+	DefaultSimilarityThreshold float32                 `yaml:"default_similarity_threshold,omitempty"`
+	HybridSearch               bool                    `yaml:"hybrid_search,omitempty"`
+	HybridMode                 string                  `yaml:"hybrid_mode,omitempty"`
+	AdaptiveThreshold          bool                    `yaml:"adaptive_threshold,omitempty"`
+	Reflection                 MemoryReflectionConfig  `yaml:"reflection,omitempty"`
+	Persistence                MemoryPersistenceConfig `yaml:"persistence,omitempty"`
+	// QueryRewrite names the openai_chat deployment that rewrites a query
+	// with its conversation before memory search.
+	QueryRewrite *MemoryQueryRewriteConfig `yaml:"query_rewrite,omitempty"`
+}
+
+// MemoryQueryRewriteConfig names the deployment that rewrites memory search
+// queries.
+type MemoryQueryRewriteConfig struct {
+	Deployment string `yaml:"deployment"`
+}
+
+// MemoryPersistenceConfig bounds asynchronous response memory writes.
+type MemoryPersistenceConfig struct {
+	TimeoutSeconds       int `yaml:"timeout_seconds,omitempty"`
+	Concurrency          int `yaml:"concurrency,omitempty"`
+	Queue                int `yaml:"queue,omitempty"`
+	ShutdownGraceSeconds int `yaml:"shutdown_grace_seconds,omitempty"`
 }
 
 // MemoryRedisCacheConfig configures an optional Redis hot cache in front of Milvus retrieval.
@@ -249,19 +270,13 @@ type MemoryRedisCacheConfig struct {
 	Password   string `yaml:"password,omitempty"`
 }
 
-type MemoryQualityScoringConfig struct {
-	InitialStrengthDays int     `yaml:"initial_strength_days,omitempty"`
-	PruneThreshold      float64 `yaml:"prune_threshold,omitempty"`
-	MaxMemoriesPerUser  int     `yaml:"max_memories_per_user,omitempty"`
-}
-
 type MemoryReflectionConfig struct {
-	Enabled          *bool    `yaml:"enabled,omitempty"`
-	Algorithm        string   `yaml:"algorithm,omitempty"`
-	MaxInjectTokens  int      `yaml:"max_inject_tokens,omitempty"`
-	RecencyDecayDays int      `yaml:"recency_decay_days,omitempty"`
-	DedupThreshold   float32  `yaml:"dedup_threshold,omitempty"`
-	BlockPatterns    []string `yaml:"block_patterns,omitempty"`
+	Enabled          *bool    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Algorithm        string   `yaml:"algorithm,omitempty" json:"algorithm,omitempty"`
+	MaxInjectTokens  int      `yaml:"max_inject_tokens,omitempty" json:"max_inject_tokens,omitempty"`
+	RecencyDecayDays int      `yaml:"recency_decay_days,omitempty" json:"recency_decay_days,omitempty"`
+	DedupThreshold   float32  `yaml:"dedup_threshold,omitempty" json:"dedup_threshold,omitempty"`
+	BlockPatterns    []string `yaml:"block_patterns,omitempty" json:"block_patterns,omitempty"`
 }
 
 func (c MemoryReflectionConfig) ReflectionEnabled() bool {
@@ -330,8 +345,8 @@ type MemoryQdrantConfig struct {
 type ResponseAPIConfig struct {
 	Enabled      bool                   `yaml:"enabled"`
 	StoreBackend string                 `yaml:"store_backend,omitempty"`
-	TTLSeconds   int                    `yaml:"ttl_seconds,omitempty"`
-	MaxResponses int                    `yaml:"max_responses,omitempty"`
+	TTLSeconds   int                    `yaml:"ttl_seconds"`
+	MaxResponses int                    `yaml:"max_responses"`
 	Redis        ResponseAPIRedisConfig `yaml:"redis,omitempty"`
 }
 
@@ -355,16 +370,14 @@ type ResponseAPIRedisConfig struct {
 	ConfigPath       string   `yaml:"config_path,omitempty" json:"config_path,omitempty"`
 }
 
-// RouterReplayConfig controls routing-decision replay record storage.
-// StoreBackend defaults to "postgres" for durable, SQL-queryable storage
-// that survives router restarts. Supported backends: "postgres", "redis",
-// "milvus", "qdrant", "memory". Use "redis" for lightweight deployments that already
-// run Redis. Set to "memory" only for local development — all replay
-// records are lost when the router process exits.
+// RouterReplayConfig says where routing-decision replay records are stored.
+// A router_replay plugin turns recording on and says what a record captures.
+// Without a storage configuration records stay in memory. Supported
+// backends: "postgres", "redis", "milvus", "qdrant", "memory". Production
+// deployments should configure a durable backend.
 type RouterReplayConfig struct {
-	Enabled      bool                        `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	StoreBackend string                      `json:"store_backend,omitempty" yaml:"store_backend,omitempty"`
-	TTLSeconds   int                         `json:"ttl_seconds,omitempty" yaml:"ttl_seconds,omitempty"`
+	TTLSeconds   int                         `json:"ttl_seconds" yaml:"ttl_seconds"`
 	AsyncWrites  bool                        `json:"async_writes,omitempty" yaml:"async_writes,omitempty"`
 	Redis        *RouterReplayRedisConfig    `json:"redis,omitempty" yaml:"redis,omitempty"`
 	Postgres     *RouterReplayPostgresConfig `json:"postgres,omitempty" yaml:"postgres,omitempty"`

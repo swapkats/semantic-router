@@ -1,46 +1,31 @@
-import React, { Suspense, lazy, useState } from 'react'
-import {
-  BrowserRouter,
-  Route,
-  Routes,
-} from 'react-router-dom'
-import type { ConfigSection } from '../components/ConfigNav'
+import React from 'react'
+import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useSetup } from '../contexts/SetupContext'
-import { canAccessMLSetup } from '../utils/accessControl'
+import AuthTransitionPage from '../pages/AuthTransitionPage'
 import AuthGate from './AuthGate'
 import AuthenticatedShell from './AuthenticatedShell'
 import { renderAuthenticatedAppRoutes } from './AuthenticatedAppRoutes'
-import RouteLoadingFallback from './RouteLoadingFallback'
+import RecoverableLazyRoute from './RecoverableLazyRoute'
 import SetupStatusPage from './SetupStatusPage'
-
-const AuthTransitionPage = lazy(() => import('../pages/AuthTransitionPage'))
-const LandingPage = lazy(() => import('../pages/LandingPage'))
-const LoginPage = lazy(() => import('../pages/LoginPage'))
-
-const renderLazyRoute = (element: React.ReactElement) => (
-  <Suspense fallback={<RouteLoadingFallback />}>
-    {element}
-  </Suspense>
-)
+import ProductLoadingState from '../components/ProductLoadingState'
+import { loadInviteAcceptPage, loadLandingPage, loadLoginPage } from './routeLoaders'
+import { useReadonly } from '../contexts/ReadonlyContext'
+import { useCapabilities } from '../contexts/CapabilitiesContext'
 
 const AppRouter: React.FC = () => {
   const { setupState, isLoading, error, refreshSetupState } = useSetup()
-  const { user } = useAuth()
-  const [configSection, setConfigSection] = useState<ConfigSection>('global-config')
-  const canUseMLSetup = canAccessMLSetup(user)
+  const { user, refreshSession } = useAuth()
+  const { refreshSettings } = useReadonly()
+  const {
+    capabilities,
+    isLoading: capabilitiesLoading,
+    error: capabilitiesError,
+    refreshCapabilities,
+  } = useCapabilities()
 
   if (isLoading) {
-    return (
-      <SetupStatusPage
-        title="Loading setup state"
-        description="The dashboard is checking whether this workspace is already activated or still in first-run setup mode."
-        actionLabel="Refresh"
-        onAction={() => {
-          window.location.reload()
-        }}
-      />
-    )
+    return <ProductLoadingState label="Opening your workspace" />
   }
 
   if (error) {
@@ -61,17 +46,33 @@ const AppRouter: React.FC = () => {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={renderLazyRoute(<LandingPage />)} />
-        <Route path="/login" element={renderLazyRoute(<LoginPage />)} />
-        <Route path="/auth/transition" element={renderLazyRoute(<AuthTransitionPage />)} />
+        <Route
+          path="/"
+          element={<RecoverableLazyRoute loader={loadLandingPage} routeLabel="Landing page" />}
+        />
+        <Route
+          path="/login"
+          element={<RecoverableLazyRoute loader={loadLoginPage} routeLabel="Login" />}
+        />
+        <Route
+          path="/invite/:token"
+          element={<RecoverableLazyRoute loader={loadInviteAcceptPage} routeLabel="Invitation" />}
+        />
+        <Route path="/auth/transition" element={<AuthTransitionPage />} />
 
         <Route element={<AuthGate />}>
           <Route element={<AuthenticatedShell />}>
             {renderAuthenticatedAppRoutes({
-              configSection,
-              setConfigSection,
-              canUseMLSetup,
+              user,
               setupMode,
+              capabilities,
+              capabilitiesLoading,
+              capabilitiesError,
+              onRefreshAccess: () => {
+                refreshSettings()
+                refreshCapabilities()
+                void refreshSession()
+              },
             })}
           </Route>
         </Route>

@@ -5,17 +5,16 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 
+	"github.com/vllm-project/semantic-router/dashboard/backend/auth"
 	"github.com/vllm-project/semantic-router/dashboard/backend/configprojection"
 	routerconfig "github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
 // ConfigHandler reads and serves the config as JSON from the local config file.
-func ConfigHandler(configPath string) http.HandlerFunc {
+func ConfigHandler(configPath string, readonlyMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -24,11 +23,11 @@ func ConfigHandler(configPath string) http.HandlerFunc {
 
 		configData, err := readCanonicalConfigFile(configPath)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read config: %v", err), http.StatusInternalServerError)
+			log.Printf("Failed to read config: %v", err)
+			http.Error(w, "Failed to read config", http.StatusInternalServerError)
 			return
 		}
-
-		if err := writeYAMLTaggedJSON(w, configData); err != nil {
+		if err := writeConfigViewJSON(w, r, configData); err != nil {
 			log.Printf("Error encoding config to JSON: %v", err)
 		}
 	}
@@ -37,9 +36,9 @@ func ConfigHandler(configPath string) http.HandlerFunc {
 // ConfigYAMLHandler reads and serves the config as raw YAML text.
 // This is used by the DSL Builder to load the current router config
 // and decompile it into DSL via WASM.
-func ConfigYAMLHandler(configPath string) http.HandlerFunc {
+func ConfigYAMLHandler(configPath string, readonlyMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -47,10 +46,19 @@ func ConfigYAMLHandler(configPath string) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 
-		data, err := os.ReadFile(configPath)
+		data, err := readPersistedDashboardConfig(configPath)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read config: %v", err), http.StatusInternalServerError)
+			log.Printf("Failed to read config: %v", err)
+			http.Error(w, "Failed to read config", http.StatusInternalServerError)
 			return
+		}
+		if !callerCanViewConfigSecrets(r) {
+			data, err = redactConfigYAML(data)
+			if err != nil {
+				log.Printf("Failed to redact configuration credentials: %v", err)
+				http.Error(w, "Failed to read config", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		_, _ = w.Write(data)
@@ -82,20 +90,27 @@ func UpdateConfigHandler(configPath string, readonlyMode bool, configDir string)
 			return
 		}
 
-		configData, err := decodeYAMLTaggedBody[routerconfig.CanonicalConfig](r.Body)
+		configData, err := decodeYAMLTaggedBody[canonicalConfigTransport](r.Body)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 			return
 		}
-		if validationErr := validateCanonicalEndpointRefs(configData); validationErr != nil {
+		if validationErr := validateCanonicalEndpointRefs(configData.CanonicalConfig); validationErr != nil {
 			http.Error(w, fmt.Sprintf("Config validation failed: %v", validationErr), http.StatusBadRequest)
 			return
 		}
+		release, lockErr := beginOrdinaryRuntimeConfigMutation(configDir)
+		if lockErr != nil {
+			writeRuntimeConfigMutationError(w, lockErr)
+			return
+		}
+		defer release()
 
 		// Read existing config so runtime rollback can restore the previous file if needed.
-		existingData, err := os.ReadFile(configPath)
+		existingData, err := readPersistedDashboardConfig(configPath)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read existing config: %v", err), http.StatusInternalServerError)
+			log.Printf("Failed to read existing config: %v", err)
+			http.Error(w, "Failed to read existing config", http.StatusInternalServerError)
 			return
 		}
 
@@ -105,11 +120,17 @@ func UpdateConfigHandler(configPath string, readonlyMode bool, configDir string)
 			return
 		}
 
+		yamlData, err = restoreConfigSecrets(existingData, yamlData)
+		if err != nil {
+			http.Error(w, "Invalid redacted configuration credentials", http.StatusBadRequest)
+			return
+		}
 		parsedConfig, err := routerconfig.ParseYAMLBytes(yamlData)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Config validation failed: %v", err), http.StatusBadRequest)
 			return
 		}
+		warnings := savedConfigWarnings(parsedConfig)
 
 		// Explicitly validate vLLM endpoints (Parse doesn't validate endpoints by default)
 		if len(parsedConfig.VLLMEndpoints) > 0 {
@@ -124,13 +145,27 @@ func UpdateConfigHandler(configPath string, readonlyMode bool, configDir string)
 			}
 		}
 
+		if auth.RejectRevokedMutation(w, r) {
+			return
+		}
 		if err := writeConfigAtomically(configPath, yamlData); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to write config: %v", err), http.StatusInternalServerError)
+			writeConfigPersistenceError(w, err)
+			return
+		}
+		if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
 			return
 		}
 
-		if err := applyWrittenConfig(configPath, configDir, existingData, true); err != nil {
-			http.Error(w, formatRuntimeApplyError("Failed to apply config to runtime", err), http.StatusInternalServerError)
+		restartMessage, applyErr := applyWrittenConfig(configPath, configDir, existingData, true)
+		if applyErr != nil {
+			http.Error(w, formatRuntimeApplyError("Failed to apply config to runtime", applyErr), http.StatusInternalServerError)
+			return
+		}
+		if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
+			return
+		}
+		if configActivationDeferred() {
+			writeDeferredConfigResponse(w, warnings)
 			return
 		}
 
@@ -141,35 +176,39 @@ func UpdateConfigHandler(configPath string, readonlyMode bool, configDir string)
 			DSLSnapshot: readArchivedDSL(configDir),
 		})
 
-		if err := writeYAMLTaggedJSON(w, map[string]string{"status": "success"}); err != nil {
-			log.Printf("Error encoding response: %v", err)
+		if restartMessage != "" {
+			writeRestartRequiredResponse(w, "", restartMessage, warnings)
+			return
 		}
+		writeConfigSavedResponse(w, warnings)
 	}
 }
 
 // RouterDefaultsHandler returns effective canonical global config merged from
 // router-owned defaults plus any current config.yaml global overrides.
-func RouterDefaultsHandler(configDir string) http.HandlerFunc {
+func RouterDefaultsHandler(configPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		defaults, err := currentGlobalDefaults(configDir)
+		defaults, err := currentGlobalDefaults(configPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to load defaults: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		if err := writeYAMLTaggedJSON(w, defaults); err != nil {
+		if err := writeConfigViewJSON(w, r, defaults); err != nil {
 			log.Printf("Error encoding global defaults to JSON: %v", err)
 		}
 	}
 }
 
-// UpdateRouterDefaultsHandler updates the canonical global override block in config.yaml.
-func UpdateRouterDefaultsHandler(configDir string, readonlyMode bool) http.HandlerFunc {
+// UpdateRouterDefaultsHandler updates the canonical global override block in
+// config.yaml. The body is a JSON merge patch of that block: a null value
+// removes its key.
+func UpdateRouterDefaultsHandler(configPath string, readonlyMode bool, configDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodPut {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -194,11 +233,17 @@ func UpdateRouterDefaultsHandler(configDir string, readonlyMode bool) http.Handl
 			http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 			return
 		}
+		release, lockErr := beginOrdinaryRuntimeConfigMutation(configDir)
+		if lockErr != nil {
+			writeRuntimeConfigMutationError(w, lockErr)
+			return
+		}
+		defer release()
 
-		configPath := filepath.Join(configDir, "config.yaml")
-		existingData, err := os.ReadFile(configPath)
+		existingData, err := readPersistedDashboardConfig(configPath)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read config: %v", err), http.StatusInternalServerError)
+			log.Printf("Failed to read config: %v", err)
+			http.Error(w, "Failed to read config", http.StatusInternalServerError)
 			return
 		}
 
@@ -208,23 +253,46 @@ func UpdateRouterDefaultsHandler(configDir string, readonlyMode bool) http.Handl
 			return
 		}
 
-		if _, err := routerconfig.ParseYAMLBytes(yamlData); err != nil {
+		yamlData, err = restoreConfigSecrets(existingData, yamlData)
+		if err != nil {
+			http.Error(w, "Invalid redacted configuration credentials", http.StatusBadRequest)
+			return
+		}
+		parsedConfig, err := routerconfig.ParseYAMLBytes(yamlData)
+		if err != nil {
 			http.Error(w, fmt.Sprintf("Config validation failed: %v", err), http.StatusBadRequest)
 			return
 		}
+		warnings := savedConfigWarnings(parsedConfig)
 
+		if auth.RejectRevokedMutation(w, r) {
+			return
+		}
 		if err := writeConfigAtomically(configPath, yamlData); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to write config: %v", err), http.StatusInternalServerError)
+			writeConfigPersistenceError(w, err)
+			return
+		}
+		if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
 			return
 		}
 
-		if err := applyWrittenConfig(configPath, configDir, existingData, false); err != nil {
-			http.Error(w, formatRuntimeApplyError("Failed to apply config to runtime", err), http.StatusInternalServerError)
+		restartMessage, applyErr := applyWrittenConfig(configPath, configDir, existingData, false)
+		if applyErr != nil {
+			http.Error(w, formatRuntimeApplyError("Failed to apply config to runtime", applyErr), http.StatusInternalServerError)
+			return
+		}
+		if rejectRevokedConfigAndRestore(w, r, configPath, configDir, existingData) {
+			return
+		}
+		if configActivationDeferred() {
+			writeDeferredConfigResponse(w, warnings)
 			return
 		}
 
-		if err := writeYAMLTaggedJSON(w, map[string]string{"status": "success"}); err != nil {
-			log.Printf("Error encoding response: %v", err)
+		if restartMessage != "" {
+			writeRestartRequiredResponse(w, "", restartMessage, warnings)
+			return
 		}
+		writeConfigSavedResponse(w, warnings)
 	}
 }

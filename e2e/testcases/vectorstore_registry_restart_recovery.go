@@ -17,11 +17,14 @@ import (
 	pkgtestcases "github.com/vllm-project/semantic-router/e2e/pkg/testcases"
 )
 
+const registryTestDocument = "Registry durability test document.\nThis content exists to verify file metadata survives restart."
+
 func init() {
 	pkgtestcases.Register("vectorstore-registry-restart-recovery", pkgtestcases.TestCase{
-		Description: "Vector store and file metadata stored in Postgres survive a semantic-router pod restart",
-		Tags:        []string{"vectorstore", "registry", "functional", "postgres", "restart"},
-		Fn:          testVectorStoreRegistryRestartRecovery,
+		Description:         "Vector store and file metadata stored in Postgres, and the file's bytes on the Router's data volume, survive a semantic-router pod restart",
+		Tags:                []string{"vectorstore", "registry", "functional", "postgres", "restart"},
+		MutatesClusterState: true,
+		Fn:                  testVectorStoreRegistryRestartRecovery,
 	})
 }
 
@@ -81,12 +84,12 @@ func registryCreateVectorStore(ctx context.Context, httpClient *http.Client, bas
 		"metadata": map[string]interface{}{"env": "e2e", "purpose": "restart-recovery"},
 	}
 
-	resp, err := fixtures.DoPOSTRequest(ctx, httpClient, baseURL+"/v1/vector_stores", payload)
+	resp, err := fixtures.DoPOSTRequest(ctx, httpClient, baseURL+"/api/v1/storage/vector-stores", payload)
 	if err != nil {
-		return "", fmt.Errorf("POST /v1/vector_stores failed: %w", err)
+		return "", fmt.Errorf("POST /api/v1/storage/vector-stores failed: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("POST /v1/vector_stores returned status %d: %s", resp.StatusCode, string(resp.Body))
+		return "", fmt.Errorf("POST /api/v1/storage/vector-stores returned status %d: %s", resp.StatusCode, string(resp.Body))
 	}
 
 	var result struct {
@@ -114,7 +117,7 @@ func registryUploadFile(ctx context.Context, httpClient *http.Client, baseURL st
 	if err != nil {
 		return "", fmt.Errorf("create form file: %w", err)
 	}
-	if _, err := fw.Write([]byte("Registry durability test document.\nThis content exists to verify file metadata survives restart.")); err != nil {
+	if _, err = fw.Write([]byte(registryTestDocument)); err != nil {
 		return "", fmt.Errorf("write form file: %w", err)
 	}
 	if err := w.WriteField("purpose", "assistants"); err != nil {
@@ -124,7 +127,7 @@ func registryUploadFile(ctx context.Context, httpClient *http.Client, baseURL st
 		return "", fmt.Errorf("close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/files", &buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/v1/storage/files", &buf)
 	if err != nil {
 		return "", fmt.Errorf("create upload request: %w", err)
 	}
@@ -132,7 +135,7 @@ func registryUploadFile(ctx context.Context, httpClient *http.Client, baseURL st
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("POST /v1/files failed: %w", err)
+		return "", fmt.Errorf("POST /api/v1/storage/files failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -141,7 +144,7 @@ func registryUploadFile(ctx context.Context, httpClient *http.Client, baseURL st
 		return "", fmt.Errorf("read upload response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("POST /v1/files returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("POST /api/v1/storage/files returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -208,9 +211,10 @@ func verifyRegistryEntriesAfterRestart(ctx context.Context, client *kubernetes.C
 		if err == nil {
 			if opts.SetDetails != nil {
 				opts.SetDetails(map[string]interface{}{
-					"store_id": storeID,
-					"file_id":  fileID,
-					"survived": true,
+					"store_id":         storeID,
+					"file_id":          fileID,
+					"survived":         true,
+					"content_survived": true,
 				})
 			}
 			return nil
@@ -235,11 +239,33 @@ func verifyRegistryOnce(ctx context.Context, client *kubernetes.Clientset, opts 
 	if err := verifyStoreExists(ctx, httpClient, baseURL, storeID, opts.Verbose); err != nil {
 		return err
 	}
-	return verifyFileExists(ctx, httpClient, baseURL, fileID, opts.Verbose)
+	if err := verifyFileExists(ctx, httpClient, baseURL, fileID, opts.Verbose); err != nil {
+		return err
+	}
+	return verifyFileContent(ctx, httpClient, baseURL, fileID, opts.Verbose)
+}
+
+// verifyFileContent reads the uploaded bytes back from the restarted Router,
+// which keeps them on its data volume's claim.
+func verifyFileContent(ctx context.Context, httpClient *http.Client, baseURL, fileID string, verbose bool) error {
+	resp, err := fixtures.DoGETRequest(ctx, httpClient, baseURL+"/api/v1/storage/files/"+fileID+"/content")
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET /api/v1/storage/files/%s/content returned %d: %s", fileID, resp.StatusCode, string(resp.Body))
+	}
+	if string(resp.Body) != registryTestDocument {
+		return fmt.Errorf("file %s content after restart = %q, want the uploaded %q", fileID, string(resp.Body), registryTestDocument)
+	}
+	if verbose {
+		fmt.Printf("[Test] File %s content survived restart (%d bytes)\n", fileID, len(resp.Body))
+	}
+	return nil
 }
 
 func verifyStoreExists(ctx context.Context, httpClient *http.Client, baseURL, storeID string, verbose bool) error {
-	resp, err := fixtures.DoGETRequest(ctx, httpClient, baseURL+"/v1/vector_stores/"+storeID)
+	resp, err := fixtures.DoGETRequest(ctx, httpClient, baseURL+"/api/v1/storage/vector-stores/"+storeID)
 	if err != nil {
 		if verbose {
 			fmt.Printf("[Test] GET vector store %s not ready yet: %v — retrying\n", storeID, err)
@@ -247,7 +273,7 @@ func verifyStoreExists(ctx context.Context, httpClient *http.Client, baseURL, st
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		retryErr := fmt.Errorf("GET /v1/vector_stores/%s returned %d: %s", storeID, resp.StatusCode, string(resp.Body))
+		retryErr := fmt.Errorf("GET /api/v1/storage/vector-stores/%s returned %d: %s", storeID, resp.StatusCode, string(resp.Body))
 		if verbose {
 			fmt.Printf("[Test] %v — retrying\n", retryErr)
 		}
@@ -272,7 +298,7 @@ func verifyStoreExists(ctx context.Context, httpClient *http.Client, baseURL, st
 }
 
 func verifyFileExists(ctx context.Context, httpClient *http.Client, baseURL, fileID string, verbose bool) error {
-	resp, err := fixtures.DoGETRequest(ctx, httpClient, baseURL+"/v1/files/"+fileID)
+	resp, err := fixtures.DoGETRequest(ctx, httpClient, baseURL+"/api/v1/storage/files/"+fileID)
 	if err != nil {
 		if verbose {
 			fmt.Printf("[Test] GET file %s not ready yet: %v — retrying\n", fileID, err)
@@ -280,7 +306,7 @@ func verifyFileExists(ctx context.Context, httpClient *http.Client, baseURL, fil
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		retryErr := fmt.Errorf("GET /v1/files/%s returned %d: %s", fileID, resp.StatusCode, string(resp.Body))
+		retryErr := fmt.Errorf("GET /api/v1/storage/files/%s returned %d: %s", fileID, resp.StatusCode, string(resp.Body))
 		if verbose {
 			fmt.Printf("[Test] %v — retrying\n", retryErr)
 		}

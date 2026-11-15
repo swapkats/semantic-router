@@ -23,14 +23,18 @@ def empty_snapshot() -> dict:
             "pull_requests": {
                 "merge-candidate": [],
                 "review-now": [],
+                "needs-author": [],
                 "unblock": [],
                 "needs-rebase": [],
                 "close-candidate": [],
             },
             "issues": {
+                "release-blocker": [],
+                "needs-acceptance": [],
+                "in-progress": [],
+                "ready-for-dev": [],
+                "close-candidate": [],
                 "milestone-bound": [],
-                "milestone-candidate": [],
-                "incoming-triage": [],
                 "backlog": [],
                 "stale": [],
             },
@@ -40,6 +44,128 @@ def empty_snapshot() -> dict:
 
 
 class MaintainerBoardGAReadinessTests(unittest.TestCase):
+    def test_gh_json_retries_transient_gateway_errors(self) -> None:
+        transient = maintainer_board.subprocess.CompletedProcess(
+            ["gh", "pr", "list"],
+            1,
+            stdout="",
+            stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
+        )
+        success = maintainer_board.subprocess.CompletedProcess(
+            ["gh", "pr", "list"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+
+        with (
+            mock.patch.object(
+                maintainer_board.subprocess,
+                "run",
+                side_effect=[transient, success],
+            ) as run,
+            mock.patch.object(maintainer_board.time, "sleep") as sleep,
+        ):
+            payload = maintainer_board.gh_json(["pr", "list"])
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def pull_request_page(self, numbers, *, next_cursor=None) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {
+                            "hasNextPage": next_cursor is not None,
+                            "endCursor": next_cursor,
+                        },
+                        "nodes": [
+                            {
+                                "number": number,
+                                "title": f"pr {number}",
+                                "labels": {"nodes": [{"name": "bug"}]},
+                                "assignees": {"nodes": [{"login": "owner"}]},
+                            }
+                            for number in numbers
+                        ],
+                    }
+                }
+            }
+        }
+
+    def test_fetch_github_state_fetches_pr_status_rollups_separately(self) -> None:
+        policy = {"default_issue_limit": 100, "default_pr_limit": 50}
+
+        with mock.patch.object(
+            maintainer_board,
+            "gh_json",
+            side_effect=[
+                [],
+                self.pull_request_page([12, 13]),
+                {"statusCheckRollup": [{"conclusion": "SUCCESS"}]},
+                {"statusCheckRollup": [{"conclusion": "FAILURE"}]},
+                [{"title": "v0.4"}],
+                [{"name": "bug"}],
+            ],
+        ) as gh_json:
+            state = maintainer_board.fetch_github_state(policy)
+
+        self.assertEqual(
+            state["pull_requests"],
+            [
+                {
+                    "number": 12,
+                    "title": "pr 12",
+                    "labels": [{"name": "bug"}],
+                    "assignees": [{"login": "owner"}],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+                },
+                {
+                    "number": 13,
+                    "title": "pr 13",
+                    "labels": [{"name": "bug"}],
+                    "assignees": [{"login": "owner"}],
+                    "statusCheckRollup": [{"conclusion": "FAILURE"}],
+                },
+            ],
+        )
+        pr_list_call = gh_json.call_args_list[1].args[0]
+        pr_list_query = pr_list_call[pr_list_call.index("-f") + 1]
+        self.assertIn("mergeStateStatus", pr_list_query)
+        self.assertNotIn("statusCheckRollup", pr_list_query)
+        self.assertEqual(
+            gh_json.call_args_list[2].args[0],
+            ["pr", "view", "12", "--json", "statusCheckRollup"],
+        )
+        self.assertEqual(
+            gh_json.call_args_list[3].args[0],
+            ["pr", "view", "13", "--json", "statusCheckRollup"],
+        )
+
+    def test_pull_requests_are_listed_in_small_pages_up_to_the_limit(self) -> None:
+        page_size = maintainer_board.PULL_REQUEST_PAGE_SIZE
+        first = list(range(1, page_size + 1))
+        second = [100, 101]
+
+        with mock.patch.object(
+            maintainer_board,
+            "gh_json",
+            side_effect=[
+                self.pull_request_page(first, next_cursor="after-first"),
+                self.pull_request_page(second),
+            ],
+        ) as gh_json:
+            pull_requests = maintainer_board.list_open_pull_requests(page_size + 2)
+
+        self.assertEqual([pr["number"] for pr in pull_requests], [*first, *second])
+        first_call, second_call = (call.args[0] for call in gh_json.call_args_list)
+        self.assertIn(f"size={page_size}", first_call)
+        self.assertNotIn("cursor=after-first", first_call)
+        self.assertIn("size=2", second_call)
+        self.assertIn("cursor=after-first", second_call)
+
     def test_latest_ga_readiness_report_summarizes_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

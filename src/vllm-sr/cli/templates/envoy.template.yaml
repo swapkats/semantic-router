@@ -1,3 +1,42 @@
+{#- Route timeouts and retry policy from a model's reliability block, at the
+    indentation of a route action's fields. Retries prefer an endpoint the
+    request has not tried, as the standalone Router's do. #}
+{% macro route_reliability(r, listener) %}
+                  timeout: {{ r.total_timeout or (listener.timeout | default('1200s')) }}
+                  {% if r.idle_timeout %}
+                  idle_timeout: {{ r.idle_timeout }}
+                  {% endif %}
+                  {% if r.retry_count | default(0) > 0 or r.per_try_timeout %}
+                  retry_policy:
+                    retry_on: {{ r.retry_on | default('connect-failure,refused-stream') }}
+                    num_retries: {{ r.retry_count | default(0) }}
+                    {% if r.per_try_timeout %}
+                    per_try_timeout: {{ r.per_try_timeout }}
+                    {% endif %}
+                    {% if r.retriable_status_codes %}
+                    retriable_status_codes: {{ r.retriable_status_codes | tojson }}
+                    {% endif %}
+                    {% if r.retry_back_off_base or r.retry_back_off_max %}
+                    retry_back_off:
+                      base_interval: {{ r.retry_back_off_base | default('0.025s', true) }}
+                      {% if r.retry_back_off_max %}
+                      max_interval: {{ r.retry_back_off_max }}
+                      {% endif %}
+                    {% endif %}
+                    {% if r.retry_after_max %}
+                    rate_limited_retry_back_off:
+                      reset_headers:
+                      - name: retry-after
+                        format: SECONDS
+                      max_interval: {{ r.retry_after_max }}
+                    {% endif %}
+                    retry_host_predicate:
+                    - name: envoy.retry_host_predicates.previous_hosts
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+                    host_selection_retry_max_attempts: 3
+                  {% endif %}
+{% endmacro %}
 admin:
   address:
     socket_address:
@@ -10,7 +49,7 @@ static_resources:
   - name: {{ listener.name }}
     address:
       socket_address:
-        address: {{ listener.address }}
+        address: {{ listener.address | tojson }}
         port_value: {{ listener.port }}
     perConnectionBufferLimitBytes: 524288000
     filter_chains:
@@ -26,24 +65,31 @@ static_resources:
             virtual_hosts:
             - name: local_service
               domains: ["*"]
-              # Security: strip internal headers from client requests to prevent
-              # looper bypass, identity spoofing, and credential leakage.
+              # Identity headers never reach a model backend. Envoy removes them
+              # from the request it sends upstream, after the HTTP filters ran;
+              # client-sent identity is removed at ingress below.
               request_headers_to_remove:
-              - "x-vsr-looper-request"
-              - "x-vsr-looper-secret"
-              - "x-vsr-looper-decision"
-              - "x-vsr-looper-iteration"
-              - "x-authz-user-id"
-              - "x-authz-user-groups"
+              {% for header in identity_headers %}
+              - {{ header | tojson }}
+              {% endfor %}
+              {% for header in delegated_credential_headers %}
+              - {{ header | tojson }}
+              {% endfor %}
               routes:
               {% for model in models %}
-              # Route for model: {{ model.name }}
+              # Route for model: {{ model.name | tojson }}
               - match:
+                  {% if listener.served_path_regex %}
+                  # Only the paths of the APIs this listener serves.
+                  safe_regex:
+                    regex: {{ listener.served_path_regex | tojson }}
+                  {% else %}
                   prefix: "/"
+                  {% endif %}
                   headers:
-                  - name: x-selected-model
+                  - name: x-vsr-route-model
                     string_match:
-                      exact: "{{ model.name }}"
+                      exact: {{ model.name | tojson }}
                 {% if model.route_request_headers %}
                 request_headers_to_add:
                 {% for header in model.route_request_headers %}
@@ -55,36 +101,25 @@ static_resources:
                 {% endif %}
                 route:
                   cluster: {{ model.cluster_name }}_cluster
-                  timeout: {{ listener.timeout | default('1200s') }}
-                  idleTimeout: 1200s
-                  # Rewrite Host header to match upstream server
+{{ route_reliability(model.reliability, listener) }}
+                  # Rewrite Host header to match the endpoint Envoy selected.
+                  {% if model.auto_host_rewrite %}
+                  auto_host_rewrite: true
+                  {% else %}
                   host_rewrite_literal: "{{ model.endpoints[0].host_authority }}"
-                  {% if model.path_prefix %}
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "{{ model.path_prefix }}\\1"
                   {% endif %}
+                  # ext_proc has already resolved the complete provider path for
+                  # requests carrying x-vsr-route-model, so this route must not
+                  # prefix it a second time.
               {% endfor %}
-              {% for model in anthropic_models %}
-              # Route for Anthropic model: {{ model.name }}
+              # Default route (no x-vsr-route-model header)
               - match:
+                  {% if listener.served_path_regex %}
+                  safe_regex:
+                    regex: {{ listener.served_path_regex | tojson }}
+                  {% else %}
                   prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      exact: "{{ model.name }}"
-                route:
-                  cluster: anthropic_api_cluster
-                  timeout: {{ listener.timeout | default('1200s') }}
-                  idleTimeout: 1200s
-                  host_rewrite_literal: "api.anthropic.com"
-              {% endfor %}
-              # Default route (no x-selected-model header)
-              - match:
-                  prefix: "/"
+                  {% endif %}
                 {% if models and models[0].route_request_headers %}
                 request_headers_to_add:
                 {% for header in models[0].route_request_headers %}
@@ -101,20 +136,52 @@ static_resources:
                   {% else %}
                   cluster: vllm_static_cluster
                   {% endif %}
-                  timeout: {{ listener.timeout | default('1200s') }}
+{{ route_reliability(models[0].reliability if models else {}, listener) }}
                   {% if models %}
-                  # Rewrite Host header to match upstream server
+                  # Rewrite Host header to match the endpoint Envoy selected.
+                  {% if models[0].auto_host_rewrite %}
+                  auto_host_rewrite: true
+                  {% else %}
                   host_rewrite_literal: "{{ models[0].endpoints[0].host_authority }}"
                   {% endif %}
+                  {% endif %}
                   {% if models and models[0].path_prefix %}
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
+                  # Prepend path prefix to /v1 requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions).
+                  # Match only the complete /v1 segment so route recomputation cannot rewrite /v1beta/... again.
                   regex_rewrite:
                     pattern:
                       google_re2: {}
-                      regex: "^/v1(.*)$"
+                      regex: "^/v1([/?].*)?$"
                     substitution: "{{ models[0].path_prefix }}\\1"
                   {% endif %}
+              {% if listener.served_path_regex %}
+              # A path of an API this listener does not serve.
+              - match:
+                  prefix: "/"
+                direct_response:
+                  status: 404
+                  body:
+                    inline_string: {{ listener.unserved_body | tojson }}
+                response_headers_to_add:
+                - header:
+                    key: content-type
+                    value: application/json
+                  append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              {% endif %}
           http_filters:
+          {% if not listener.trust_identity_headers %}
+          # Only an authenticating proxy in front of a listener that sets
+          # identity.trust_headers may assert identity: the identity headers a
+          # client sends are removed before any filter or the Router reads them.
+          - name: strip-client-identity
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+              mutations:
+                request_mutations:
+                {% for header in identity_headers %}
+                - remove: {{ header | tojson }}
+                {% endfor %}
+          {% endif %}
           {% if listener.api_keys %}
           - name: envoy.filters.http.lua
             typed_config:
@@ -132,7 +199,15 @@ static_resources:
                   local auth = request_handle:headers():get("authorization") or
                                request_handle:headers():get("Authorization") or ""
                   local token = string.match(auth, "^[Bb]earer%s+(.+)$")
+                  if not (token and VALID_KEYS[token]) then
+                    -- Azure OpenAI clients send the key in api-key instead.
+                    token = request_handle:headers():get("api-key")
+                  end
                   if token and VALID_KEYS[token] then
+                    -- The listener credential authenticates the Router client;
+                    -- it is never an upstream provider credential.
+                    request_handle:headers():remove("authorization")
+                    request_handle:headers():remove("api-key")
                     return
                   end
                   request_handle:respond(
@@ -143,6 +218,20 @@ static_resources:
                   )
                 end
           {% endif %}
+          # The delegated credential is an authenticator output, never a client
+          # input. Remove any client copy before ext_proc sees the request; the
+          # route-level removal above only runs at the router filter. This
+          # stack runs no authenticator, so a deployment that issues the
+          # credential adds its authenticator after this filter.
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                {% for header in delegated_credential_headers %}
+                  request_handle:headers():remove({{ header | tojson }})
+                {% endfor %}
+                end
           - name: envoy.filters.http.ext_proc
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
@@ -150,13 +239,20 @@ static_resources:
               grpc_service:
                 envoy_grpc:
                   cluster_name: extproc_service
-                timeout: 1200s
               processing_mode:
                 request_header_mode: "SEND"
                 response_header_mode: "SEND"
                 request_body_mode: "BUFFERED"
                 response_body_mode: "BUFFERED"
-              message_timeout: {{ listener.timeout | default('1200s') }}
+              # Unlike route/idle timeouts, zero expires immediately here.
+              # Bound each Router processing step independently of chat duration.
+              message_timeout: 1200s
+              # A decision's reliability block reaches Envoy's router as these
+              # per-request headers. ext_proc may set no other x-envoy-* header.
+              # Always rendered: the Router reloads its config without Envoy.
+              mutation_rules:
+                allow_expression:
+                  regex: "^x-envoy-(upstream-rq-timeout-ms|upstream-rq-per-try-timeout-ms|max-retries|retry-on|retriable-status-codes)$"
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -216,14 +312,52 @@ static_resources:
   {% endif %}
 
   {% for model in models %}
-  # Cluster for model: {{ model.name }}
+  # Cluster for model: {{ model.name | tojson }}
   - name: {{ model.cluster_name }}_cluster
-    connect_timeout: 1200s
+    connect_timeout: {{ model.reliability.connect_timeout | default('10s', true) }}
     type: {{ model.cluster_type }}
     {% if model.cluster_type == 'LOGICAL_DNS' %}
     dns_lookup_family: V4_ONLY
     {% endif %}
+    {% if model.reliability.lb_policy | default('round_robin') == 'least_request' %}
+    lb_policy: LEAST_REQUEST
+    least_request_lb_config:
+      choice_count: 2
+    {% else %}
     lb_policy: ROUND_ROBIN
+    {% endif %}
+    {% set raised = model.reliability.retry_count | default(0) > 0 or model.reliability.consecutive_5xx | default(0) > 0 %}
+    {% set budget = model.reliability.retry_budget_percent or model.reliability.retry_budget_min_concurrency %}
+    {% if raised or budget %}
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 1024
+        max_pending_requests: 1024
+        max_requests: {{ 4096 if raised else 1024 }}
+        {% if budget %}
+        retry_budget:
+          budget_percent:
+            value: {{ model.reliability.retry_budget_percent | default(20.0, true) }}
+          min_retry_concurrency: {{ model.reliability.retry_budget_min_concurrency | default(3, true) }}
+        {% endif %}
+    {% endif %}
+    {% if model.reliability.consecutive_5xx | default(0) > 0 and model.endpoints | length > 1 %}
+    outlier_detection:
+      consecutive_5xx: {{ model.reliability.consecutive_5xx }}
+      interval: 10s
+      base_ejection_time: {{ model.reliability.base_ejection_time | default('30s') }}
+      max_ejection_percent: {{ model.reliability.max_ejection_percent | default(50) }}
+    {% endif %}
+    {% if model.reliability.health_check_path | default('') %}
+    health_checks:
+    - timeout: {{ model.reliability.health_check_timeout | default('2s') }}
+      interval: {{ model.reliability.health_check_interval | default('10s') }}
+      unhealthy_threshold: 3
+      healthy_threshold: 1
+      http_health_check:
+        path: {{ model.reliability.health_check_path | tojson }}
+    {% endif %}
     load_assignment:
       cluster_name: {{ model.cluster_name }}_cluster
       endpoints:
@@ -234,7 +368,9 @@ static_resources:
               socket_address:
                 address: {{ endpoint.address }}
                 port_value: {{ endpoint.port }}
-            {% if endpoint.is_domain %}
+            {% if model.auto_host_rewrite %}
+            hostname: "{{ endpoint.host_authority }}"
+            {% elif endpoint.is_domain %}
             hostname: "{{ endpoint.address }}"
             {% endif %}
           load_balancing_weight: {{ endpoint.weight | default(1) }}
@@ -244,41 +380,24 @@ static_resources:
       name: envoy.transport_sockets.tls
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: {{ model.endpoints[0].address }}
+        sni: {{ model.tls.server_name | tojson if model.tls.server_name else model.endpoints[0].address }}
+        auto_sni_san_validation: true
         common_tls_context:
           tls_params:
             tls_minimum_protocol_version: TLSv1_2
             tls_maximum_protocol_version: TLSv1_3
+          {%- if model.tls.cert_file %}
+          tls_certificates:
+          - certificate_chain:
+              filename: {{ model.tls.cert_file | tojson }}
+            private_key:
+              filename: {{ model.tls.key_file | tojson }}
+          {%- endif %}
+          validation_context:
+            trusted_ca:
+              filename: {{ model.tls.ca_file | tojson if model.tls.ca_file else "/etc/ssl/certs/ca-certificates.crt" }}
     {% endif %}
   {% endfor %}
-
-  {% if anthropic_models %}
-  # Shared cluster for Anthropic API (all Anthropic models use this cluster)
-  - name: anthropic_api_cluster
-    type: LOGICAL_DNS
-    dns_lookup_family: V4_ONLY
-    connect_timeout: 1200s
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: anthropic_api_cluster
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: api.anthropic.com
-                port_value: 443
-            hostname: "api.anthropic.com"
-    transport_socket:
-      name: envoy.transport_sockets.tls
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: api.anthropic.com
-        common_tls_context:
-          tls_params:
-            tls_minimum_protocol_version: TLSv1_2
-            tls_maximum_protocol_version: TLSv1_3
-  {% endif %}
 
 # Runtime configuration
 layered_runtime:

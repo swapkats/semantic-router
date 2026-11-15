@@ -2,9 +2,8 @@
 
 ## Overview
 
-Use `config/decision/and/` when multiple signals must all match before the route is valid.
-
-`AND` is the standard shape for narrow, high-confidence routes.
+An `AND` decision matches only when every child condition matches. Use it for
+narrow routes that require several independent facts.
 
 ## Key Advantages
 
@@ -21,7 +20,7 @@ A single signal often matches too broadly. Domain alone may be insufficient with
 
 ## When to Use
 
-Use `and/` when:
+Use `AND` when:
 
 - domain and urgency must both be present
 - domain and safety clearance must both pass
@@ -29,24 +28,28 @@ Use `and/` when:
 
 ## Configuration
 
-Source fragment: `config/decision/and/urgent-business.yaml`
-
 ```yaml
-routing:
-  decisions:
-    - name: urgent_business_route
-      description: Match only when business intent and urgent language appear together.
-      priority: 140
-      rules:
-        operator: AND
-        conditions:
-          - type: domain
-            name: business
-          - type: keyword
-            name: urgent_keywords
-      modelRefs:
-        - model: qwen2.5:3b
-          use_reasoning: false
+recipes:
+  - name: default
+    decisions:
+      - name: urgent_business_route
+        description: Match only when business intent and urgent language appear together.
+        priority: 140
+        rules:
+          operator: AND
+          conditions:
+            - type: domain
+              name: business
+            - type: keyword
+              name: urgent_keywords
+        modelRefs:
+          - model: qwen2.5:3b
+            use_reasoning: false
 ```
 
 Use `AND` when a model should only activate for a narrow, high-confidence slice of traffic.
+
+Every referenced signal must be declared in the same recipe. `AND` reduces
+broad matches but does not make probabilistic signals authoritative. See a
+complete example:
+[`config/fragments/decision/and/urgent-business.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/decision/and/urgent-business.yaml).

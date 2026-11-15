@@ -1,28 +1,16 @@
 // topology/types.ts - Topology Page Type Definitions
 
 import { ReactNode } from 'react'
+import type { NumericPredicate, SafetySignal } from '../../types/config'
+import type {
+  AlgorithmType as CanonicalAlgorithmType,
+  PluginType as CanonicalPluginType,
+  SignalType as CanonicalSignalType,
+} from '../../generated/routerConfigContract'
+import type { TopologyOptionalCacheConfig } from './cacheTypes'
 
 // ============== Signal Types ==============
-export type SignalType =
-  | 'keyword'
-  | 'embedding'
-  | 'domain'
-  | 'fact_check'
-  | 'user_feedback'
-  | 'reask'
-  | 'preference'
-  | 'language'
-  | 'context'
-  | 'structure'
-  | 'complexity'
-  | 'modality'
-  | 'authz'
-  | 'jailbreak'
-  | 'pii'
-  | 'kb'
-  | 'conversation'
-  | 'event'
-  | 'projection'
+export type SignalType = CanonicalSignalType | 'projection'
 
 export interface SignalConfig {
   type: SignalType
@@ -31,16 +19,13 @@ export interface SignalConfig {
   latency: string
   config:
     | KeywordSignalConfig
-    | EmbeddingSignalConfig
     | DomainSignalConfig
     | ContextSignalConfig
-    | StructureSignalConfig
     | ComplexitySignalConfig
     | ModalitySignalConfig
     | AuthzSignalConfig
     | JailbreakSignalConfig
     | PIISignalConfig
-    | KBSignalConfig
     | ProjectionSignalConfig
     | GenericSignalConfig
 }
@@ -49,16 +34,12 @@ export interface KeywordSignalConfig {
   operator: 'AND' | 'OR'
   keywords: string[]
   case_sensitive: boolean
-}
-
-export interface EmbeddingSignalConfig {
-  threshold: number
-  candidates: string[]
-  aggregation_method: 'max' | 'avg' | 'min'
+  count?: NumericPredicateConfig
+  density?: NumericPredicateConfig
 }
 
 export interface DomainSignalConfig {
-  mmlu_categories?: string[]
+  labels?: string[]
 }
 
 export interface ContextSignalConfig {
@@ -66,36 +47,11 @@ export interface ContextSignalConfig {
   max_tokens?: string
 }
 
-export interface StructureSourceConfig {
-  type: string
-  pattern?: string
-  keywords?: string[]
-  case_sensitive?: boolean
-  sequences?: string[][]
-}
-
-export interface StructureFeatureConfig {
-  type: string
-  source?: StructureSourceConfig
-}
-
 export interface NumericPredicateConfig {
   gt?: number
   gte?: number
   lt?: number
   lte?: number
-}
-
-export interface StructureSignalConfig {
-  feature?: StructureFeatureConfig
-  predicate?: NumericPredicateConfig
-}
-
-export interface StructureRuleDefinition {
-  name: string
-  description?: string
-  feature: StructureFeatureConfig
-  predicate?: NumericPredicateConfig
 }
 
 export interface ComplexitySignalConfig {
@@ -107,6 +63,7 @@ export interface ComplexitySignalConfig {
 export interface JailbreakSignalConfig {
   threshold?: number
   include_history?: boolean
+  direction?: 'request' | 'response'
 }
 
 // Modality is detected by the modality_detector inline model; no extra params needed.
@@ -118,17 +75,9 @@ export interface AuthzSignalConfig {
 
 export interface PIISignalConfig {
   threshold?: number
+  source?: 'tool_result'
   pii_types_allowed?: string[]
   include_history?: boolean
-}
-
-export interface KBSignalConfig {
-  kb: string
-  target: {
-    kind: 'label' | 'group'
-    value: string
-  }
-  match?: 'best' | 'threshold'
 }
 
 export interface ProjectionSignalInputRef {
@@ -178,72 +127,47 @@ export interface RawRuleNode {
 }
 
 export interface RawRuleCombination {
+  type?: string
+  name?: string
   operator?: string
   conditions?: RawRuleNode[]
 }
 
 // ============== Algorithm Types ==============
-export type AlgorithmType =
-  | 'confidence'
-  | 'concurrent'
-  | 'sequential'
-  | 'ratings'
-  | 'static'
-  | 'router_dc'
-  | 'automix'
-  | 'hybrid'
-  | 'remom'
-  | 'fusion'
-  | 'workflows'
-  | 'latency_aware'
-  | 'knn'
-  | 'kmeans'
-  | 'svm'
-  | 'mlp'
-  | 'multi_factor'
+export type AlgorithmType = CanonicalAlgorithmType
 
 export interface AlgorithmConfig {
   type: AlgorithmType
-  confidence?: ConfidenceAlgorithmConfig
-  concurrent?: ConcurrentAlgorithmConfig
-  latency_aware?: LatencyAwareAlgorithmConfig
-  ratings?: GenericAlgorithmConfig
-  remom?: GenericAlgorithmConfig
-  fusion?: GenericAlgorithmConfig
-  workflows?: GenericAlgorithmConfig
-  router_dc?: GenericAlgorithmConfig
-  automix?: GenericAlgorithmConfig
-  autoMix?: GenericAlgorithmConfig
-  hybrid?: GenericAlgorithmConfig
-  knn?: GenericAlgorithmConfig
-  kmeans?: GenericAlgorithmConfig
-  svm?: GenericAlgorithmConfig
-  mlp?: GenericAlgorithmConfig
+  minimum_candidates?: number
+  budget?: AlgorithmBudget
+  on_error?: string
   multi_factor?: GenericAlgorithmConfig
+  systemone?: GenericAlgorithmConfig
+  escalate?: EscalateAlgorithmConfig
+  fusion?: GenericAlgorithmConfig
+  remom?: GenericAlgorithmConfig
+  ratings?: GenericAlgorithmConfig
+  workflows?: GenericAlgorithmConfig
 }
 
 export type RawDecisionAlgorithmConfig = Omit<Partial<AlgorithmConfig>, 'type'> & {
   type: string
-  autoMix?: GenericAlgorithmConfig
 }
 
-export interface ConfidenceAlgorithmConfig {
-  threshold?: number
-  avg_logprob_threshold?: number
-  margin_threshold?: number
-  max_escalations?: number
-  on_error?: 'skip' | 'fail'
+export interface AlgorithmBudget {
+  deadline?: string
+  max_calls?: number
 }
 
-export interface ConcurrentAlgorithmConfig {
-  timeout_seconds?: number
-  on_error?: 'skip' | 'fail'
-}
-
-export interface LatencyAwareAlgorithmConfig {
-  tpot_percentile?: number
-  ttft_percentile?: number
-  description?: string
+export interface EscalateAlgorithmConfig {
+  order?: 'size' | 'cost'
+  accept?: {
+    confidence?: { method?: string; gte?: number }
+    systemone?: { gte?: number }
+    refusal?: boolean
+  }
+  quality?: GenericAlgorithmConfig
+  stages?: GenericAlgorithmConfig[]
 }
 
 export interface GenericAlgorithmConfig {
@@ -251,20 +175,7 @@ export interface GenericAlgorithmConfig {
 }
 
 // ============== Plugin Types ==============
-export type PluginType =
-  | 'semantic-cache'
-  | 'memory'
-  | 'system_prompt'
-  | 'header_mutation'
-  | 'hallucination'
-  | 'router_replay'
-  | 'rag'
-  | 'image_gen'
-  | 'fast_response'
-  | 'request_params'
-  | 'response_jailbreak'
-  | 'tools'
-  | 'tool_selection'
+export type PluginType = CanonicalPluginType
 
 export interface PluginConfig {
   type: PluginType
@@ -276,7 +187,8 @@ export interface PluginConfig {
 export interface ModelRefConfig {
   model: string
   use_reasoning?: boolean
-  reasoning_effort?: 'low' | 'medium' | 'high'
+  reasoning_mode?: 'enabled' | 'disabled' | 'adaptive'
+  reasoning_effort?: string
   lora_name?: string
   reasoning_family?: string
 }
@@ -298,15 +210,16 @@ export interface EndpointConfig {
 export interface PricingConfig {
   currency?: string
   prompt_per_1m?: number
+  cached_input_per_1m?: number
+  cache_write_per_1m?: number
+  cache_write_1h_per_1m?: number
   completion_per_1m?: number
 }
 
 // ============== Global Plugin Types ==============
 export interface GlobalPluginConfig {
-  type: 'prompt_guard' | 'pii_detection' | 'semantic_cache'
+  type: 'response_cache'
   enabled: boolean
-  modelId?: string
-  threshold?: number
   config?: Record<string, unknown>
 }
 
@@ -354,8 +267,20 @@ export interface TestQueryResult {
   highlightedPath: string[]
   isAccurate: boolean
   evaluatedRules?: EvaluatedRule[]
+  evalTrace?: Array<Record<string, unknown>>
+  signalErrors?: Record<string, string>
+  appliedUnknownPolicies?: Record<string, string>
+  decisionError?: string
+  selectedModel?: string
+  recommendedModels?: string[]
+  selectionStatus?: string
+  selectionMethod?: string
+  selectionReason?: string
   routingLatency?: number
   warning?: string
+  decisionConfidence?: number | null
+  decisionConfidenceAvailable?: boolean
+  signalErrorMatches?: Record<string, boolean>
   isFallbackDecision?: boolean // True if matched decision is a system fallback
   fallbackReason?: string // Reason for fallback (e.g., "low_confidence", "no_match")
 }
@@ -365,8 +290,9 @@ export interface MatchedSignal {
   name: string
   matched: boolean
   value?: number
-  confidence?: number
-  score?: number
+  confidence?: number | null
+  confidenceAvailable?: boolean
+  score?: number | null
   reason?: string
   needsBackend?: boolean
 }
@@ -374,6 +300,7 @@ export interface MatchedSignal {
 export interface EvaluatedRule {
   decisionName: string
   condition: string
+  state?: string
   result: boolean
   priority: number
   matchedConditions?: number
@@ -404,149 +331,6 @@ export interface FilterState {
 
 // ============== Config Data (from API) ==============
 export interface ConfigData {
-  embedding_models?: {
-    bert_model_path?: string
-    mmbert_model_path?: string
-    use_cpu?: boolean
-    embedding_config?: {
-      top_k?: number
-      min_score_threshold?: number
-    }
-  }
-  prompt_guard?: {
-    enabled: boolean
-    model_id?: string
-    model_ref?: string
-    use_modernbert?: boolean
-    threshold?: number
-    use_vllm?: boolean
-  }
-  classifier?: {
-    category_model?: {
-      model_id?: string
-      use_modernbert?: boolean
-      threshold?: number
-    }
-    pii_model?: {
-      enabled?: boolean
-      model_id?: string
-      model_ref?: string
-      use_modernbert?: boolean
-      threshold?: number
-    }
-  }
-  semantic_cache?: {
-    enabled: boolean
-    backend_type?: string
-    similarity_threshold?: number
-    ttl_seconds?: number
-  }
-  // Signal definitions
-  keyword_rules?: Array<{
-    name: string
-    operator: 'AND' | 'OR'
-    keywords: string[]
-    case_sensitive?: boolean
-  }>
-  embedding_rules?: Array<{
-    name: string
-    threshold: number
-    candidates: string[]
-    aggregation_method?: 'max' | 'avg' | 'min'
-  }>
-  fact_check_rules?: Array<{
-    name: string
-    description?: string
-  }>
-  user_feedback_rules?: Array<{
-    name: string
-    description?: string
-  }>
-  reask_rules?: Array<{
-    name: string
-    description?: string
-    threshold?: number
-    lookback_turns?: number
-  }>
-  preference_rules?: Array<{
-    name: string
-    description?: string
-    examples?: string[]
-    threshold?: number
-  }>
-  language_rules?: Array<{
-    name: string
-    languages?: string[]
-  }>
-  context_rules?: Array<{
-    name: string
-    min_tokens?: string
-    max_tokens?: string
-  }>
-  structure_rules?: StructureRuleDefinition[]
-  complexity_rules?: Array<{
-    name: string
-    threshold?: number
-    hard?: {
-      candidates?: string[]
-    }
-    easy?: {
-      candidates?: string[]
-    }
-    description?: string
-  }>
-  // Modality signal rules
-  modality_rules?: Array<{
-    name: string
-    description?: string
-  }>
-  // Authz / RBAC role bindings
-  role_bindings?: Array<{
-    name: string
-    role: string
-    subjects: Array<{
-      kind: 'User' | 'Group'
-      name: string
-    }>
-    description?: string
-  }>
-  // Jailbreak/PII signal rules (top-level due to yaml:",inline")
-  jailbreak?: Array<{
-    name: string
-    threshold?: number
-    include_history?: boolean
-    description?: string
-  }>
-  pii?: Array<{
-    name: string
-    threshold?: number
-    pii_types_allowed?: string[]
-    include_history?: boolean
-    description?: string
-  }>
-  kb?: Array<{
-    name: string
-    kb: string
-    target: {
-      kind: 'label' | 'group'
-      value: string
-    }
-    match?: 'best' | 'threshold'
-    description?: string
-  }>
-  conversation?: Array<{
-    name: string
-    description?: string
-    feature?: Record<string, unknown>
-    predicate?: Record<string, unknown>
-  }>
-  events?: Array<{
-    name: string
-    event_types?: string[]
-    severities?: string[]
-    action_codes?: string[]
-    temporal?: boolean
-  }>
   projections?: {
     scores?: Array<{
       name: string
@@ -573,43 +357,19 @@ export interface ConfigData {
       }>
     }>
   }
-  // Legacy format
-  categories?: Array<{
-    name: string
-    description?: string
-    system_prompt?: string
-    mmlu_categories?: string[]
-    model_scores?:
-      | Array<{
-          model: string
-          score: number
-          use_reasoning?: boolean
-        }>
-      | Record<string, number>
-  }>
-  model_config?: {
-    [key: string]: {
-      reasoning_family?: string
-    }
-  }
-  // Python CLI format - signals wrapper
+  // The selected routing profile's signals
   signals?: {
+    [collection: string]: unknown
     keywords?: Array<{
       name: string
       operator: 'AND' | 'OR'
       keywords: string[]
       case_sensitive?: boolean
     }>
-    embeddings?: Array<{
-      name: string
-      threshold: number
-      candidates: string[]
-      aggregation_method?: 'max' | 'avg' | 'min'
-    }>
     domains?: Array<{
       name: string
       description?: string
-      mmlu_categories?: string[]
+      labels?: string[]
     }>
     fact_check?: Array<{
       name: string
@@ -618,18 +378,6 @@ export interface ConfigData {
     user_feedbacks?: Array<{
       name: string
       description?: string
-    }>
-    reasks?: Array<{
-      name: string
-      description?: string
-      threshold?: number
-      lookback_turns?: number
-    }>
-    preferences?: Array<{
-      name: string
-      description?: string
-      examples?: string[]
-      threshold?: number
     }>
     language?: Array<{
       name: string
@@ -640,16 +388,11 @@ export interface ConfigData {
       min_tokens?: string
       max_tokens?: string
     }>
-    structure?: StructureRuleDefinition[]
     complexity?: Array<{
       name: string
-      threshold?: number
-      hard?: {
-        candidates?: string[]
-      }
-      easy?: {
-        candidates?: string[]
-      }
+      labels?: string[]
+      deployment?: string
+      timeout_ms?: number
       description?: string
     }>
     modality?: Array<{
@@ -665,27 +408,29 @@ export interface ConfigData {
       }>
       description?: string
     }>
+    safety?: SafetySignal[]
     jailbreak?: Array<{
       name: string
-      threshold?: number
-      include_history?: boolean
+      predicate?: NumericPredicate
+      stage?: 'request' | 'response'
+      input?: { history?: boolean }
+      deployment?: string
+      timeout_ms?: number
+      on_unknown?: 'match' | 'no_match'
+      description?: string
+    }>
+    hallucination?: Array<{
+      name: string
       description?: string
     }>
     pii?: Array<{
       name: string
-      threshold?: number
-      pii_types_allowed?: string[]
-      include_history?: boolean
-      description?: string
-    }>
-    kb?: Array<{
-      name: string
-      kb: string
-      target: {
-        kind: 'label' | 'group'
-        value: string
-      }
-      match?: 'best' | 'threshold'
+      predicate?: NumericPredicate
+      ignore_labels?: string[]
+      input?: { history?: boolean; tool_results?: boolean; request?: boolean }
+      deployment?: string
+      timeout_ms?: number
+      on_unknown?: 'match' | 'no_match'
       description?: string
     }>
     conversation?: Array<{
@@ -693,13 +438,6 @@ export interface ConfigData {
       description?: string
       feature?: Record<string, unknown>
       predicate?: Record<string, unknown>
-    }>
-    events?: Array<{
-      name: string
-      event_types?: string[]
-      severities?: string[]
-      action_codes?: string[]
-      temporal?: boolean
     }>
   }
   decisions?: Array<{
@@ -711,7 +449,8 @@ export interface ConfigData {
     modelRefs?: Array<{
       model: string
       use_reasoning?: boolean
-      reasoning_effort?: 'low' | 'medium' | 'high'
+      reasoning_mode?: 'enabled' | 'disabled' | 'adaptive'
+      reasoning_effort?: string
       lora_name?: string
     }>
     plugins?: Array<{
@@ -722,11 +461,18 @@ export interface ConfigData {
   }>
   providers?: {
     defaults?: {
-      default_model?: string
+      model?: string
     }
     models?: Array<{
       name: string
-      reasoning_family?: string
+      catalog?: string
+      reasoning?: {
+        family?: string
+        type?: string
+        parameter?: string
+        levels?: string[]
+        default?: string
+      }
     }>
   }
   routing?: {
@@ -736,38 +482,28 @@ export interface ConfigData {
     signals?: ConfigData['signals']
     projections?: ConfigData['projections']
     decisions?: ConfigData['decisions']
+    strategy?: 'priority' | 'confidence'
   }
+  entrypoints?: Array<{
+    model_names: string[]
+    recipe: string
+  }>
+  recipes?: Array<{
+    name: string
+    description?: string
+    routing: {
+      signals?: ConfigData['signals']
+      projections?: ConfigData['projections']
+      decisions?: ConfigData['decisions']
+      strategy?: 'priority' | 'confidence'
+    }
+  }>
   global?: {
     router?: {
       strategy?: 'priority' | 'confidence'
     }
     stores?: {
-      semantic_cache?: {
-        enabled?: boolean
-        backend_type?: string
-        similarity_threshold?: number
-        ttl_seconds?: number
-      }
-    }
-    model_catalog?: {
-      modules?: {
-        prompt_guard?: {
-          enabled?: boolean
-          model_id?: string
-          model_ref?: string
-          threshold?: number
-          use_modernbert?: boolean
-          use_vllm?: boolean
-        }
-        classifier?: {
-          pii?: {
-            model_id?: string
-            model_ref?: string
-            threshold?: number
-            enabled?: boolean
-          }
-        }
-      }
+      response_cache?: TopologyOptionalCacheConfig
     }
   }
 }

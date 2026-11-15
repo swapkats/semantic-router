@@ -12,8 +12,9 @@ func (d *Decision) HasSignalType(signalType string) bool {
 	return len(collectSignalNames(&d.Rules, normalizedType)) > 0
 }
 
-// UsesSignalTypeInRouting returns true when any routing decision uses the given
-// signal type directly or indirectly via projection outputs.
+// UsesSignalTypeInRouting returns true when any routing decision in any
+// recipe uses the given signal type directly or indirectly via projection
+// outputs.
 func (c *RouterConfig) UsesSignalTypeInRouting(signalType string) bool {
 	if c == nil {
 		return false
@@ -24,10 +25,53 @@ func (c *RouterConfig) UsesSignalTypeInRouting(signalType string) bool {
 		return false
 	}
 
+	if len(c.Recipes) > 0 {
+		for i := range c.Recipes {
+			if c.ConfigForRecipe(&c.Recipes[i]).profileUsesSignalType(normalizedType) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return c.profileUsesSignalType(normalizedType)
+}
+
+// UsesSignalTypeInReachableRouting reports whether a request-reachable routing
+// profile depends on the signal type. Immutable recipe-scoped configs evaluate
+// their own profile directly; root configs ignore named recipes that have no
+// entrypoint.
+func (c *RouterConfig) UsesSignalTypeInReachableRouting(signalType string) bool {
+	if c == nil {
+		return false
+	}
+
+	normalizedType := strings.ToLower(strings.TrimSpace(signalType))
+	if normalizedType == "" {
+		return false
+	}
+	if c.RoutingScope != "" {
+		return c.profileUsesSignalType(normalizedType)
+	}
+	if len(c.Recipes) == 0 {
+		if !c.IsRecipeReachableForRouting(DefaultRecipeName) {
+			return false
+		}
+		return c.profileUsesSignalType(normalizedType)
+	}
+	for _, recipe := range c.ReachableRoutingRecipes() {
+		if c.ConfigForRecipe(recipe).profileUsesSignalType(normalizedType) {
+			return true
+		}
+	}
+	return false
+}
+
+func decisionsUseSignalType(decisions []Decision, projections Projections, signalType string) bool {
 	projectionOutputs := make(map[string]struct{})
-	for i := range c.Decisions {
-		decision := &c.Decisions[i]
-		if decision.HasSignalType(normalizedType) {
+	for i := range decisions {
+		decision := &decisions[i]
+		if decision.HasSignalType(signalType) {
 			return true
 		}
 		for _, name := range collectSignalNames(&decision.Rules, SignalTypeProjection) {
@@ -38,25 +82,7 @@ func (c *RouterConfig) UsesSignalTypeInRouting(signalType string) bool {
 		}
 	}
 
-	return projectionsReferenceSignalType(c.Projections, projectionOutputs, normalizedType)
-}
-
-// NeedsCategoryMappingForRouting returns true when routing actually depends on
-// the local file-backed category classifier assets.
-func (c *RouterConfig) NeedsCategoryMappingForRouting() bool {
-	return c != nil && c.IsCategoryClassifierEnabled() && c.UsesSignalTypeInRouting(SignalTypeDomain)
-}
-
-// NeedsPIIMappingForRouting returns true when routing actually depends on the
-// local file-backed PII classifier assets.
-func (c *RouterConfig) NeedsPIIMappingForRouting() bool {
-	return c != nil && c.IsPIIClassifierEnabled() && c.UsesSignalTypeInRouting(SignalTypePII)
-}
-
-// NeedsJailbreakMappingForRouting returns true when routing actually depends on
-// the local file-backed jailbreak classifier assets.
-func (c *RouterConfig) NeedsJailbreakMappingForRouting() bool {
-	return c != nil && c.IsPromptGuardEnabled() && c.UsesSignalTypeInRouting(SignalTypeJailbreak)
+	return projectionsReferenceSignalType(projections, projectionOutputs, signalType)
 }
 
 func projectionsReferenceSignalType(projections Projections, outputs map[string]struct{}, signalType string) bool {
@@ -66,8 +92,10 @@ func projectionsReferenceSignalType(projections Projections, outputs map[string]
 
 	scoreByName := projectionScoresByName(projections.Scores)
 	sourceByOutput := projectionSourcesByOutput(projections.Mappings)
+	state := make(map[string]uint8, len(scoreByName))
+	matches := make(map[string]bool, len(scoreByName))
 	for outputName := range outputs {
-		if projectionOutputReferencesSignalType(outputName, sourceByOutput, scoreByName, signalType) {
+		if projectionOutputReferencesSignalType(outputName, sourceByOutput, scoreByName, signalType, state, matches) {
 			return true
 		}
 	}
@@ -97,28 +125,65 @@ func projectionSourcesByOutput(mappings []ProjectionMapping) map[string]string {
 	return sourceByOutput
 }
 
-func projectionOutputReferencesSignalType(outputName string, sourceByOutput map[string]string, scoreByName map[string]ProjectionScore, signalType string) bool {
-	scoreName, ok := sourceByOutput[outputName]
+func projectionOutputReferencesSignalType(
+	outputName string,
+	sourceByOutput map[string]string,
+	scoreByName map[string]ProjectionScore,
+	signalType string,
+	state map[string]uint8,
+	matches map[string]bool,
+) bool {
+	scoreName, ok := sourceByOutput[strings.ToLower(strings.TrimSpace(outputName))]
 	if !ok {
 		return false
 	}
-	score, ok := scoreByName[scoreName]
-	if !ok {
-		return false
-	}
-	return projectionScoreReferencesSignalType(score, signalType)
+	return projectionScoreReferencesSignalType(scoreName, sourceByOutput, scoreByName, signalType, state, matches)
 }
 
-func projectionScoreReferencesSignalType(score ProjectionScore, signalType string) bool {
+func projectionScoreReferencesSignalType(
+	scoreName string,
+	sourceByOutput map[string]string,
+	scoreByName map[string]ProjectionScore,
+	signalType string,
+	state map[string]uint8,
+	matches map[string]bool,
+) bool {
+	normalizedScoreName := strings.ToLower(strings.TrimSpace(scoreName))
+	switch state[normalizedScoreName] {
+	case 1:
+		// Invalid programmatic configs can bypass projection validation. Treat a
+		// back edge as non-matching so startup discovery terminates safely.
+		return false
+	case 2:
+		return matches[normalizedScoreName]
+	}
+
+	score, ok := scoreByName[normalizedScoreName]
+	if !ok {
+		return false
+	}
+	state[normalizedScoreName] = 1
 	for _, input := range score.Inputs {
-		if strings.EqualFold(input.Type, ProjectionInputKBMetric) {
+		inputType := strings.ToLower(strings.TrimSpace(input.Type))
+		if inputType == signalType {
+			matches[normalizedScoreName] = true
+			break
+		}
+		if inputType != SignalTypeProjection {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(input.Type), signalType) {
-			return true
+
+		dependency := strings.ToLower(strings.TrimSpace(input.Name))
+		if strings.EqualFold(strings.TrimSpace(input.ValueSource), ProjectionValueSourceConfidence) {
+			dependency = sourceByOutput[dependency]
+		}
+		if projectionScoreReferencesSignalType(dependency, sourceByOutput, scoreByName, signalType, state, matches) {
+			matches[normalizedScoreName] = true
+			break
 		}
 	}
-	return false
+	state[normalizedScoreName] = 2
+	return matches[normalizedScoreName]
 }
 
 // collectSignalNames traverses a RuleNode tree and returns all leaf signal names
@@ -135,4 +200,13 @@ func collectSignalNames(node *RuleNode, signalType string) []string {
 		names = append(names, collectSignalNames(&node.Conditions[i], signalType)...)
 	}
 	return names
+}
+
+// profileUsesSignalType includes Replay's evidence dependency in addition to
+// decision and projection inputs.
+func (c *RouterConfig) profileUsesSignalType(signalType string) bool {
+	if signalType == SignalTypePII && c.ReplayNeedsPIIEvidence() {
+		return true
+	}
+	return decisionsUseSignalType(c.Decisions, c.Projections, signalType)
 }

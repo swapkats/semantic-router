@@ -1,0 +1,57 @@
+//go:build !windows
+
+package apiserver
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/pluginruntime"
+)
+
+func apiPluginRetrievalRoutes() []apiRoute {
+	return []apiRoute{
+		managedRoute(EndpointMetadata{Path: apiPluginsPath + "/context/preview", Method: "POST", Description: "Preview the context plugin's rag source injection using supplied_context; mode=probe recalls from the configured backend and judges the documents, without the RAG result cache or generation"},
+			routePolicy{Permission: PermDataRead, Sensitivity: SensitivityConfig}, (*ClassificationAPIServer).handleRAGPluginPreview,
+			strictJSONBodyFor[pluginruntime.RAGPreviewRequest](), jsonResponse[pluginruntime.RAGPreviewResponse](http.StatusOK, "Recipe-bound RAG preview and explicit effects"), errorResponses(400, 404, 409, 429, 500, 503, 504),
+			pluginOperationFor(config.DecisionPluginContext, "preview"), pluginOperationFor(config.DecisionPluginContext, "probe")),
+		managedRoute(EndpointMetadata{Path: apiPluginsPath + "/tools/preview", Method: "POST", Description: "Preview the configured tools policy; mode=probe also lets the selection ask the decision model, and never executes tools"},
+			routePolicy{Permission: PermConfigRead, Sensitivity: SensitivityConfig}, (*ClassificationAPIServer).handleToolsPluginPreview,
+			strictJSONBodyFor[pluginruntime.ToolsPreviewRequest](), jsonResponse[pluginruntime.ToolsPreviewResponse](http.StatusOK, "Recipe-bound tool policy and selection result and explicit effects"), errorResponses(400, 404, 409, 429, 500, 503, 504),
+			pluginOperationFor("tools", "preview"), pluginOperationFor("tools", "probe")),
+	}
+}
+
+func (s *ClassificationAPIServer) handleRAGPluginPreview(w http.ResponseWriter, r *http.Request) {
+	var input pluginruntime.RAGPreviewRequest
+	if err := s.parseStrictJSONRequest(r, &input); err != nil {
+		s.writeJSONRequestError(w, err)
+		return
+	}
+	runPluginPreview(s, w, r, func(ctx context.Context, capabilities pluginruntime.Capabilities) (pluginruntime.RAGPreviewResponse, error) {
+		if capabilities.Retrieval == nil {
+			return pluginruntime.RAGPreviewResponse{}, pluginruntime.ErrUnavailable
+		}
+		return capabilities.Retrieval.PreviewRAG(ctx, input)
+	})
+}
+
+func (s *ClassificationAPIServer) handleToolsPluginPreview(w http.ResponseWriter, r *http.Request) {
+	s.handleToolPreview(w, r, "tools")
+}
+
+func (s *ClassificationAPIServer) handleToolPreview(w http.ResponseWriter, r *http.Request, plugin string) {
+	var input pluginruntime.ToolsPreviewRequest
+	if err := s.parseStrictJSONRequest(r, &input); err != nil {
+		s.writeJSONRequestError(w, err)
+		return
+	}
+	input.Plugin = plugin
+	runPluginPreview(s, w, r, func(ctx context.Context, capabilities pluginruntime.Capabilities) (pluginruntime.ToolsPreviewResponse, error) {
+		if capabilities.Retrieval == nil {
+			return pluginruntime.ToolsPreviewResponse{}, pluginruntime.ErrUnavailable
+		}
+		return capabilities.Retrieval.PreviewTools(ctx, input)
+	})
+}

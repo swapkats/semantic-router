@@ -3,137 +3,312 @@ title: Common Errors
 sidebar_label: Common Errors
 ---
 
-# Common Errors and Fixes
+# Common errors
 
-This guide provides a quick reference for common log messages and errors you may encounter when running vLLM Semantic Router. Each section maps error patterns to their root causes and configuration fixes.
-
-:::tip
-Use the [Quick Diagnostic Commands](#quick-diagnostic-commands) at the end of this page to quickly identify issues.
-:::
-
-## Configuration Loading Errors
-
-### Failed to create ExtProc server
-
-**Log Pattern:**
-
-```
-Failed to create ExtProc server: <error>
-```
-
-**Causes & Fixes:**
-
-| Cause                   | Fix                                                 |
-| ----------------------- | --------------------------------------------------- |
-| Invalid config path     | Verify `--config` flag points to existing YAML file |
-| YAML syntax error       | Validate YAML with `yq` or online validator         |
-| Missing required fields | Check all required fields are present               |
+Start with the first failing component instead of changing several settings at
+once:
 
 ```bash
-# Verify config path
-./router --config /app/config/config.yaml
+vllm-sr status
+vllm-sr logs router
+vllm-sr logs envoy        # only with --gateway extproc
+vllm-sr config validate --config config.yaml
 ```
 
----
+The examples below are fragments. Add them to the corresponding section of a
+complete canonical configuration and validate the result.
+Use [config/config.yaml](https://github.com/vllm-project/semantic-router/blob/main/config/config.yaml)
+when you need the exhaustive field context.
 
-### Failed to read config file
+| Symptom | Go to |
+| --- | --- |
+| The Router doesn't start, or rejects the file | [Router cannot load the configuration](#router-cannot-load-the-configuration) |
+| A validation error names an entrypoint or recipe | [Entrypoint and recipe validation](#entrypoint-and-recipe-validation) |
+| A request fails with a routing error code | [A request returns a routing error code](#a-request-returns-a-routing-error-code) |
+| The response cache doesn't start, or rarely hits | [Response cache cannot start](#response-cache-cannot-start) |
+| A PII or jailbreak route matches unexpectedly | [A PII route matches unexpectedly](#a-pii-route-matches-unexpectedly) |
+| A backend has no address | [Provider backend has no address](#provider-backend-has-no-address) |
+| The decision or embedding model doesn't load | [A decision or embedding model cannot load](#a-decision-or-embedding-model-cannot-load) |
+| Requests fall back after the domain signal | [Domain confidence is too low](#domain-confidence-is-too-low) |
 
-**Log Pattern:**
+## Router cannot load the configuration
 
+### `Failed to create ExtProc server`
+
+This is a top-level startup failure. The useful cause normally appears later on
+the same log line or immediately before it.
+
+Check that the file exists and is readable, then run validation outside the
+container:
+
+```bash
+test -r config.yaml
+vllm-sr config validate --config config.yaml
 ```
-failed to read config file: <error>
+
+Follow the field path in the validation error. Do not add missing fields to a
+random nested block; canonical fields are location-sensitive.
+
+### `failed to read config file`
+
+The process cannot open the path it received. Check:
+
+- whether `--config` is relative to the current working directory;
+- whether the same path exists inside the Router container;
+- the file and parent-directory permissions; and
+- whether a managed Recipe generated its runtime config in a different
+  workspace.
+
+Use `vllm-sr status` to identify the active workspace before inspecting
+container mounts.
+
+## Entrypoint and recipe validation
+
+`vllm-sr config validate` includes a repair hint for common multi-recipe
+wiring errors.
+
+### Unknown recipe
+
+```text
+Entrypoint references unknown recipe 'missing-recipe'
+Hint: Change this to the name of a recipe defined under recipes.
 ```
 
-**Fixes:**
-
-- Verify file exists: `ls -la config/config.yaml`
-- Check permissions: `chmod 644 config/config.yaml`
-- Ensure path is absolute or correct relative path
-
-> See code: [cmd/main.go](https://github.com/vllm-project/semantic-router/blob/main/src/semantic-router/cmd/main.go).
-
----
-
-## Cache & Storage Errors
-
-### Milvus configuration is required
-
-**Log Pattern:**
-
-```
-milvus configuration is required for Milvus cache backend
-```
-
-**Fix:** Inline the `semantic_cache.milvus` settings when using the Milvus backend:
+Broken:
 
 ```yaml
-global:
-  stores:
-    semantic_cache:
-      enabled: true
-      backend_type: "milvus"
-      milvus:
-        connection:
-          host: "milvus"
-          port: 19530
-        collection:
-          name: "semantic_cache"
+entrypoints:
+  - model_names: [my-model]
+    recipe: missing-recipe
+recipes:
+  - name: production
 ```
 
----
+Corrected:
 
-### Qdrant configuration is required
-
-**Log Pattern:**
-
+```yaml
+entrypoints:
+  - model_names: [my-model]
+    recipe: production
+recipes:
+  - name: production
 ```
+
+### Duplicate recipe name
+
+```text
+Duplicate recipe name 'production'
+Hint: Rename one recipe so every recipe has a unique name.
+```
+
+Give each recipe a distinct `name`, then update entrypoints that refer to the
+renamed recipe:
+
+```yaml
+recipes:
+  - name: production
+  - name: staging
+entrypoints:
+  - model_names: [my-model]
+    recipe: production
+```
+
+### Default entrypoint name collision {#model-or-reserved-alias-collision}
+
+```text
+Entrypoint model 'vllm-sr/auto' is mapped more than once
+```
+
+`vllm-sr/auto` publishes the default recipe unless an explicit entrypoint
+replaces it. Giving that same name to a named recipe creates a duplicate.
+
+Broken:
+
+```yaml
+entrypoints:
+  - model_names: [vllm-sr/auto]
+    recipe: production
+```
+
+Corrected:
+
+```yaml
+entrypoints:
+  - model_names: [customer-production]
+    recipe: production
+```
+
+### Entrypoint name collides with a backend model
+
+A public recipe entrypoint must have its own name. The Router rejects an
+entrypoint whose name also identifies a backend model, including Fusion,
+ReMoM and Flow entrypoints. There is no special dispatch namespace for these
+algorithms.
+
+Broken, if `openai/gpt-oss-20b` is a configured backend:
+
+```yaml
+entrypoints:
+  - model_names: [openai/gpt-oss-20b]
+    recipe: flow
+```
+
+Corrected, with Flow requests sent to `vllm-sr/flow` and the flow recipe
+containing decisions with `algorithm.type: workflows`:
+
+```yaml
+entrypoints:
+  - model_names: [vllm-sr/flow]
+    recipe: flow
+```
+
+See the
+[entrypoints and recipes tutorial](../tutorials/global/entrypoints-and-recipes.md)
+and [recipes tutorial](../tutorials/global/recipes.md) for complete examples.
+
+## A request returns a routing error code
+
+Look the code up in [routing errors](../api/router.md#routing-errors), then
+find the Router's own reason in its log under the request's `x-request-id`:
+
+```bash
+vllm-sr logs router | grep '<x-request-id>'
+```
+
+For `no_route`, the `entrypoint_routing_no_selection` line names the model,
+the recipe, and any decision that matched. Fusion, Flow and ReMoM are
+selected by decisions inside that recipe; their public names are ordinary
+entrypoints. Check the entrypoint mapping and recipe rules first.
+
+## Response cache cannot start
+
+### Backend configuration is required
+
+Errors such as these mean `backend_type` selected a backend without its
+matching configuration:
+
+```text
+milvus configuration is required for Milvus cache backend
 qdrant configuration is required for Qdrant cache backend
 ```
 
-**Fix:** Inline the `semantic_cache.qdrant` settings when using the Qdrant backend:
+Milvus example:
 
 ```yaml
 global:
   stores:
-    semantic_cache:
-      enabled: true
+    response_cache:
+      backend_type: milvus
+      milvus:
+        connection:
+          host: milvus
+          port: 19530
+        collection:
+          name: response_cache
+```
+
+Qdrant example:
+
+```yaml
+global:
+  stores:
+    response_cache:
       backend_type: qdrant
       qdrant:
         host: qdrant
         port: 6334
-        collection_name: semantic_cache
+        collection_name: response_cache
 ```
 
----
+The backend hostname must be resolvable from the Router container or pod, not
+only from the host.
 
-### Index does not exist and auto-creation is disabled
+### Index or collection is missing
 
-**Log Pattern:**
+An error ending with `auto-creation is disabled` means the backing service is
+reachable but the required index is absent. Choose one operating model:
 
-```
-index <name> does not exist and auto-creation is disabled
-```
+- provision the index or collection before Router startup; or
+- enable development-time creation for that backend.
 
-**Fix:** Enable auto-creation in Redis/Milvus config:
+Redis and Valkey use `development.auto_create_index`; Milvus uses
+`development.auto_create_collection`. For example:
 
 ```yaml
-# In config/redis.yaml
-index:
-  auto_create: true # ← Enable this
+global:
+  stores:
+    response_cache:
+      backend_type: redis
+      redis:
+        # Add the connection, index, and search settings from the runtime example.
+        development:
+          auto_create_index: true
 ```
 
----
+See the checked-in
+[response-cache examples](https://github.com/vllm-project/semantic-router/tree/main/config/runtime/response-cache)
+for complete backend blocks. Production deployments commonly provision schema
+separately and leave automatic creation disabled.
 
-### Redis Response API store cannot connect
+### Cache hits are unexpectedly rare
 
-**Log Pattern:**
+First confirm that a `response_cache` plugin is enabled for the request, in
+`global.plugins` or the decision's plugins. Then inspect `x-vsr-response-path`
+(`cache` on a hit) or the replay diagnostics.
 
+A semantic hit passes two stages: `recall` finds similar cached requests, and
+the `same_request` judge confirms one. If embeddings are healthy but near
+duplicates miss, test a lower `recall.min_similarity`, or a lower
+`judge.min_score`, on representative traffic:
+
+```yaml
+global:
+  plugins:
+    - type: response_cache
+      configuration:
+        enabled: true
+        semantic:
+          match:
+            recall: {method: embedding, top_k: 3, min_similarity: 0.75}
+            judge: {preset: same_request, min_score: 0.8}
 ```
+
+:::warning Write both stages
+A `match` block replaces the default as a whole. A block with `recall` alone
+serves the most similar cached request without asking the judge.
+:::
+
+A decision's own plugin overrides it for that decision:
+
+```yaml
+recipes:
+  - name: default
+    decisions:
+      - name: cached-route
+        plugins:
+          - type: response_cache
+            configuration:
+              enabled: true
+              semantic:
+                match:
+                  recall: {method: embedding, top_k: 3, min_similarity: 0.70}
+                  judge: {preset: same_request, min_score: 0.8}
+```
+
+Lower thresholds increase false-match risk. Evaluate answer equivalence before
+rolling them out, and use the management API's response-cache statistics and
+test endpoints when diagnosing the backend.
+
+## Responses API store cannot connect
+
+An error such as:
+
+```text
 failed to connect to Redis: redis ping failed
 ```
 
-**Fix:** Redis is the default durable Response API store. Make sure the router
-can reach the Redis address configured under `global.services.response_api`:
+comes from the Responses API store, not the response cache. Check the separate
+service block:
 
 ```yaml
 global:
@@ -146,305 +321,162 @@ global:
         db: 0
 ```
 
-Use `store_backend: memory` only for local development. Memory-backed
-responses and conversation chains are lost when the router process restarts.
+Use `store_backend: memory` only for local work where losing stored responses
+and conversation chains on restart is acceptable.
 
-> See code: [pkg/responsestore](https://github.com/vllm-project/semantic-router/tree/main/src/semantic-router/pkg/responsestore).
+## A PII route matches unexpectedly
 
----
+Preview the request (`POST /api/v1/routing/preview?trace=true`), or send it
+with `x-vsr-debug: true` from a caller `global.router.headers.debug` allows:
+the `signals` member of `x-vsr-trace` names the `pii` rule that matched.
 
-## PII & Security Errors
-
-### PII policy violation
-
-**Log Pattern:**
-
-```
-PII signal fired: rule=<name>, detected_types=[<types>], threshold=<score>
-```
-
-**Fixes:**
-
-1. **Allow the PII type** if it should be permitted — add it to `pii_types_allowed` in the signal rule:
+If the label is allowed by policy, add it to the rule's `ignore_labels`. If the
+model produces low-confidence false positives, evaluate a higher `predicate`:
 
 ```yaml
-signals:
-  pii:
-    - name: "pii_allow_location"
-      threshold: 0.5
-      pii_types_allowed:
-        - "GPE"          # Add the denied type here
-        - "ORGANIZATION"
+recipes:
+  - name: default
+    signals:
+      pii:
+        - name: pii-policy
+          predicate: {gte: 0.90}
+          ignore_labels:
+            - DATE_TIME
+            - LOCATION
 ```
 
-2. **Raise threshold** if false positives:
+Changing a privacy threshold changes false-negative risk. Validate it against a
+labeled dataset rather than a few hand-written prompts.
+
+## A jailbreak route matches unexpectedly
+
+Use replay, a routing preview, or an `x-vsr-debug: true` request from a caller
+`global.router.headers.debug` allows to inspect the matched signals (the
+`signals` member of `x-vsr-trace`) and the selected decision.
+
+To reduce false positives, evaluate a higher `predicate` on the affected rule:
 
 ```yaml
-signals:
-  pii:
-    - name: "pii_deny_all"
-      threshold: 0.95   # Increase from default 0.5
+recipes:
+  - name: default
+    signals:
+      jailbreak:
+        - name: jailbreak-standard
+          predicate: {gte: 0.95}
 ```
 
----
+If a route should not depend on jailbreak detection, remove that condition
+from the route. Changing the rule changes every decision that reads it.
 
-### Jailbreak detected
+## Provider backend has no address
 
-**Log Pattern:**
+These validation errors mean a backend reference cannot be resolved:
 
-```
-Jailbreak detected: type=<type>, confidence=<score>
-```
-
-**Fixes:**
-
-1. **Raise threshold** to reduce false positives — update the signal rule:
-
-```yaml
-signals:
-  jailbreak:
-    - name: "jailbreak_standard"
-      threshold: 0.85   # Increase from default 0.65
+```text
+providers.models[<model>].backend_refs[<n>] has no endpoint URL
+<path> requires endpoint because provider '<provider>' has no default
 ```
 
-2. **Exclude specific decisions** from jailbreak blocking by not referencing the jailbreak signal in that decision's conditions:
-
-```yaml
-decisions:
-  # This decision does NOT reference any jailbreak signal → no jailbreak check
-  - name: "internal_decision"
-    priority: 100
-    rules:
-      operator: "OR"
-      conditions:
-        - type: "keyword"
-          name: "internal_keywords"
-    modelRefs:
-      - model: "internal-model"
-```
-
-> See code: [pii/policy.go](https://github.com/vllm-project/semantic-router/blob/main/src/semantic-router/pkg/utils/pii/policy.go) AND [req_filter_jailbreak.go](https://github.com/vllm-project/semantic-router/blob/main/src/semantic-router/pkg/extproc/req_filter_jailbreak.go).
-
----
-
-## MCP Client Errors
-
-### Either command or URL must be specified
-
-**Log Pattern:**
-
-```
-either command or URL must be specified
-```
-
-**Fix:** Specify transport configuration:
-
-```yaml
-# For stdio transport
-mcp_clients:
-  my_client:
-    transport_type: "stdio"
-    command: "/path/to/mcp-server"
-
-# For HTTP transport
-mcp_clients:
-  my_client:
-    transport_type: "streamable-http"
-    url: "http://localhost:8080"
-```
-
----
-
-### Command is required for stdio transport
-
-**Log Pattern:**
-
-```
-command is required for stdio transport
-```
-
-**Fix:** Add command for stdio transport:
-
-```yaml
-mcp_clients:
-  my_client:
-    transport_type: "stdio"
-    command: "python"
-    args: ["-m", "my_mcp_server"]
-```
-
-> See code: [pkg/mcp/factory.go](https://github.com/vllm-project/semantic-router/blob/main/src/semantic-router/pkg/mcp/factory.go).
-
----
-
-## Endpoint Errors
-
-### Invalid address format
-
-**Log Pattern:**
-
-```
-invalid endpoint address: <address>
-```
-
-**Fixes:**
-
-| Wrong                  | Correct                              |
-| ---------------------- | ------------------------------------ |
-| `http://10.0.0.1:8000` | `10.0.0.1:8000` (`endpoint`)         |
-| `vllm.example.com`     | `vllm.example.com:8000`              |
-| `10.0.0.1`             | `10.0.0.1:8000`                      |
+Give the backend an `endpoint`:
 
 ```yaml
 providers:
   models:
-    - name: qwen3-8b
+    - name: local-model
+      provider_model_id: local-model
+      api_format: openai
       backend_refs:
-        - name: endpoint1
-          endpoint: "10.0.0.1:8000" # host:port, no scheme
+        - name: local-vllm
+          endpoint: 10.0.0.1:8000
           protocol: http
+          provider: vllm
 ```
 
-> See: [config/config.yaml](https://github.com/vllm-project/semantic-router/blob/main/config/config.yaml) and [Configuration](../installation/configuration).
+Write a full URL in `endpoint` when the provider requires a complete API root
+such as `https://provider.example/v1`. Use a hostname reachable from the Router
+network; `localhost` refers to the Router container itself.
 
----
+The version segment in that API root is accepted for every provider ID.
+Providers whose operation path already carries the version, such as
+`anthropic` and `minimax`, don't repeat it: `https://provider.example/v1` and
+`https://provider.example` resolve to the same upstream path.
 
-## Model Loading Errors
+See [Container connectivity](./container-connectivity) for end-to-end checks.
 
-### Model not found
+## A decision or embedding model cannot load
 
-**Log Pattern:**
-
-```
-failed to load model: <path>
-```
-
-**Fixes:**
-
-- Verify model path exists
-- Check model is downloaded: `ls -la models/`
-- Ensure path is accessible inside container
-
-```yaml
-global:
-  model_catalog:
-    embeddings:
-      semantic:
-        bert_model_path: /app/models/all-MiniLM-L12-v2 # Use absolute path in container
-```
-
----
-
-## Image Pull Errors
-
-### No matching manifest for linux/amd64 (after pinning a digest built on Apple Silicon)
-
-**Symptoms:** Pods on `amd64` nodes stay in `ImagePullBackOff` with an event like
-`no matching manifest for linux/amd64 in the manifest list entries`, while the
-same image reference runs fine on `arm64` nodes or on an Apple Silicon laptop.
-The exact wording varies by container runtime (Docker vs containerd), but it
-always reports that no image matches the node's `linux/amd64` platform.
-
-**Cause:** The published images (`ghcr.io/vllm-project/semantic-router/extproc`
-and `.../dashboard`) are multi-arch manifest lists covering `linux/amd64` and
-`linux/arm64`. You are most likely to hit this if you pin images by digest (a
-common supply-chain or GitOps practice) and resolved that digest on an arm64
-build host such as an Apple Silicon laptop or an arm64 CI runner; a default
-tag-based install is not affected. Resolving a floating tag such as `:latest` to
-a digest on an Apple Silicon machine (for example `docker pull` followed by
-`docker inspect` of `RepoDigests`) returns the **arm64-specific** image digest,
-not the
-manifest-list (index) digest. Pinning a deployment to that single-arch digest
-(in a raw manifest, via `kubectl set image`, or any tooling that consumes a
-`name@sha256:...` reference) leaves `amd64` nodes without a matching manifest.
-
-**Fixes:**
-
-- Reference images by tag (for example `:latest` or a release tag like
-  `:v0.3.0`) so the kubelet selects the correct architecture per node from the
-  manifest list. The bundled Helm chart references images this way, through
-  `image.tag` and `dashboard.image.tag`.
-- If you pin by digest for immutability, pin the **manifest-list (index)
-  digest** in the `name@sha256:...` form, not a platform-specific one. Read the
-  index digest without pulling a single architecture:
+Every model runs in the [model runtime](../model-runtime/get-started/overview.md). When a
+model cannot load, its feature reports unknown results and the runtime records
+why. Check the router's `vsr_model_runtime_ready{deployment="..."}` metric and
+the router log, or ask a runtime you run yourself:
 
 ```bash
-# Index (manifest-list) digest, safe to pin; resolves correctly on amd64 and arm64.
-docker buildx imagetools inspect \
-  ghcr.io/vllm-project/semantic-router/extproc:latest \
-  --format '{{.Manifest.Digest}}'
+curl -s localhost:8100/v1/models
 ```
 
-- Avoid deriving the digest from a plain `docker pull` + `docker inspect` on
-  Apple Silicon; that yields the per-architecture digest for the host platform
-  (arm64), which is the root cause above.
+Each model's `status` and `reason` say what failed: a damaged download, a
+missing `revision`, a private repository without a token, a device that does
+not exist, or a model too large for its device.
+[Troubleshooting and FAQ](../model-runtime/deploy/troubleshooting.md) lists each
+reason and the fix.
 
-> Note: the bundled Helm chart builds image references as `repository:tag` (from
-> `image.tag` and `dashboard.image.tag` in
-> [the chart values](https://github.com/vllm-project/semantic-router/blob/main/deploy/helm/semantic-router/values.yaml)),
-> so it does not construct `name@sha256:...` digest references. Digest pinning is
-> done in your own deployment manifest, not through these values.
+## Container image has no matching platform
 
----
+`ImagePullBackOff` with `no matching manifest` means the selected tag or digest
+does not contain an image for the node architecture.
 
-## Performance Issues
-
-### Low cache hit ratio
-
-**Symptoms:** Cache rarely returns hits, high backend latency
-
-**Fix:** Lower similarity threshold:
-
-```yaml
-global:
-  stores:
-    semantic_cache:
-      similarity_threshold: 0.75 # Lower from default 0.8
-
-# Or per-decision
-routing:
-  decisions:
-    - name: "cached-route"
-      plugins:
-        - type: "semantic-cache"
-          configuration:
-            similarity_threshold: 0.70
-```
-
----
-
-### Classification confidence too low
-
-**Symptoms:** Many queries fall through to "other" category
-
-**Fix:** Lower category threshold:
-
-```yaml
-global:
-  model_catalog:
-    modules:
-      classifier:
-        domain:
-          threshold: 0.5 # Lower from default 0.6
-```
-
----
-
-## Quick Diagnostic Commands
+Inspect the exact reference from the deployment:
 
 ```bash
-# Check config syntax
-yq eval '.' config/config.yaml
-
-# Test endpoint connectivity
-curl -s http://<address>:<port>/health
-
-# Check model files
-ls -la models/
-
-# View recent logs
-docker logs semantic-router --tail 100
-
-# Check metrics
-curl -s http://localhost:9190/metrics | grep semantic_router
+docker buildx imagetools inspect <registry>/<image>:<tag>
 ```
+
+If the tag is a multi-platform index, pin its index digest rather than one
+architecture's child manifest. If it is single-platform, use a release that
+publishes the required architecture or build and publish the image through
+your approved pipeline. Do not switch to an unpinned `latest` tag as a
+long-term immutability workaround.
+
+## Domain confidence is too low
+
+If requests often fall back after the domain signal, first confirm which
+model answers the `domains` rules. A rule without a `predicate` uses the
+answering model's calibrated threshold (0.41 on vela3-fast), or 0.5 with an
+`uncalibrated_preset` warning. Then evaluate a lower value on labeled traffic:
+
+```yaml
+recipes:
+  - name: default
+    signals:
+      domains:
+        - name: math
+          predicate: {gte: 0.30}
+```
+
+Lowering the predicate may increase wrong-domain routes. Report per-domain
+precision and recall at the chosen operating point.
+
+## Diagnostic commands
+
+```bash
+# Validate the source configuration.
+vllm-sr config validate --config config.yaml
+
+# Identify the active local stack and component state.
+vllm-sr status
+
+# Read component logs without depending on generated container names.
+vllm-sr logs router
+vllm-sr logs envoy        # only with --gateway extproc
+
+# Check the public listener and model catalog.
+curl -sS http://localhost:8899/v1/models
+
+# Check management health and metrics.
+curl -sS http://localhost:8080/health
+curl -sS http://localhost:9190/metrics | head
+```
+
+If a provider succeeds from the host but fails from the Router, continue with
+[Container connectivity](./container-connectivity). For image and artifact
+downloads, see [Restricted network environments](./network-tips).

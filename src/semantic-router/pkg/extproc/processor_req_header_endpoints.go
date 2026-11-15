@@ -5,15 +5,16 @@ import (
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
 
 func (r *OpenAIRouter) handleModelsRequestHeaders(
 	method string,
 	path string,
+	ctx *RequestContext,
 ) (*ext_proc.ProcessingResponse, error) {
-	if method != "GET" || !strings.HasPrefix(path, "/v1/models") {
+	if method != "GET" || normalizeRequestPath(path) != "/v1/models" {
 		return nil, nil
 	}
 
@@ -21,7 +22,7 @@ func (r *OpenAIRouter) handleModelsRequestHeaders(
 		"method": method,
 		"path":   path,
 	})
-	response, err := r.handleModelsRequest(path)
+	response, err := r.handleModelsRequest(path, ctx.ListenerModels)
 	if err != nil {
 		return nil, err
 	}
@@ -33,54 +34,23 @@ func (r *OpenAIRouter) handleResponseAPIRequestHeaders(
 	path string,
 	ctx *RequestContext,
 ) (*ext_proc.ProcessingResponse, error) {
-	if r.ResponseAPIFilter == nil || !r.ResponseAPIFilter.IsEnabled() || !strings.HasPrefix(path, "/v1/responses") {
+	if !strings.HasPrefix(path, "/v1/responses") && !isAzureResponsesCollection(path) {
 		return nil, nil
 	}
-
-	if method == "GET" && strings.HasSuffix(path, "/input_items") {
-		responseID := extractResponseIDFromInputItemsPath(path)
-		if responseID != "" {
-			logging.ComponentDebugEvent("extproc", "response_api_request_intercepted", map[string]interface{}{
-				"request_id":  ctx.RequestID,
-				"method":      method,
-				"path":        path,
-				"operation":   "get_input_items",
-				"response_id": responseID,
-			})
-			return r.ResponseAPIFilter.HandleGetInputItems(ctx.TraceContext, responseID)
-		}
+	if r.ResponseAPIFilter == nil && r.Config != nil && r.Config.ResponseAPI.Enabled {
+		// Enabled in config, but the store failed to start (see
+		// response_api_store_init_failed). A 404 would read as a missing route.
+		ctx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamUnavailable, "response_store_unavailable",
+			"the Responses API is enabled but its store failed to start, check global.services.response_api", nil)
+		return r.createErrorResponse(503, ctx.ImmediateProtocolError.Message), nil
 	}
 
-	if method == "GET" {
-		responseID := extractResponseIDFromPath(path)
-		if responseID != "" {
-			logging.ComponentDebugEvent("extproc", "response_api_request_intercepted", map[string]interface{}{
-				"request_id":  ctx.RequestID,
-				"method":      method,
-				"path":        path,
-				"operation":   "get_response",
-				"response_id": responseID,
-			})
-			return r.ResponseAPIFilter.HandleGetResponse(ctx.TraceContext, responseID)
-		}
-	}
-
-	if method == "DELETE" {
-		responseID := extractResponseIDFromPath(path)
-		if responseID != "" {
-			logging.ComponentDebugEvent("extproc", "response_api_request_intercepted", map[string]interface{}{
-				"request_id":  ctx.RequestID,
-				"method":      method,
-				"path":        path,
-				"operation":   "delete_response",
-				"response_id": responseID,
-			})
-			return r.ResponseAPIFilter.HandleDeleteResponse(ctx.TraceContext, responseID)
-		}
-	}
-
-	if method == "POST" {
-		ctx.ResponseAPICtx = &ResponseAPIContext{IsResponseAPIRequest: true}
+	switch method {
+	case "GET":
+		return r.handleResponseAPIGet(path, ctx)
+	case "DELETE":
+		return r.handleResponseAPIDelete(path, ctx)
+	case "POST":
 		logging.ComponentDebugEvent("extproc", "response_api_request_detected", map[string]interface{}{
 			"request_id": ctx.RequestID,
 			"method":     method,
@@ -90,6 +60,56 @@ func (r *OpenAIRouter) handleResponseAPIRequestHeaders(
 	}
 
 	return nil, nil
+}
+
+func (r *OpenAIRouter) handleResponseAPIGet(
+	path string,
+	ctx *RequestContext,
+) (*ext_proc.ProcessingResponse, error) {
+	if responseID := extractResponseIDFromInputItemsPath(path); responseID != "" {
+		logResponseAPIOperation(ctx, "GET", path, "get_input_items", responseID)
+		if r.ResponseAPIFilter == nil {
+			return responseObjectNotFound(responseID), nil
+		}
+		return r.ResponseAPIFilter.HandleGetInputItems(ctx.TraceContext, responseID)
+	}
+	responseID := extractResponseIDFromPath(path)
+	if responseID == "" {
+		return nil, nil
+	}
+	logResponseAPIOperation(ctx, "GET", path, "get_response", responseID)
+	if r.ResponseAPIFilter == nil {
+		return responseObjectNotFound(responseID), nil
+	}
+	return r.ResponseAPIFilter.HandleGetResponse(ctx.TraceContext, responseID)
+}
+
+func (r *OpenAIRouter) handleResponseAPIDelete(
+	path string,
+	ctx *RequestContext,
+) (*ext_proc.ProcessingResponse, error) {
+	responseID := extractResponseIDFromPath(path)
+	if responseID == "" {
+		return nil, nil
+	}
+	logResponseAPIOperation(ctx, "DELETE", path, "delete_response", responseID)
+	if r.ResponseAPIFilter == nil {
+		return responseObjectNotFound(responseID), nil
+	}
+	return r.ResponseAPIFilter.HandleDeleteResponse(ctx.TraceContext, responseID)
+}
+
+func logResponseAPIOperation(
+	ctx *RequestContext,
+	method, path, operation, responseID string,
+) {
+	logging.ComponentDebugEvent("extproc", "response_api_request_intercepted", map[string]interface{}{
+		"request_id":  ctx.RequestID,
+		"method":      method,
+		"path":        path,
+		"operation":   operation,
+		"response_id": responseID,
+	})
 }
 
 // extractResponseIDFromPath extracts the response ID from a path like /v1/responses/{id}.
@@ -134,13 +154,19 @@ func extractResponseIDFromInputItemsPath(path string) string {
 	return ""
 }
 
-// detectClientProtocol classifies the inbound wire format from the request path.
-// Paths under /v1/messages (the Anthropic Messages API surface, including
-// /v1/messages/count_tokens) are tagged as Anthropic; everything else falls
-// through to the OpenAI-compatible default represented by the zero value.
-func detectClientProtocol(path string, ctx *RequestContext) {
-	if strings.HasPrefix(path, "/v1/messages") {
-		ctx.ClientProtocol = config.ClientProtocolAnthropic
+// detectSourceFormat classifies the public wire format from the request path.
+func detectSourceFormat(path string, ctx *RequestContext) {
+	switch {
+	case strings.HasPrefix(path, "/v1/messages"):
+		ctx.SourceFormat = llmprotocol.AnthropicMessagesV1
 		logging.Debugf("Detected Anthropic client protocol from path: %s", path)
+	case strings.HasPrefix(path, "/v1/responses"):
+		ctx.SourceFormat = llmprotocol.OpenAIResponsesV1
+	case isAzureResponsesCollection(path):
+		ctx.SourceFormat = llmprotocol.OpenAIResponsesV1
+	case normalizeRequestPath(path) == imagesGenerationsPath:
+		ctx.SourceFormat = llmprotocol.OpenAIImagesV1
+	default:
+		ctx.SourceFormat = llmprotocol.OpenAIChatV1
 	}
 }

@@ -1,0 +1,124 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/vllm-project/semantic-router/vllm-sr
+  tag: latest
+  pullPolicy: Never
+config:
+  version: v0.5
+  listeners: []
+  providers:
+    defaults:
+      model: openai/mock-model
+    models:
+      - name: openai/mock-model
+        backend_refs:
+          - name: provider-mocker
+            provider: vllm
+            endpoint: provider-mocker.default.svc.cluster.local:8000
+            weight: 1
+  recipes:
+    - name: default
+      decisions:
+        - name: skip_on_classifier_error
+          description: Skips the decision when the guardrail classifier is unreachable
+          priority: 110
+          rules:
+            operator: OR
+            on_unknown: no_match
+            conditions:
+              - type: jailbreak
+                name: guardrail_unreachable
+          plugins:
+            - type: fast_response
+              configuration:
+                message: This response must not be selected.
+        # #2918: every request matches this decision, because the jailbreak
+        # rule's deployment points at an endpoint nothing listens on
+        # (127.0.0.1:1 inside the router pod) - the call always fails, and the
+        # rule's on_unknown: match makes it match without an answer instead of
+        # silently letting the request through.
+        - name: block_on_classifier_error
+          description: Blocks every request because the guardrail deployment is unreachable
+          priority: 100
+          rules:
+            operator: OR
+            conditions:
+              - type: jailbreak
+                name: guardrail_unreachable
+          plugins:
+            - type: fast_response
+              configuration:
+                message: Your request has been declined due to a policy violation.
+        - name: default_decision
+          description: Default catch-all decision (should not be reached - the blocking decision always matches first)
+          priority: 1
+          rules:
+            operator: AND
+            conditions: []
+          modelRefs:
+            - model: openai/mock-model
+              use_reasoning: false
+      signals:
+        jailbreak:
+          - name: guardrail_unreachable
+            description: Signal rule bound to the deliberately-unreachable guardrail endpoint
+            predicate:
+              gte: 0.5
+            # The contract under test: a guardrail that gives no answer blocks.
+            on_unknown: match
+  global:
+    router:
+      strategy: priority
+    services:
+      api:
+        batch_classification:
+          max_batch_size: 100
+          metrics:
+            enabled: true
+            detailed_goroutine_tracking: false
+            high_resolution_timing: false
+            sample_rate: 1.0
+      observability:
+        tracing:
+          enabled: false
+    integrations: {}
+    model_catalog:
+      deployments:
+        # Deliberately unreachable: nothing listens on 127.0.0.1:1 inside the
+        # router pod, so every System One call fails with a connection
+        # error - this profile exists to exercise the fail-closed jailbreak
+        # signal against a real call failure, not a working guardrail.
+        unreachable-guardrail:
+          provider: systemone
+          endpoint: http://127.0.0.1:1/v1/systemone
+          model: unreachable-guardrail
+          schema: vllm-sr/4.0
+          timeout_ms: 5000
+      bindings:
+        jailbreak: unreachable-guardrail
+
+resources:
+  # 2Gi (copied from the hallucination profile) OOMKilled the router
+  # (exit 137, confirmed via `kubectl get pod -o json` lastState) while it
+  # downloaded and loaded the local mmbert embedding model at startup. That
+  # load is what needs the headroom, and it happens because this profile uses
+  # a local embedding backend with non-empty *_model_path values - the
+  # tools_db warmup then embeds through it (mmbert, target_dimension 768).
+  # The actively-CI-running envoy-ai-gateway profile uses 12Gi/5Gi.
+  #
+  # A leaner option exists but is not taken here: remote-embedding's profile
+  # empties all five *_model_path values and points at a mock embedding
+  # service, which flips the download gate off entirely and lets it run in
+  # 2Gi. That needs an extra mock deployment and would change what the
+  # tools_db warmup exercises, so it is left as a possible follow-up rather
+  # than bundled into an on_error test.
+  limits:
+    cpu: '2'
+    memory: 6Gi
+  requests:
+    cpu: 500m
+    memory: 2Gi
+
+# E2E/Kind: disable PVC for reliable CI (same as other e2e profiles).
+persistence:
+  enabled: false

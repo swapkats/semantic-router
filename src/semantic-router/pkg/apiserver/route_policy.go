@@ -1,0 +1,90 @@
+//go:build !windows
+
+package apiserver
+
+// RoutePermission names the authorization required for a management route.
+type RoutePermission string
+
+const (
+	PermHealthRead         RoutePermission = "health.read"
+	PermReadyRead          RoutePermission = "ready.read"
+	PermDocsRead           RoutePermission = "docs.read"
+	PermClassifyInvoke     RoutePermission = "classify.invoke"
+	PermConfigRead         RoutePermission = "config.read"
+	PermConfigWrite        RoutePermission = "config.write"
+	PermSecretView         RoutePermission = "secret_view"
+	PermLearningIngest     RoutePermission = "learning.ingest"
+	PermReplayRead         RoutePermission = "replay.read"
+	PermReplayDetail       RoutePermission = "replay.detail"
+	PermDataRead           RoutePermission = "data.read"
+	PermDataWrite          RoutePermission = "data.write"
+	PermMetricsRead        RoutePermission = "metrics.read"
+	PermAuditRead          RoutePermission = "audit.read"
+	PermCacheRead          RoutePermission = "cache.read"
+	PermCacheInvalidate    RoutePermission = "cache.invalidate"
+	PermCacheManage        RoutePermission = "cache.manage"
+	PermCompressionRead    RoutePermission = "compression.read"
+	PermCompressionPreview RoutePermission = "compression.preview"
+	PermCompressionManage  RoutePermission = "compression.manage"
+)
+
+// RouteSensitivity classifies response risk for inventory and policy.
+type RouteSensitivity string
+
+const (
+	SensitivityPublic      RouteSensitivity = "public"
+	SensitivityOperational RouteSensitivity = "operational"
+	SensitivityConfig      RouteSensitivity = "config"
+	SensitivityReplay      RouteSensitivity = "replay"
+	SensitivitySecretView  RouteSensitivity = "secret_view"
+	SensitivityMutation    RouteSensitivity = "mutation"
+)
+
+// RouteAuditAction names immutable audit events for mutation routes.
+type RouteAuditAction string
+
+const (
+	AuditActionNone           RouteAuditAction = ""
+	AuditActionConfigPatch    RouteAuditAction = "config.patch"
+	AuditActionConfigPut      RouteAuditAction = "config.put"
+	AuditActionConfigRollback RouteAuditAction = "config.rollback"
+	// The configuration lifecycle's outcomes: an update that activated (an
+	// ACK), was rejected (a NACK), or was superseded by a newer document.
+	AuditActionConfigActivate        RouteAuditAction = "config.activate"
+	AuditActionConfigReject          RouteAuditAction = "config.reject"
+	AuditActionConfigSupersede       RouteAuditAction = "config.supersede"
+	AuditActionRecipeSave            RouteAuditAction = "recipe.save"
+	AuditActionRecipeDelete          RouteAuditAction = "recipe.delete"
+	AuditActionOutcomeIngest         RouteAuditAction = "outcome.ingest"
+	AuditActionMemoryDelete          RouteAuditAction = "memory.delete"
+	AuditActionDataWrite             RouteAuditAction = "data.write"
+	AuditActionCacheInvalidate       RouteAuditAction = "cache.invalidate"
+	AuditActionCacheFlush            RouteAuditAction = "cache.flush"
+	AuditActionCompressionPreview    RouteAuditAction = "compression.preview"
+	AuditActionCompressionInvalidate RouteAuditAction = "compression.recovery.invalidate"
+)
+
+type routePolicy struct {
+	Permission  RoutePermission
+	Sensitivity RouteSensitivity
+	AuditAction RouteAuditAction
+}
+
+func managedRoute(
+	meta EndpointMetadata,
+	policy routePolicy,
+	handler apiRouteHandler,
+	options ...apiRouteOption,
+) apiRoute {
+	route := apiRoute{
+		EndpointMetadata: meta,
+		Handler:          handler,
+		Permission:       policy.Permission,
+		Sensitivity:      policy.Sensitivity,
+		AuditAction:      policy.AuditAction,
+	}
+	for _, option := range options {
+		option.applyRoute(&route)
+	}
+	return route
+}

@@ -4,7 +4,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/consts"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelpricing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
@@ -33,6 +35,7 @@ var maxTelemetrySessions = 50_000
 type turnState struct {
 	cumulativePrompt                int64
 	cumulativeCached                int64
+	cumulativeCacheWrite            int64
 	cumulativeEstimatedCached       int64
 	cumulativeCompletion            int64
 	cumulativeCost                  float64 // in the currency supplied by TurnPricing.Currency
@@ -102,10 +105,16 @@ func telemetrySessionCount() int {
 	return len(store)
 }
 
-// ResponseAPIInput identifies a Response API (/v1/responses) conversation.
+// ResponseAPIInput identifies a Response API (/v1/responses) turn for
+// telemetry. ConversationID is strict OpenAI-spec external membership: empty
+// unless the request explicitly supplied conversation_id. Do not use it as a
+// session/correlation key; grouping and cumulative-state lookups must use
+// SessionTrackingID instead, which is always non-empty, namespaced, and
+// never a real conversation_id or response_id.
 type ResponseAPIInput struct {
-	ConversationID string
-	HistoryLen     int
+	ConversationID    string
+	SessionTrackingID string
+	HistoryLen        int
 }
 
 // ChatInput identifies a Chat Completions session when user id and messages are available.
@@ -115,32 +124,22 @@ type ChatInput struct {
 }
 
 // TurnPricing carries the active per-1M token prices stamped onto a dispatch log entry.
-// All rates are in Currency (default "USD").
-//
-// isConfigured() returns true when at least one rate is non-zero or Currency is explicitly
-// set (even with zero rates) — the latter supports free/self-hosted models that
-// still need cost=0 and savings attribution.
-type TurnPricing struct {
-	Currency         string
-	PromptPer1M      float64
-	CompletionPer1M  float64
-	CachedInputPer1M float64
-}
-
-// isConfigured reports whether pricing is active: at least one billable rate is set, or
-// Currency is explicit (covers zero-rate free models that still produce cost=0 telemetry).
-func (p TurnPricing) isConfigured() bool {
-	return p.PromptPer1M != 0 || p.CompletionPer1M != 0 || p.CachedInputPer1M != 0 || p.Currency != ""
-}
+type TurnPricing = modelpricing.Rates
 
 // TurnParams carries usage and routing context for one completed LLM round-trip.
 type TurnParams struct {
 	RequestID string
 	Model     string
 	Domain    string // VSR category; empty -> "unknown"
+	// RoutingScope namespaces internal cumulative/session state while the
+	// client-visible session identifier remains unchanged in logs.
+	RoutingScope     config.RecipeName
+	SkipRoutingState bool
 
 	PromptTokens                int
 	CachedPromptTokens          int
+	CacheWriteTokens            int
+	CacheWrite1hTokens          int
 	EstimatedCachedPromptTokens int
 	CompletionTokens            int
 	EstimatedCacheSavings       float64
@@ -159,6 +158,7 @@ type TurnParams struct {
 type turnCumulativeState struct {
 	prompt     int64
 	cached     int64
+	cacheWrite int64
 	completion int64
 	cost       float64
 }
@@ -172,12 +172,12 @@ func normalizeDomain(d string) string {
 
 func resolve(p TurnParams) (storeKey string, turn int, apiKind string, publicSessionID string, ok bool) {
 	if p.ResponseAPI != nil {
-		if p.ResponseAPI.ConversationID == "" {
+		if p.ResponseAPI.SessionTrackingID == "" {
 			return "", 0, "", "", false
 		}
-		cid := p.ResponseAPI.ConversationID
 		turn = p.ResponseAPI.HistoryLen + 1
-		return "respapi:" + cid, turn, "responses", cid, true
+		sid := p.ResponseAPI.SessionTrackingID
+		return sid, turn, "responses", sid, true
 	}
 	if p.Chat != nil && p.Chat.UserID != "" && len(p.Chat.Messages) > 0 {
 		sid := DeriveChatCompletionsSessionID(p.Chat.Messages, p.Chat.UserID)
@@ -202,18 +202,26 @@ func RecordTurn(p TurnParams) {
 	}
 	domain := normalizeDomain(p.Domain)
 
-	costThisTurn := computeCost(p.PromptTokens, p.CachedPromptTokens, p.CompletionTokens, p.Pricing)
+	costThisTurn := computeCost(p.PromptTokens, p.CachedPromptTokens, p.CacheWriteTokens, p.CacheWrite1hTokens, p.CompletionTokens, p.Pricing)
 
 	t := nowFn()
-	cumulative := recordTurnState(key, p, costThisTurn, t)
-	recordRouterSessionUsage(publicSessionID, model, p, costThisTurn, t)
+	stateKey := scopedTelemetrySessionID(p.RoutingScope, key)
+	stateSessionID := scopedTelemetrySessionID(p.RoutingScope, publicSessionID)
+	cumulative := recordTurnState(stateKey, p, costThisTurn, t)
+	if !p.SkipRoutingState {
+		recordRouterSessionUsage(stateSessionID, model, p, costThisTurn, t)
+	}
 
 	metrics.RecordSessionTurnTokens(model, domain, float64(p.PromptTokens), float64(p.CompletionTokens))
 	currency := pricingCurrency(p.Pricing)
-	if p.Pricing.isConfigured() {
+	if p.Pricing.IsConfigured() {
 		metrics.RecordSessionTurnCost(model, domain, currency, costThisTurn)
 	}
 	logSessionTurn(p, publicSessionID, turn, apiKind, model, domain, currency, costThisTurn, cumulative, t)
+}
+
+func scopedTelemetrySessionID(scope config.RecipeName, sessionID string) string {
+	return RoutingSessionKey(scope, sessionID)
 }
 
 func recordTurnState(key string, p TurnParams, costThisTurn float64, t time.Time) turnCumulativeState {
@@ -232,10 +240,18 @@ func recordTurnState(key string, p TurnParams, costThisTurn float64, t time.Time
 		st = &turnState{}
 		store[key] = st
 	}
-	st.cumulativePrompt += int64(p.PromptTokens)
-	st.cumulativeCached += int64(clampCachedPromptTokens(p.PromptTokens, p.CachedPromptTokens))
+	usage := modelpricing.Normalize(modelpricing.Usage{
+		PromptTokens:       p.PromptTokens,
+		CachedInputTokens:  p.CachedPromptTokens,
+		CacheWriteTokens:   p.CacheWriteTokens,
+		CacheWrite1hTokens: p.CacheWrite1hTokens,
+		CompletionTokens:   p.CompletionTokens,
+	})
+	st.cumulativePrompt += int64(usage.PromptTokens)
+	st.cumulativeCached += int64(usage.CachedInputTokens)
+	st.cumulativeCacheWrite += int64(usage.CacheWriteTokens)
 	st.cumulativeEstimatedCached += int64(clampCachedPromptTokens(p.PromptTokens, p.EstimatedCachedPromptTokens))
-	st.cumulativeCompletion += int64(p.CompletionTokens)
+	st.cumulativeCompletion += int64(usage.CompletionTokens)
 	st.cumulativeCost += costThisTurn
 	if p.EstimatedCacheSavings > 0 {
 		st.cumulativeEstimatedCacheSavings += p.EstimatedCacheSavings
@@ -247,6 +263,7 @@ func recordTurnState(key string, p TurnParams, costThisTurn float64, t time.Time
 	return turnCumulativeState{
 		prompt:     st.cumulativePrompt,
 		cached:     st.cumulativeCached,
+		cacheWrite: st.cumulativeCacheWrite,
 		completion: st.cumulativeCompletion,
 		cost:       st.cumulativeCost,
 	}
@@ -258,6 +275,8 @@ func recordRouterSessionUsage(publicSessionID string, model string, p TurnParams
 		Model:                       model,
 		PromptTokens:                p.PromptTokens,
 		CachedPromptTokens:          p.CachedPromptTokens,
+		CacheWriteTokens:            p.CacheWriteTokens,
+		CacheWrite1hTokens:          p.CacheWrite1hTokens,
 		EstimatedCachedPromptTokens: p.EstimatedCachedPromptTokens,
 		CompletionTokens:            p.CompletionTokens,
 		Cost:                        costThisTurn,
@@ -296,11 +315,19 @@ func logSessionTurn(
 		"domain":                          domain,
 		"prompt_tokens":                   p.PromptTokens,
 		"cached_prompt_tokens":            clampCachedPromptTokens(p.PromptTokens, p.CachedPromptTokens),
+		"cache_write_tokens":              p.CacheWriteTokens,
 		"completion_tokens":               p.CompletionTokens,
 		"cumulative_prompt_tokens":        cumulative.prompt,
 		"cumulative_cached_prompt_tokens": cumulative.cached,
+		"cumulative_cache_write_tokens":   cumulative.cacheWrite,
 		"cumulative_completion_tokens":    cumulative.completion,
 		"timestamp":                       t.UTC().Format(time.RFC3339Nano),
+	}
+	if p.ResponseAPI != nil && p.ResponseAPI.ConversationID != "" {
+		// Distinct from session_id (the internal SessionTrackingID grouping
+		// key): this is the client-visible OpenAI conversation_id, present
+		// only when the request explicitly used it.
+		fields["conversation_id"] = p.ResponseAPI.ConversationID
 	}
 	if p.CacheAccountingSource != "" {
 		fields["router_cache_accounting_source"] = p.CacheAccountingSource
@@ -310,10 +337,12 @@ func logSessionTurn(
 			fields["router_estimated_cache_savings"] = p.EstimatedCacheSavings
 		}
 	}
-	if p.Pricing.isConfigured() {
+	if p.Pricing.IsConfigured() {
 		fields["pricing_prompt_per_1m"] = p.Pricing.PromptPer1M
 		fields["pricing_completion_per_1m"] = p.Pricing.CompletionPer1M
 		fields["pricing_cached_input_per_1m"] = p.Pricing.CachedInputPer1M
+		fields["pricing_cache_write_per_1m"] = p.Pricing.EffectiveCacheWritePer1M()
+		fields["pricing_cache_write_1h_per_1m"] = p.Pricing.EffectiveCacheWrite1hPer1M()
 		fields["pricing_currency"] = currency
 		fields["cost_this_turn"] = costThisTurn
 		fields["cumulative_cost"] = cumulative.cost
@@ -322,16 +351,18 @@ func logSessionTurn(
 }
 
 // computeCost returns the turn cost in the pricing currency given token counts
-// and rates. Cached prompt tokens use CachedInputPer1M when configured.
-func computeCost(promptTokens, cachedPromptTokens, completionTokens int, pricing TurnPricing) float64 {
-	if !pricing.isConfigured() {
+// and rates. Cached reads and cache writes use their configured rates.
+func computeCost(promptTokens, cachedPromptTokens, cacheWriteTokens, cacheWrite1hTokens, completionTokens int, pricing TurnPricing) float64 {
+	if !pricing.IsConfigured() {
 		return 0
 	}
-	cached := clampCachedPromptTokens(promptTokens, cachedPromptTokens)
-	uncachedPrompt := promptTokens - cached
-	return (float64(uncachedPrompt)*pricing.PromptPer1M +
-		float64(cached)*pricing.CachedInputPer1M +
-		float64(completionTokens)*pricing.CompletionPer1M) / 1_000_000.0
+	return modelpricing.Cost(modelpricing.Usage{
+		PromptTokens:       promptTokens,
+		CachedInputTokens:  cachedPromptTokens,
+		CacheWriteTokens:   cacheWriteTokens,
+		CacheWrite1hTokens: cacheWrite1hTokens,
+		CompletionTokens:   completionTokens,
+	}, pricing)
 }
 
 func clampCachedPromptTokens(promptTokens, cachedPromptTokens int) int {

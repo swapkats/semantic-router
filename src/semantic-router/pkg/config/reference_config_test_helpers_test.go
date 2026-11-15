@@ -44,10 +44,10 @@ func referenceConfigRepoRoot(t testingT) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "../../../../"))
 }
 
-func assertPluginConfigCoverage(t testingT, plugins []map[string]interface{}, typ reflect.Type, pluginType string) {
+func assertPluginConfigCoverage(t testingT, plugins []map[string]interface{}, typ reflect.Type, pluginType string, skip ...string) {
 	t.Helper()
 	configs := collectChildMapsFromSlice(t, plugins, "configuration", "plugins("+pluginType+")")
-	assertSliceUnionCoversStructFields(t, configs, typ, "routing.decisions[].plugins[type="+pluginType+"].configuration")
+	assertSliceUnionCoversStructFields(t, configs, typ, "recipes[default].decisions[].plugins[type="+pluginType+"].configuration", skip...)
 }
 
 func collectRuleCoverage(t testingT, rule map[string]interface{}, operators map[string]bool, signalTypes map[string]bool) {
@@ -127,24 +127,6 @@ func normalizeSliceItems(t testingT, items interface{}, path string) []interface
 	}
 }
 
-func mapValuesToSlice(t testingT, value map[string]interface{}, path string) []interface{} {
-	t.Helper()
-	keys := make([]string, 0, len(value))
-	for key := range value {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	result := make([]interface{}, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, value[key])
-	}
-	if len(result) == 0 {
-		t.Fatalf("%s is empty", path)
-	}
-	return result
-}
-
 func assertMapCoversStructFields(t testingT, node map[string]interface{}, typ reflect.Type, path string, skip ...string) {
 	t.Helper()
 	for _, field := range requiredYAMLFields(t, typ, skip...) {
@@ -217,7 +199,11 @@ func collectYAMLFields(t testingT, typ reflect.Type, fields map[string]bool, ski
 
 		name, inline := parseYAMLTag(field, tag)
 		if inline {
-			collectYAMLFields(t, indirectType(field.Type), fields, skipSet)
+			// An inline map holds registered extension blocks, which have no
+			// fixed names to cover.
+			if indirectType(field.Type).Kind() == reflect.Struct {
+				collectYAMLFields(t, indirectType(field.Type), fields, skipSet)
+			}
 			continue
 		}
 		if name == "" {

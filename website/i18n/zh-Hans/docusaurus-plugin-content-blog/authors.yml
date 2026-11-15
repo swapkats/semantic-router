@@ -1,6 +1,6 @@
 rootfs:
   name: Huamin Chen
-  title: Distinguished Engineer @ Red Hat
+  title: AI @Microsoft
   url: https://github.com/rootfs
   image_url: /img/team/huamin.png
 
@@ -18,7 +18,7 @@ yuezhu1:
 
 Xunzhuo:
   name: Xunzhuo Liu
-  title: Intelligent Routing @vLLM
+  title: Intelligent Routing @vLLM | Open Source & AI @AMD
   url: https://github.com/Xunzhuo
   image_url: /img/team/xunzhuo.png
 
@@ -48,12 +48,63 @@ andyluo:
 
 anupsharma:
   name: Anup Sharma
-  title: AI & Distributed System @ Nutanix
+  title: Engineering @ Sarvam AI
   url: https://www.linkedin.com/in/anup-sharma1
   image_url: /img/team/anup.jpeg
+
+1fanwang:
+  name: Stefan Wang
+  title: Senior Software Engineer at LinkedIn
+  url: https://github.com/1fanwang
+  image_url: /img/team/stefan.png
 
 aayushsaini101:
   name: Aayush Saini
   title: SDE, Data and AI @ Red Hat
   url: https://github.com/AayushSaini101
   image_url: https://github.com/AayushSaini101.png
+
+sharanharsoor:
+  name: Sharan Harsoor
+  title: Founder and maintainer of Runkite · ML Engineer
+  url: https://github.com/sharanharsoor
+  image_url: https://github.com/sharanharsoor.png
+
+shivjikumarjha:
+  name: Shivji Kumar Jha
+  title: Staff Engineer (Data & AI) @ Nutanix
+  url: https://github.com/ShivjiKumarJha
+  image_url: /img/team/shivji.png
+
+adaamko:
+  name: Ádám Kovács
+  title: Co-founder @ KR Labs · LettuceDetect
+  url: https://github.com/adaamko
+  image_url: https://github.com/adaamko.png
+
+boweihe:
+  name: Bowei He
+  title: Postdoctoral Researcher @ MBZUAI · McGill
+
+abhinav:
+  name: Abhinav Mahajan
+  title: Software Engineer at Barclays
+  url: https://www.linkedin.com/in/abhinav-mahajan-b805b022a/
+  image_url: /img/team/abhinav.png
+
+Alex-Wengg:
+  name: Alex Weng
+  title: Fluid Inference
+  url: https://github.com/Alex-Wengg
+  image_url: https://github.com/Alex-Wengg.png
+
+LeON-Nie-code:
+  name: Leon Nie
+  url: https://github.com/LeON-Nie-code
+  image_url: https://avatars.githubusercontent.com/u/118652405?v=4
+
+theohsiung:
+  name: Theo Hsiung
+  title: Associate Research Scientist @ Delta Electronics
+  url: https://github.com/theohsiung
+  image_url: https://github.com/theohsiung.png

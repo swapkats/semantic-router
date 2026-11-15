@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { ReadonlyProvider } from './contexts/ReadonlyContext'
+import { CapabilitiesProvider } from './contexts/CapabilitiesContext'
 import { SetupProvider } from './contexts/SetupContext'
 import { AuthProvider } from './contexts/AuthContext'
 import AppRouter from './app/AppRouter'
@@ -8,6 +9,10 @@ const App: React.FC = () => {
   const [isInIframe, setIsInIframe] = useState(false)
 
   useEffect(() => {
+    document.documentElement.setAttribute('data-theme', 'dark')
+    document.documentElement.setAttribute('data-design', 'graphite')
+    document.documentElement.style.colorScheme = 'dark'
+
     if (window.self !== window.top) {
       setIsInIframe(true)
       console.warn('Dashboard detected it is running inside an iframe - this may indicate a loop')
@@ -48,7 +53,7 @@ const App: React.FC = () => {
             marginTop: '1.5rem',
             padding: '0.75rem 1.5rem',
             backgroundColor: 'var(--color-primary)',
-            color: 'white',
+            color: '#09090a',
             border: 'none',
             borderRadius: 'var(--radius-md)',
             fontSize: '0.875rem',
@@ -65,9 +70,11 @@ const App: React.FC = () => {
   return (
     <AuthProvider>
       <ReadonlyProvider>
-        <SetupProvider>
-          <AppRouter />
-        </SetupProvider>
+        <CapabilitiesProvider>
+          <SetupProvider>
+            <AppRouter />
+          </SetupProvider>
+        </CapabilitiesProvider>
       </ReadonlyProvider>
     </AuthProvider>
   )

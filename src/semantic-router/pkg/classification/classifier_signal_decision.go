@@ -27,6 +27,15 @@ func (c *Classifier) EvaluateDecisionWithEngineAndTrace(signals *SignalResults) 
 	return c.evaluateDecisionInternal(signals, true, nil)
 }
 
+// EvaluateDecisionWithEngineAndTraceForDecisions evaluates only the supplied
+// decision candidates and returns their trace trees.
+func (c *Classifier) EvaluateDecisionWithEngineAndTraceForDecisions(
+	signals *SignalResults,
+	decisions []config.Decision,
+) (*decision.DecisionResult, []decision.DecisionTrace, error) {
+	return c.evaluateDecisionInternal(signals, true, decisions)
+}
+
 func (c *Classifier) evaluateDecisionInternal(signals *SignalResults, trace bool, candidates []config.Decision) (*decision.DecisionResult, []decision.DecisionTrace, error) {
 	decisions := c.Config.Decisions
 	if candidates != nil {
@@ -36,56 +45,32 @@ func (c *Classifier) evaluateDecisionInternal(signals *SignalResults, trace bool
 		return nil, nil, fmt.Errorf("no decisions configured")
 	}
 
-	logging.Debugf("Signal evaluation results: keyword=%v, embedding=%v, domain=%v, fact_check=%v, user_feedback=%v, reask=%v, preference=%v, language=%v, context=%v, structure=%v, complexity=%v, modality=%v, authz=%v, jailbreak=%v, pii=%v, kb=%v, conversation=%v, event=%v",
-		signals.MatchedKeywordRules, signals.MatchedEmbeddingRules, signals.MatchedDomainRules,
-		signals.MatchedFactCheckRules, signals.MatchedUserFeedbackRules, signals.MatchedReaskRules, signals.MatchedPreferenceRules,
-		signals.MatchedLanguageRules, signals.MatchedContextRules, signals.MatchedStructureRules,
+	logging.Debugf("Signal evaluation results: keyword=%v, domain=%v, fact_check=%v, user_feedback=%v, turn_relation=%v, language=%v, context=%v, complexity=%v, modality=%v, authz=%v, jailbreak=%v, safety=%v, pii=%v, conversation=%v, input_modality=%v, systemone=%v",
+		signals.MatchedKeywordRules, signals.MatchedDomainRules,
+		signals.MatchedFactCheckRules, signals.MatchedUserFeedbackRules, signals.MatchedTurnRelationRules,
+		signals.MatchedLanguageRules, signals.MatchedContextRules,
 		signals.MatchedComplexityRules, signals.MatchedModalityRules, signals.MatchedAuthzRules,
-		signals.MatchedJailbreakRules, signals.MatchedPIIRules, signals.MatchedKBRules,
-		signals.MatchedConversationRules, signals.MatchedEventRules)
+		signals.MatchedJailbreakRules, signals.MatchedSafetyRules, signals.MatchedPIIRules,
+		signals.MatchedConversationRules, signals.MatchedInputModalityRules,
+		signals.MatchedSystemOneRules)
 
-	engine := decision.NewDecisionEngine(
-		c.Config.KeywordRules,
-		c.Config.EmbeddingRules,
-		c.Config.Categories,
-		decisions,
-		c.Config.Strategy,
-	)
+	engine := decision.NewDecisionEngine(decisions, c.Config.Strategy).WithRoutingScope(c.Config.RoutingScope)
 
-	sm := &decision.SignalMatches{
-		KeywordRules:      signals.MatchedKeywordRules,
-		EmbeddingRules:    signals.MatchedEmbeddingRules,
-		DomainRules:       signals.MatchedDomainRules,
-		FactCheckRules:    signals.MatchedFactCheckRules,
-		UserFeedbackRules: signals.MatchedUserFeedbackRules,
-		ReaskRules:        signals.MatchedReaskRules,
-		PreferenceRules:   signals.MatchedPreferenceRules,
-		LanguageRules:     signals.MatchedLanguageRules,
-		ContextRules:      signals.MatchedContextRules,
-		StructureRules:    signals.MatchedStructureRules,
-		ComplexityRules:   signals.MatchedComplexityRules,
-		ModalityRules:     signals.MatchedModalityRules,
-		SignalConfidences: signals.SignalConfidences,
-		AuthzRules:        signals.MatchedAuthzRules,
-		JailbreakRules:    signals.MatchedJailbreakRules,
-		PIIRules:          signals.MatchedPIIRules,
-		KBRules:           signals.MatchedKBRules,
-		ConversationRules: signals.MatchedConversationRules,
-		EventRules:        signals.MatchedEventRules,
-		ProjectionRules:   signals.MatchedProjectionRules,
-	}
+	sm := signals.Matches()
 
 	var result *decision.DecisionResult
 	var traces []decision.DecisionTrace
+	var diagnostics decision.EvaluationDiagnostics
+	var err error
 
 	if trace {
-		result, traces = engine.EvaluateDecisionsWithTrace(sm)
+		result, traces, diagnostics, err = engine.EvaluateDecisionsWithTraceAndDiagnostics(sm)
 	} else {
-		var err error
-		result, err = engine.EvaluateDecisionsWithSignals(sm)
-		if err != nil {
-			return nil, nil, fmt.Errorf("decision evaluation failed: %w", err)
-		}
+		result, diagnostics, err = engine.EvaluateDecisionsWithDiagnostics(sm)
+	}
+	signals.Diagnostics = diagnostics
+	if err != nil {
+		return nil, traces, fmt.Errorf("decision evaluation failed: %w", err)
 	}
 
 	if result == nil {

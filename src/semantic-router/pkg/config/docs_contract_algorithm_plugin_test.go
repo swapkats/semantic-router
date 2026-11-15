@@ -9,55 +9,60 @@ import (
 )
 
 var algorithmTutorialBuckets = map[string]string{
-	"automix":       "selection",
-	"confidence":    "looper",
+	"escalate":      "looper",
 	"fusion":        "looper",
-	"hybrid":        "selection",
-	"kmeans":        "selection",
-	"knn":           "selection",
 	"latency-aware": "selection",
-	"mlp":           "selection",
 	"multi-factor":  "selection",
+	"random":        "selection",
 	"ratings":       "looper",
 	"remom":         "looper",
-	"router-dc":     "selection",
 	"static":        "selection",
-	"svm":           "selection",
 	"workflows":     "looper",
+	"systemone":     "selection",
 }
 
 var retiredAlgorithmTutorialDocs = []string{
 	repoRel("website", "docs", "tutorials", "algorithm", "selection.md"),
 	repoRel("website", "docs", "tutorials", "algorithm", "looper.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "native"),
+	repoRel("website", "docs", "tutorials", "algorithm", "looper", "confidence.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "automix.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "hybrid.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "kmeans.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "knn.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "mlp.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "prompt.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "router-dc.md"),
+	repoRel("website", "docs", "tutorials", "algorithm", "selection", "svm.md"),
 }
 
 var pluginTutorialBuckets = map[string]string{
-	"content-safety":     "safety-and-generation",
-	"fast-response":      "response-and-mutation",
-	"hallucination":      "safety-and-generation",
-	"header-mutation":    "response-and-mutation",
-	"image-gen":          "response-and-mutation",
-	"memory":             "retrieval-and-memory",
-	"rag":                "retrieval-and-memory",
-	"request-params":     "response-and-mutation",
-	"response-jailbreak": "safety-and-generation",
-	"router-replay":      "retrieval-and-memory",
-	"semantic-cache":     "retrieval-and-memory",
-	"system-prompt":      "response-and-mutation",
-	"tool-selection":     "response-and-mutation",
-	"tools":              "response-and-mutation",
+	"content-safety":  "safety-and-generation",
+	"context":         "retrieval-and-memory",
+	"fast-response":   "response-and-mutation",
+	"header-mutation": "response-and-mutation",
+	"masking":         "response-and-mutation",
+	"prompt-cache":    "retrieval-and-memory",
+	"request-params":  "response-and-mutation",
+	"response-guard":  "safety-and-generation",
+	"router-replay":   "retrieval-and-memory",
+	"response-cache":  "retrieval-and-memory",
+	"system-prompt":   "response-and-mutation",
+	"tools":           "response-and-mutation",
 }
 
 var retiredPluginTutorialDocs = []string{
 	repoRel("website", "docs", "tutorials", "plugin", "response-and-mutation.md"),
 	repoRel("website", "docs", "tutorials", "plugin", "retrieval-and-memory.md"),
 	repoRel("website", "docs", "tutorials", "plugin", "safety-and-generation.md"),
+	repoRel("website", "docs", "tutorials", "plugin", "hallucination.md"),
+	repoRel("website", "docs", "tutorials", "plugin", "response-jailbreak.md"),
 }
 
 func assertAlgorithmTutorialDocsMatchConfigHierarchy(t *testing.T, root string) {
 	t.Helper()
 
-	configRoot := filepath.Join(root, repoRel("config", "algorithm"))
+	configRoot := filepath.Join(root, repoRel("config", "fragments", "algorithm"))
 	remaining := copyStringStringMap(algorithmTutorialBuckets)
 	seen := 0
 
@@ -95,7 +100,7 @@ func assertAlgorithmTutorialDocsMatchConfigHierarchy(t *testing.T, root string) 
 		t.Fatalf("%s should contain algorithm fragments", configRoot)
 	}
 	for algorithm := range remaining {
-		t.Fatalf("algorithm tutorial mapping declares %q, but config/algorithm is missing it", algorithm)
+		t.Fatalf("algorithm tutorial mapping declares %q, but config/fragments/algorithm is missing it", algorithm)
 	}
 
 	assertPathsDoNotExist(t, root, retiredAlgorithmTutorialDocs)
@@ -104,7 +109,7 @@ func assertAlgorithmTutorialDocsMatchConfigHierarchy(t *testing.T, root string) 
 func assertPluginTutorialDocsMatchConfigHierarchy(t *testing.T, root string) {
 	t.Helper()
 
-	configRoot := filepath.Join(root, repoRel("config", "plugin"))
+	configRoot := filepath.Join(root, repoRel("config", "fragments", "plugin"))
 	entries, err := os.ReadDir(configRoot)
 	if err != nil {
 		t.Fatalf("failed to read %s: %v", configRoot, err)
@@ -122,13 +127,13 @@ func assertPluginTutorialDocsMatchConfigHierarchy(t *testing.T, root string) {
 
 		docPath := repoRel("website", "docs", "tutorials", "plugin", plugin+".md")
 		if _, err := os.Stat(filepath.Join(root, docPath)); err != nil {
-			t.Fatalf("%s should exist for config/plugin/%s: %v", docPath, plugin, err)
+			t.Fatalf("%s should exist for config/fragments/plugin/%s: %v", docPath, plugin, err)
 		}
 		delete(remaining, plugin)
 	}
 
 	for plugin := range remaining {
-		t.Fatalf("plugin tutorial mapping declares %q, but config/plugin/%s is missing", plugin, plugin)
+		t.Fatalf("plugin tutorial mapping declares %q, but config/fragments/plugin/%s is missing", plugin, plugin)
 	}
 
 	assertPathsDoNotExist(t, root, retiredPluginTutorialDocs)

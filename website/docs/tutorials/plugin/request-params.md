@@ -4,13 +4,12 @@
 
 `request_params` is a route-local plugin that validates and trims OpenAI Chat Completions request bodies before they are forwarded to backends.
 
-It aligns to `config/plugin/request-params/budget-tier.yaml`.
-
 ## Key Advantages
 
 - Caps expensive parameters (`max_tokens`, `n`) per route.
 - Blocks sensitive parameters such as `logprobs` / `top_logprobs` for tiers that should not expose token distributions.
-- Optionally strips unknown top-level JSON fields to reduce surprise passthrough behavior.
+- Can remove a client `prompt_cache_key` with `blocked_params: [prompt_cache_key]` before backend dispatch.
+- Can remove `min_p` and `logit_bias` with `blocked_params: [min_p, logit_bias]` when every backend of a route rejects them, as vLLM does with speculative decoding. To remove them for one model only, list them in [its `unsupported_capabilities`](../../installation/protocol-compatibility#sampling-controls-a-backend-rejects).
 
 ## What Problem Does It Solve?
 
@@ -20,11 +19,10 @@ Model routing can restrict which backend serves a request, but clients can still
 
 - a tier or route must not request logprobs or multiple completions
 - you need a hard ceiling on `max_tokens` or `n` independent of client input
-- unknown JSON fields should not be forwarded to backends
 
 ## Configuration
 
-Use this fragment under `routing.decisions[].plugins` (list of plugin entries):
+Add the plugin under `recipes[].decisions[].plugins`:
 
 ```yaml
 plugins:
@@ -35,7 +33,6 @@ plugins:
         - top_logprobs
       max_tokens_limit: 500
       max_n: 1
-      strip_unknown: true
 ```
 
 In DSL, the same plugin can appear as:
@@ -45,6 +42,22 @@ PLUGIN request_params {
   blocked_params: ["logprobs", "top_logprobs"]
   max_tokens_limit: 500
   max_n: 1
-  strip_unknown: true
 }
 ```
+
+`max_tokens_limit` bounds the whole output, thinking included. When it lowers
+`max_tokens` to or below an Anthropic `thinking.budget_tokens`, the budget drops
+to one token below the cap. Anthropic needs a budget of at least 1024, so an
+Anthropic route capped at 1024 or less still refuses a thinking budget.
+
+`blocked_params` cannot include `stream`. The Router streams the answer exactly
+when the client asks for a stream, so a configuration that lists it fails at
+load.
+
+This plugin enforces a bounded set of OpenAI Chat Completions fields. It is not
+a general JSON-schema firewall and does not authorize a caller. The Router
+already refuses a request field the client's wire format does not declare, so
+the plugin has no `strip_unknown`: a configuration that still sets it fails at
+load with a one-line hint, and `vllm-sr config migrate` deletes it. See a
+complete example:
+[`config/fragments/plugin/request-params/budget-tier.yaml`](https://github.com/vllm-project/semantic-router/blob/main/config/fragments/plugin/request-params/budget-tier.yaml).

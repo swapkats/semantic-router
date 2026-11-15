@@ -2,8 +2,8 @@ package selection
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math"
 	"strings"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
@@ -13,7 +13,6 @@ import (
 
 // SessionAwareConfig configures agentic session-aware model selection.
 type SessionAwareConfig struct {
-	BaseMethod                   SelectionMethod
 	IdleTimeoutSeconds           int
 	MinTurnsBeforeSwitch         int
 	SwitchMargin                 float64
@@ -36,7 +35,6 @@ type SessionAwareConfig struct {
 // DefaultSessionAwareConfig returns the production-oriented default policy.
 func DefaultSessionAwareConfig() *SessionAwareConfig {
 	return &SessionAwareConfig{
-		BaseMethod:                   MethodHybrid,
 		IdleTimeoutSeconds:           300,
 		MinTurnsBeforeSwitch:         1,
 		SwitchMargin:                 0.05,
@@ -79,7 +77,6 @@ func NewSessionAwareSelector(cfg *SessionAwareConfig) *SessionAwareSelector {
 
 func normalizeSessionAwareConfig(cfg SessionAwareConfig) *SessionAwareConfig {
 	defaults := DefaultSessionAwareConfig()
-	cfg.BaseMethod = defaultSessionAwareBaseMethod(cfg.BaseMethod, defaults.BaseMethod)
 	cfg.IdleTimeoutSeconds = defaultNonNegativeInt(cfg.IdleTimeoutSeconds, defaults.IdleTimeoutSeconds)
 	cfg.MinTurnsBeforeSwitch = defaultNonNegativeInt(cfg.MinTurnsBeforeSwitch, defaults.MinTurnsBeforeSwitch)
 	cfg.SwitchMargin = defaultNonNegativeFloat(cfg.SwitchMargin, defaults.SwitchMargin)
@@ -95,13 +92,6 @@ func normalizeSessionAwareConfig(cfg SessionAwareConfig) *SessionAwareConfig {
 	cfg.RemainingTurnPriorHorizon = defaultPositiveInt(cfg.RemainingTurnPriorHorizon, defaults.RemainingTurnPriorHorizon)
 	cfg.MinRemainingTurnPriorSamples = defaultNonNegativeInt(cfg.MinRemainingTurnPriorSamples, defaults.MinRemainingTurnPriorSamples)
 	return &cfg
-}
-
-func defaultSessionAwareBaseMethod(method, defaultMethod SelectionMethod) SelectionMethod {
-	if method == "" || method == MethodSessionAware {
-		return defaultMethod
-	}
-	return method
 }
 
 func defaultNonNegativeInt(value, defaultValue int) int {
@@ -139,10 +129,6 @@ func defaultAtLeastFloat(value, defaultValue, minimum float64) float64 {
 	return value
 }
 
-func (s *SessionAwareSelector) Method() SelectionMethod {
-	return MethodSessionAware
-}
-
 func (s *SessionAwareSelector) SetBaseSelector(selector Selector) {
 	s.baseSelector = selector
 }
@@ -177,33 +163,52 @@ func (s *SessionAwareSelector) Select(ctx context.Context, selCtx *SelectionCont
 	current := strings.TrimSpace(session.PreviousModel)
 	driftDetected := s.decisionDriftDetected(selCtx, session)
 	trace := s.newPolicyTrace(selCtx, base, session, current, false, driftDetected)
+	owner := CurrentSessionCandidate(selCtx, base, current)
+	// A tool-loop lock binds a turn to the decision state that admitted it.
+	// Decision drift is itself a continuity boundary: the drifted decision
+	// releases the lock (traced as decision_drift) and routes from its own
+	// candidate set instead of rejecting every candidate and deadlocking the
+	// loop. Opaque provider state keeps the stricter rule: it stays physically
+	// bound to the model that created it.
+	toolLoopLocked := session.ActiveToolLoop && s.config.ToolLoopHardLock && !driftDetected
+	portabilityLocked := session.HasNonPortableContext && s.config.ContextPortabilityHardLock
+	if current != "" && owner == nil && (toolLoopLocked || portabilityLocked) {
+		return nil, fmt.Errorf("%w: excluded exact session owner %q", ErrNoEligibleCandidates, current)
+	}
 	if signal, reason := currentModelIssue(selCtx.CandidateModels, current); signal != "" {
 		trace.MissingSignals = append(trace.MissingSignals, signal)
 		return s.wrapBaseSelection(base, reason, trace), nil
 	}
 
+	if owner == nil {
+		trace.MissingSignals = append(trace.MissingSignals, "previous_candidate_not_in_candidates")
+		return s.wrapBaseSelection(base, "previous_candidate_not_in_candidates", trace), nil
+	}
+
 	timeout := secondsDuration(s.config.IdleTimeoutSeconds)
 	idleExpired := session.idleExpired(timeout)
 	trace.IdleExpired = idleExpired
-	continuityReset := idleExpired || driftDetected
+	trace.ExplicitRelease = session.ReleaseHonored
+	continuityReset := idleExpired || driftDetected || session.ReleaseHonored
 	if reason := s.sessionHardLockReason(session, continuityReset); reason != "" {
-		return s.forceCurrent(selCtx, base, current, reason, trace), nil
+		return s.forceCurrent(selCtx, base, current, reason, trace)
 	}
 
 	adjusted, candidateTraces := s.adjustScores(selCtx, base, session, current, continuityReset)
-	bestRef, bestScore := bestCandidateByScore(selCtx.CandidateModels, adjusted)
-	if bestRef == nil {
+	best := adjusted.Best(HigherIsBetter, false)
+	if best < 0 {
 		trace.MissingSignals = append(trace.MissingSignals, "adjusted_scores")
 		return s.wrapBaseSelection(base, "missing_adjusted_scores", trace), nil
 	}
 
-	confidence := adjustedConfidence(bestRef.Model, adjusted)
+	bestRef, bestScore := &adjusted[best].Candidate, adjusted[best].Score
+	confidence := candidateScoreConfidence(best, adjusted)
 	reason := fmt.Sprintf(
 		"session_aware: base=%s current=%s selected=%s idle_expired=%t active_tool_loop=%t",
 		base.Method, current, bestRef.Model, idleExpired, session.ActiveToolLoop,
 	)
 	trace.SelectedModel = bestRef.Model
-	trace.FinalScores = cloneScores(adjusted)
+	trace.FinalScores = adjusted.Diagnostics()
 	trace.CandidateTraces = candidateTraces
 	trace.DecisionReason = "switch_allowed"
 	if bestRef.Model == current {
@@ -211,15 +216,17 @@ func (s *SessionAwareSelector) Select(ctx context.Context, selCtx *SelectionCont
 	}
 	logging.Infof("[SessionAwareSelector] %s score=%.4f confidence=%.2f", reason, bestScore, confidence)
 	return &SelectionResult{
-		SelectedModel: bestRef.Model,
-		LoRAName:      bestRef.LoRAName,
-		Score:         bestScore,
-		Confidence:    confidence,
-		Method:        MethodSessionAware,
-		Tier:          TierSupported,
-		Reasoning:     reason,
-		AllScores:     adjusted,
-		SessionPolicy: trace,
+		SelectedModel:     bestRef.Model,
+		SelectedCandidate: bestRef,
+		LoRAName:          bestRef.LoRAName,
+		Score:             bestScore,
+		Confidence:        confidence,
+		Method:            MethodSessionAware,
+		Tier:              TierSupported,
+		Reasoning:         reason,
+		AllScores:         adjusted.Diagnostics(),
+		CandidateScores:   adjusted,
+		SessionPolicy:     trace,
 	}, nil
 }
 
@@ -271,15 +278,31 @@ func (s *SessionAwareSelector) decisionDriftDetected(selCtx *SelectionContext, s
 	if selCtx.DecisionName == "" || session.LastDecisionName == "" {
 		return false
 	}
-	return selCtx.DecisionName != session.LastDecisionName
+	return selCtx.ScopedRoutingName(selCtx.DecisionName) != session.LastDecisionName
 }
 
 func (s *SessionAwareSelector) selectBase(ctx context.Context, selCtx *SelectionContext) (*SelectionResult, error) {
 	if s.baseSelector != nil && s.baseSelector.Method() != MethodSessionAware {
 		result, err := s.baseSelector.Select(ctx, selCtx)
+		if errors.Is(err, ErrNoEligibleCandidates) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		if err == nil && result != nil {
-			ensureScoresForCandidates(result, selCtx.CandidateModels)
-			return result, nil
+			copy := *result
+			// Session bonuses are higher-is-better utilities. Convert a latency
+			// cost into that orientation before applying them, never after ranking.
+			if copy.ScoreDirection == LowerIsBetter {
+				scores := result.ScoresFor(selCtx.CandidateModels)
+				for i := range scores {
+					scores[i].Score = -scores[i].Score
+				}
+				copy = *copy.WithScores(scores)
+				copy.Score = -copy.Score
+				copy.ScoreDirection = HigherIsBetter
+			} else {
+				ensureScoresForCandidates(&copy, selCtx.CandidateModels)
+			}
+			return &copy, nil
 		}
 		logging.Warnf("[SessionAwareSelector] base selector %s failed: %v", s.baseSelector.Method(), err)
 	}
@@ -301,48 +324,43 @@ func (s *SessionAwareSelector) wrapBaseSelection(base *SelectionResult, reason s
 	return &wrapped
 }
 
-func (s *SessionAwareSelector) forceCurrent(selCtx *SelectionContext, base *SelectionResult, current, reason string, trace *SessionPolicyTrace) *SelectionResult {
-	allScores := cloneScores(base.AllScores)
-	if allScores == nil {
-		allScores = make(map[string]float64, len(selCtx.CandidateModels))
+func (s *SessionAwareSelector) forceCurrent(selCtx *SelectionContext, base *SelectionResult, current, reason string, trace *SessionPolicyTrace) (*SelectionResult, error) {
+	scores := base.ScoresFor(selCtx.CandidateModels)
+	ref := CurrentSessionCandidate(selCtx, base, current)
+	if ref == nil {
+		return nil, fmt.Errorf("%w: missing exact session candidate %q", ErrNoEligibleCandidates, current)
 	}
-	currentScore := allScores[current]
-	allScores[current] = math.Max(currentScore, maxScore(allScores)+s.config.ToolLoopStayBias+s.config.StayBias)
-	ref := modelRefForName(selCtx.CandidateModels, current)
-	loRA := ""
-	if ref != nil {
-		loRA = ref.LoRAName
-	}
+	currentScore, _ := scores.Get(*ref)
+	allScores := scores.Diagnostics()
+	loRA := ref.LoRAName
 	if trace != nil {
 		trace.HardLocked = true
 		trace.HardLockReason = reason
 		trace.DecisionReason = reason
 		trace.SelectedModel = current
 		trace.FinalScores = cloneScores(allScores)
-		baseScore := 0.0
-		if base != nil && base.AllScores != nil {
-			baseScore = base.AllScores[current]
-		}
 		trace.CandidateTraces = map[string]SessionCandidateTrace{
 			current: {
 				Current:    true,
-				BaseScore:  baseScore,
-				FinalScore: allScores[current],
+				BaseScore:  currentScore,
+				FinalScore: currentScore,
 			},
 		}
 	}
 	result := &SelectionResult{
-		SelectedModel: current,
-		LoRAName:      loRA,
-		Score:         allScores[current],
-		Confidence:    1.0,
-		Method:        MethodSessionAware,
-		Tier:          TierSupported,
-		Reasoning:     fmt.Sprintf("session_aware: %s current=%s base=%s", reason, current, base.Method),
-		AllScores:     allScores,
-		SessionPolicy: trace,
+		SelectedModel:     current,
+		SelectedCandidate: ref,
+		CandidateScores:   scores,
+		LoRAName:          loRA,
+		Score:             currentScore,
+		Confidence:        1.0,
+		Method:            MethodSessionAware,
+		Tier:              TierSupported,
+		Reasoning:         fmt.Sprintf("session_aware: %s current=%s base=%s", reason, current, base.Method),
+		AllScores:         allScores,
+		SessionPolicy:     trace,
 	}
-	return result
+	return result, nil
 }
 
 func (s *SessionAwareSelector) newPolicyTrace(
@@ -360,6 +378,9 @@ func (s *SessionAwareSelector) newPolicyTrace(
 		StayBias:      s.config.StayBias,
 		IdleExpired:   idleExpired,
 		DecisionDrift: decisionDrift,
+	}
+	if selCtx != nil {
+		trace.CandidateModels = getModelNames(selCtx.CandidateModels)
 	}
 	if base != nil {
 		trace.BaseMethod = string(base.Method)
@@ -403,22 +424,4 @@ func (s *SessionAwareSelector) newPolicyTrace(
 		trace.SessionID = selCtx.SessionID
 	}
 	return trace
-}
-
-func (s *SessionAwareSelector) UpdateFeedback(ctx context.Context, feedback *Feedback) error {
-	if s.baseSelector == nil {
-		return nil
-	}
-	return s.baseSelector.UpdateFeedback(ctx, feedback)
-}
-
-func (s *SessionAwareSelector) Tier() AlgorithmTier {
-	return TierSupported
-}
-
-func (s *SessionAwareSelector) ExternalDependencies() []Dependency {
-	if s.baseSelector == nil {
-		return nil
-	}
-	return s.baseSelector.ExternalDependencies()
 }

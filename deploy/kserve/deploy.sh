@@ -25,17 +25,8 @@ SIM_INFERENCESERVICE_B="model-b"
 MODEL_NAME_A="Model-A"
 MODEL_NAME_B="Model-B"
 STORAGE_CLASS=""
-MODELS_PVC_SIZE="10Gi"
+MODELS_PVC_SIZE="20Gi"
 CACHE_PVC_SIZE="5Gi"
-# Embedding model directory for semantic caching and tools similarity.
-# Supported canonical options:
-#   - mom-embedding-ultra (default mmBERT 32K)
-#   - mom-embedding-pro   (Qwen3 embedding)
-#   - mom-embedding-flash (EmbeddingGemma)
-EMBEDDING_MODEL="mom-embedding-ultra"
-EMBEDDING_MODEL_REPO=""
-EMBEDDING_MODEL_TYPE="mmbert"
-EMBEDDING_MODEL_PATH_KEY="mmbert_model_path"
 DRY_RUN=false
 SKIP_VALIDATION=false
 CLASSIFIER_GPU=false
@@ -62,9 +53,8 @@ Optional:
   --sim-model-b NAME                 Simulator model name for B (default: Model-B)
   --classifier-gpu                   Run semantic router classifier on GPU
   -s, --storage-class CLASS          StorageClass for PVCs (default: cluster default)
-  --models-pvc-size SIZE             Size for models PVC (default: 10Gi)
+  --models-pvc-size SIZE             Size for models PVC (default: 20Gi)
   --cache-pvc-size SIZE              Size for cache PVC (default: 5Gi)
-  --embedding-model MODEL            Embedding model directory (default: mom-embedding-ultra)
   --dry-run                          Generate manifests without applying
   --skip-validation                  Skip pre-deployment validation
   -h, --help                         Show this help message
@@ -79,8 +69,8 @@ Examples:
   # Deploy simulator with GPU-backed classifier
   $0 -n semantic --simulator --classifier-gpu
 
-  # Deploy with custom storage class and a canonical embedding model
-  $0 -n myproject -i llama3-70b -m llama3-70b -s gp3-csi --embedding-model mom-embedding-flash
+  # Deploy with custom storage class
+  $0 -n myproject -i llama3-70b -m llama3-70b -s gp3-csi
 
   # Dry run to see what will be deployed
   $0 -n semantic -i granite32-8b -m granite32-8b --dry-run
@@ -108,8 +98,6 @@ substitute_vars() {
         -e "s|{{MODEL_NAME}}|$MODEL_NAME|g" \
         -e "s|{{MODEL_NAME_A}}|$MODEL_NAME_A|g" \
         -e "s|{{MODEL_NAME_B}}|$MODEL_NAME_B|g" \
-        -e "s|{{EMBEDDING_MODEL}}|$EMBEDDING_MODEL|g" \
-        -e "s|{{EMBEDDING_MODEL_REPO}}|$EMBEDDING_MODEL_REPO|g" \
         -e "s|{{PREDICTOR_SERVICE_IP}}|${PREDICTOR_SERVICE_IP:-10.0.0.1}|g" \
         -e "s|{{PREDICTOR_SERVICE_IP_A}}|${PREDICTOR_SERVICE_IP_A:-10.0.0.1}|g" \
         -e "s|{{PREDICTOR_SERVICE_IP_B}}|${PREDICTOR_SERVICE_IP_B:-10.0.0.1}|g" \
@@ -122,34 +110,6 @@ substitute_vars() {
         sed -i.bak "s/# storageClassName:.*/storageClassName: $STORAGE_CLASS/g" "$output_file"
         rm -f "${output_file}.bak"
     fi
-}
-
-resolve_embedding_settings() {
-    case "$1" in
-        mom-embedding-ultra|mmbert|mmbert-embedding|mmbert-embed-32k-2d-matryoshka)
-            EMBEDDING_MODEL="mom-embedding-ultra"
-            EMBEDDING_MODEL_REPO="llm-semantic-router/mmbert-embed-32k-2d-matryoshka"
-            EMBEDDING_MODEL_TYPE="mmbert"
-            EMBEDDING_MODEL_PATH_KEY="mmbert_model_path"
-            ;;
-        mom-embedding-pro|qwen3|qwen3-embedding)
-            EMBEDDING_MODEL="mom-embedding-pro"
-            EMBEDDING_MODEL_REPO="Qwen/Qwen3-Embedding-0.6B"
-            EMBEDDING_MODEL_TYPE="qwen3"
-            EMBEDDING_MODEL_PATH_KEY="qwen3_model_path"
-            ;;
-        mom-embedding-flash|gemma|embeddinggemma-300m)
-            EMBEDDING_MODEL="mom-embedding-flash"
-            EMBEDDING_MODEL_REPO="google/embeddinggemma-300m"
-            EMBEDDING_MODEL_TYPE="gemma"
-            EMBEDDING_MODEL_PATH_KEY="gemma_model_path"
-            ;;
-        *)
-            echo -e "${RED}Unsupported embedding model: $1${NC}"
-            echo "Use one of: mom-embedding-ultra, mom-embedding-pro, mom-embedding-flash"
-            exit 1
-            ;;
-    esac
 }
 
 patch_generated_router_config() {
@@ -218,10 +178,6 @@ while [[ $# -gt 0 ]]; do
             CACHE_PVC_SIZE="$2"
             shift 2
             ;;
-        --embedding-model)
-            EMBEDDING_MODEL="$2"
-            shift 2
-            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -239,8 +195,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-resolve_embedding_settings "$EMBEDDING_MODEL"
 
 # Validate required arguments
 if [ -z "$NAMESPACE" ]; then
@@ -281,7 +235,6 @@ else
     echo "  LLMInferenceService:    $INFERENCESERVICE_NAME"
     echo "  Model Name:             $MODEL_NAME"
 fi
-echo "  Embedding Model:        $EMBEDDING_MODEL"
 echo "  Storage Class:          ${STORAGE_CLASS:-<cluster default>}"
 echo "  Models PVC Size:        $MODELS_PVC_SIZE"
 echo "  Cache PVC Size:         $CACHE_PVC_SIZE"
@@ -511,20 +464,10 @@ else
     echo -e "${YELLOW}⚠ Missing configmap source: $CONFIGMAP_SRC${NC}"
 fi
 
-if [ "$EMBEDDING_MODEL" != "mom-embedding-ultra" ]; then
-    patch_generated_router_config "$TEMP_DIR/configmap-router-config.yaml" \
-      ".global.stores.semantic_cache.embedding_model = \"$EMBEDDING_MODEL_TYPE\" |
-       .global.model_catalog.embeddings.semantic.$EMBEDDING_MODEL_PATH_KEY = \"models/$EMBEDDING_MODEL\" |
-       .global.model_catalog.embeddings.semantic.embedding_config.model_type = \"$EMBEDDING_MODEL_TYPE\""
-    echo -e "${GREEN}✓${NC} Patched configmap-router-config.yaml for custom embedding model"
-fi
-
 if [ "$CLASSIFIER_GPU" = true ]; then
     patch_generated_router_config "$TEMP_DIR/configmap-router-config.yaml" \
-      ".global.model_catalog.modules.prompt_guard.use_cpu = false |
-       .global.model_catalog.modules.classifier.domain.use_cpu = false |
-       .global.model_catalog.modules.classifier.pii.use_cpu = false"
-    echo -e "${GREEN}✓${NC} Patched configmap-router-config.yaml for GPU classifier"
+      '.global.model_catalog.deployments.primary = {"provider": "model_runtime", "artifact": "vllm-sr/vela3-fast", "device": "auto"}'
+    echo -e "${GREEN}✓${NC} Patched configmap-router-config.yaml for a GPU decision model"
 fi
 
 if [ -f "$ENVOY_CONFIG_SRC" ]; then
@@ -534,7 +477,7 @@ else
     echo -e "${YELLOW}⚠ Missing envoy config source: $ENVOY_CONFIG_SRC${NC}"
 fi
 
-for file in serviceaccount.yaml pvc.yaml peerauthentication.yaml deployment.yaml service.yaml route.yaml; do
+for file in serviceaccount.yaml rbac.yaml pvc.yaml peerauthentication.yaml deployment.yaml service.yaml route.yaml; do
     if [ -f "$SCRIPT_DIR/$file" ]; then
         substitute_vars "$SCRIPT_DIR/$file" "$TEMP_DIR/$file"
         echo -e "${GREEN}✓${NC} Generated: $file"
@@ -596,6 +539,9 @@ if oc get deployment semantic-router-kserve -n "$NAMESPACE" &>/dev/null; then
 fi
 
 oc apply -f "$TEMP_DIR/serviceaccount.yaml" -n "$NAMESPACE"
+# Lets the config write API patch the router ConfigMap through the
+# Kubernetes API instead of the read-only mounted file (issue #3688).
+oc apply -f "$TEMP_DIR/rbac.yaml" -n "$NAMESPACE"
 oc apply -f "$TEMP_DIR/pvc.yaml" -n "$NAMESPACE"
 oc apply -f "$TEMP_DIR/configmap-router-config.yaml" -n "$NAMESPACE"
 oc apply -f "$TEMP_DIR/configmap-envoy-config.yaml" -n "$NAMESPACE"
@@ -629,18 +575,12 @@ for i in {1..60}; do
         fi
     fi
 
-    # Show init container progress
-    INIT_STATUS=$(oc get pods -l app=semantic-router -n "$NAMESPACE" -o jsonpath='{.items[0].status.initContainerStatuses[0].state.running}' 2>/dev/null || echo "")
-    if [ -n "$INIT_STATUS" ]; then
-        echo "  Initializing... (downloading models)"
-    else
-        echo "  Waiting for pod... ($i/60)"
-    fi
+    echo "  Waiting for pod... ($i/60)"
 
     if [ "$i" -eq 12 ]; then
         echo ""
-        echo "  Quick status (init logs):"
-        oc logs -l app=semantic-router -n "$NAMESPACE" -c model-downloader --tail=15 2>/dev/null || true
+        echo "  Quick status (router logs; the model runtime downloads its models at startup):"
+        oc logs -l app=semantic-router -n "$NAMESPACE" -c semantic-router --tail=15 2>/dev/null || true
         echo ""
     fi
 
@@ -654,7 +594,6 @@ if ! oc get pods -l app=semantic-router -n "$NAMESPACE" -o jsonpath='{.items[0].
     echo -e "${YELLOW}Warning: Pod may not be fully ready yet${NC}"
     echo "  Check status with: oc get pods -l app=semantic-router -n $NAMESPACE"
     echo "  View logs with: oc logs -l app=semantic-router -c semantic-router -n $NAMESPACE"
-    echo "  Init logs with: oc logs -l app=semantic-router -c model-downloader -n $NAMESPACE --tail=30"
 fi
 
 echo ""
@@ -685,7 +624,7 @@ echo "# 1. Test health endpoint"
 echo "curl -sk https://$API_ROUTE_URL/health"
 echo ""
 echo "# 2. Test classifier API"
-echo "curl -sk -X POST https://$API_ROUTE_URL/api/v1/classify/intent \\"
+echo "curl -sk -X POST https://$API_ROUTE_URL/api/v1/diagnostics/classify/intent \\"
 echo "  -H \"Content-Type: application/json\" \\"
 echo "  -d '{\"text\": \"What is machine learning?\"}'"
 echo ""

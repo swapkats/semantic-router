@@ -10,21 +10,57 @@ import (
 	"time"
 )
 
+// PhaseLoadingModelDeployments is the phase in which startup waits for the
+// Router-managed model deployments of the configuration to become ready.
+const PhaseLoadingModelDeployments = "loading_model_deployments"
+
 // State captures router startup readiness beyond process-level health.
+// While startup waits for Router-managed model deployments and once it is
+// ready, ModelDeployments lists them; PendingModels, ReadyModels and
+// TotalModels then count them, and during the model download phases they
+// count the downloaded models instead.
 type State struct {
-	Phase            string   `json:"phase"`
-	Ready            bool     `json:"ready"`
-	Message          string   `json:"message,omitempty"`
-	DownloadingModel string   `json:"downloading_model,omitempty"`
-	PendingModels    []string `json:"pending_models,omitempty"`
-	ReadyModels      int      `json:"ready_models,omitempty"`
-	TotalModels      int      `json:"total_models,omitempty"`
-	UpdatedAt        string   `json:"updated_at,omitempty"`
+	InstanceID        string                   `json:"instance_id,omitempty"`
+	Phase             string                   `json:"phase"`
+	Ready             bool                     `json:"ready"`
+	Message           string                   `json:"message,omitempty"`
+	DownloadingModel  string                   `json:"downloading_model,omitempty"`
+	PendingModels     []string                 `json:"pending_models,omitempty"`
+	ReadyModels       int                      `json:"ready_models,omitempty"`
+	TotalModels       int                      `json:"total_models,omitempty"`
+	ModelDeployments  []ModelDeploymentStatus  `json:"model_deployments,omitempty"`
+	EmbeddingProvider *EmbeddingProviderStatus `json:"embedding_provider,omitempty"`
+	UpdatedAt         string                   `json:"updated_at,omitempty"`
+}
+
+// ModelDeploymentStatus is one Router-managed model_runtime deployment: the
+// model it loads, the runtime process that serves it and the runtime's state
+// for it (starting, loading, warming, ready, failed, restarting, ...).
+type ModelDeploymentStatus struct {
+	Name     string `json:"name"`
+	Artifact string `json:"artifact,omitempty"`
+	Process  string `json:"process,omitempty"`
+	State    string `json:"state"`
+	Ready    bool   `json:"ready"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// EmbeddingProviderStatus exposes redacted embedding provider runtime state.
+type EmbeddingProviderStatus struct {
+	Mode           string `json:"mode,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Dimension      int    `json:"dimension,omitempty"`
+	APIKeyEnv      string `json:"api_key_env,omitempty"`
+	APIKeyEnvSet   *bool  `json:"api_key_env_set,omitempty"`
+	Healthy        *bool  `json:"healthy,omitempty"`
+	LastProbeError string `json:"last_probe_error,omitempty"`
+	LastCheckedAt  string `json:"last_checked_at,omitempty"`
 }
 
 // StatusWriter persists startup state so the dashboard (or other consumers)
 // can track router startup progress. Implementations include FileWriter
-// (local JSON file) and RedisWriter (shared key in Redis).
+// (local JSON file) and RedisWriter (expiring per-instance records in Redis).
 type StatusWriter interface {
 	Write(state State) error
 }

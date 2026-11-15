@@ -1,19 +1,6 @@
 import React from 'react'
+import ProductLoadingState from '../components/ProductLoadingState'
 
-const fallbackStyle: React.CSSProperties = {
-  alignItems: 'center',
-  color: 'var(--color-text-secondary)',
-  display: 'flex',
-  fontSize: '0.875rem',
-  justifyContent: 'center',
-  minHeight: '12rem',
-  width: '100%',
-}
-
-const RouteLoadingFallback: React.FC = () => (
-  <div aria-live="polite" role="status" style={fallbackStyle}>
-    Loading view...
-  </div>
-)
+const RouteLoadingFallback: React.FC = () => <ProductLoadingState label="Opening workspace" />
 
 export default RouteLoadingFallback

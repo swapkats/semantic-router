@@ -59,11 +59,16 @@ type ModelConfig struct {
 	// +kubebuilder:validation:MaxLength=100
 	Name string `json:"name" yaml:"name"`
 
-	// ReasoningFamily specifies the reasoning syntax family (e.g., "qwen3", "deepseek")
-	// Must be defined in the global static configuration's ReasoningFamilies
+	// Catalog optionally selects a repository built-in Model Card. Name remains
+	// the request-facing alias used by decisions.
 	// +optional
-	// +kubebuilder:validation:MaxLength=50
-	ReasoningFamily string `json:"reasoningFamily,omitempty" yaml:"reasoningFamily,omitempty"`
+	// +kubebuilder:validation:MaxLength=200
+	Catalog string `json:"catalog,omitempty" yaml:"catalog,omitempty"`
+
+	// Reasoning optionally selects a built-in family or defines the request
+	// projection for a custom model. Catalog-backed models normally omit it.
+	// +optional
+	Reasoning *ModelReasoning `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
 
 	// Pricing defines the cost structure for this model
 	// +optional
@@ -75,12 +80,64 @@ type ModelConfig struct {
 	LoRAs []LoRAConfig `json:"loras,omitempty" yaml:"loras,omitempty"`
 }
 
+// ModelReasoning selects a built-in reasoning family or defines an inline
+// request projection. Family and inline fields are mutually exclusive.
+type ModelReasoning struct {
+	// +optional
+	Family string `json:"family,omitempty" yaml:"family,omitempty"`
+
+	// +kubebuilder:validation:Enum=chat_template_kwargs;reasoning_effort;reasoning_mode;top_level_reasoning_effort
+	// +optional
+	Type string `json:"type,omitempty" yaml:"type,omitempty"`
+
+	// +optional
+	Parameter string `json:"parameter,omitempty" yaml:"parameter,omitempty"`
+
+	// +optional
+	ActivationParameter string `json:"activationParameter,omitempty" yaml:"activation_parameter,omitempty"`
+
+	// EffortFlags maps a logical effort to a boolean chat-template parameter.
+	// +optional
+	EffortFlags map[string]string `json:"effortFlags,omitempty" yaml:"effort_flags,omitempty"`
+
+	// +optional
+	Levels []string `json:"levels,omitempty" yaml:"levels,omitempty"`
+
+	// +optional
+	Default string `json:"default,omitempty" yaml:"default,omitempty"`
+
+	// +kubebuilder:validation:items:Enum=enabled;disabled;adaptive
+	// +optional
+	Modes []string `json:"modes,omitempty" yaml:"modes,omitempty"`
+
+	// +kubebuilder:validation:Enum=enabled;disabled;adaptive
+	// +optional
+	DefaultMode string `json:"defaultMode,omitempty" yaml:"default_mode,omitempty"`
+
+	// +optional
+	Disabled string `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+}
+
 // ModelPricing defines the pricing structure for a model
 type ModelPricing struct {
+	// Currency is the unit for all configured token prices
+	// +optional
+	Currency string `json:"currency,omitempty" yaml:"currency,omitempty"`
+
 	// InputTokenPrice is the cost per input token
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	InputTokenPrice float64 `json:"inputTokenPrice,omitempty" yaml:"inputTokenPrice,omitempty"`
+
+	// CachedInputTokenPrice is the cost per cached input token
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	CachedInputTokenPrice *float64 `json:"cachedInputTokenPrice,omitempty" yaml:"cachedInputTokenPrice,omitempty"`
+
+	// CacheWriteTokenPrice is the cost per input token written to prompt cache
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	CacheWriteTokenPrice *float64 `json:"cacheWriteTokenPrice,omitempty" yaml:"cacheWriteTokenPrice,omitempty"`
 
 	// OutputTokenPrice is the cost per output token
 	// +optional
@@ -131,7 +188,6 @@ type IntelligentPoolList struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=iroute
 // +kubebuilder:printcolumn:name="Decisions",type="integer",JSONPath=".status.statistics.decisions",description="Number of decisions"
 // +kubebuilder:printcolumn:name="Keywords",type="integer",JSONPath=".status.statistics.keywords",description="Number of keyword signals"
-// +kubebuilder:printcolumn:name="Embeddings",type="integer",JSONPath=".status.statistics.embeddings",description="Number of embedding signals"
 // +kubebuilder:printcolumn:name="Domains",type="integer",JSONPath=".status.statistics.domains",description="Number of domain signals"
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Ready status"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

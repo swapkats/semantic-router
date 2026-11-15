@@ -1,9 +1,9 @@
-import React, { useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import Layout from '@theme/Layout'
-import Link from '@docusaurus/Link'
 import Translate, { translate } from '@docusaurus/Translate'
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext'
 import { FaGithub } from 'react-icons/fa'
+import CommunityLayout from '@site/src/components/community/CommunityLayout'
 import {
   contributorRankData,
   contributorRankGeneratedAt,
@@ -13,6 +13,8 @@ import type {
   ContributorRankRange,
 } from '../../data/contributorRank.generated'
 import styles from './contributors.module.css'
+
+type SortBy = 'commits' | 'reviews'
 
 type RangeOption = {
   id: ContributorRankRange
@@ -31,44 +33,44 @@ const ContributorsPage: React.FC = () => {
       id: 'v03ToNow',
       label: translate({
         id: 'community.contributors.range.v03ToNow.label',
-        message: 'v0.3 -> Now',
+        message: 'v0.3 → Now',
       }),
       caption: translate({
         id: 'community.contributors.range.v03ToNow.caption',
-        message: 'Current release',
+        message: 'Since v0.3',
       }),
     },
     {
       id: 'v02ToV03',
       label: translate({
         id: 'community.contributors.range.v02ToV03.label',
-        message: 'v0.2 -> v0.3',
+        message: 'v0.2 → v0.3',
       }),
       caption: translate({
         id: 'community.contributors.range.v02ToV03.caption',
-        message: 'Release gap',
+        message: 'Between releases',
       }),
     },
     {
       id: 'v01ToV02',
       label: translate({
         id: 'community.contributors.range.v01ToV02.label',
-        message: 'v0.1 -> v0.2',
+        message: 'v0.1 → v0.2',
       }),
       caption: translate({
         id: 'community.contributors.range.v01ToV02.caption',
-        message: 'Release gap',
+        message: 'Between releases',
       }),
     },
     {
       id: 'v0ToV01',
       label: translate({
         id: 'community.contributors.range.v0ToV01.label',
-        message: 'v0 -> v0.1',
+        message: 'v0 → v0.1',
       }),
       caption: translate({
         id: 'community.contributors.range.v0ToV01.caption',
-        message: 'Initial release',
+        message: 'Project start',
       }),
     },
     {
@@ -85,9 +87,43 @@ const ContributorsPage: React.FC = () => {
   ]
 
   const [selectedRange, setSelectedRange] = useState<ContributorRankRange>('v03ToNow')
+  const [sortBy, setSortBy] = useState<SortBy>('commits')
   const snapshot = contributorRankData[selectedRange]
-  const topContributors = snapshot.entries.slice(0, 5)
   const selectedRangeLabel = rangeOptions.find(option => option.id === selectedRange)?.label ?? snapshot.label
+  const commitAuthors = snapshot.entries.filter(entry => entry.commits > 0).length
+
+  const rankedEntries = useMemo(() => {
+    const sorted = [...snapshot.entries].sort((left, right) => {
+      if (sortBy === 'reviews') {
+        if (right.reviews !== left.reviews) {
+          return right.reviews - left.reviews
+        }
+
+        if (right.commits !== left.commits) {
+          return right.commits - left.commits
+        }
+
+        return left.rank - right.rank
+      }
+
+      if (right.commits !== left.commits) {
+        return right.commits - left.commits
+      }
+
+      if (right.reviews !== left.reviews) {
+        return right.reviews - left.reviews
+      }
+
+      return left.rank - right.rank
+    })
+
+    return sorted.map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }))
+  }, [snapshot.entries, sortBy])
+
+  const topContributors = rankedEntries.slice(0, 5)
 
   return (
     <Layout
@@ -97,26 +133,13 @@ const ContributorsPage: React.FC = () => {
       })}
       description={translate({
         id: 'community.contributors.pageDescription',
-        message: 'vLLM Semantic Router contributor leaderboard by recent and historical repository commit activity.',
+        message: 'Explore vLLM Semantic Router contributors by commit and pull request review activity across release windows.',
       })}
     >
-      <main className={styles.container}>
-        <header className={styles.header}>
-          <div className={styles.titleBlock}>
-            <p className={styles.eyebrow}>
-              <Translate id="community.contributors.eyebrow">Community</Translate>
-            </p>
-            <div className={styles.titleRow}>
-              <h1>
-                <Translate id="community.contributors.h1">Contributor Leaderboard</Translate>
-              </h1>
-              <Link className={styles.contributeLink} to="/community/contributing">
-                <Translate id="community.contributors.startContributing">Start contributing</Translate>
-              </Link>
-            </div>
-          </div>
-        </header>
-
+      <CommunityLayout
+        activeKey="leaderboard"
+        title={<Translate id="community.contributors.h1">Contributor Leaderboard</Translate>}
+      >
         <section
           className={styles.metrics}
           aria-label={translate({ id: 'community.contributors.metrics.aria', message: 'Contributor rank summary' })}
@@ -126,12 +149,18 @@ const ContributorsPage: React.FC = () => {
             value={snapshot.totalContributors.toLocaleString(numberLocale)}
           />
           <Metric
-            label={translate({ id: 'community.contributors.metrics.newContributors', message: 'New Contributors' })}
-            value={snapshot.newContributors.toLocaleString(numberLocale)}
+            label={selectedRange === 'all'
+              ? translate({ id: 'community.contributors.metrics.commitAuthors', message: 'Commit authors' })
+              : translate({ id: 'community.contributors.metrics.newContributors', message: 'First-time commit authors' })}
+            value={(selectedRange === 'all' ? commitAuthors : snapshot.newContributors).toLocaleString(numberLocale)}
           />
           <Metric
             label={translate({ id: 'community.contributors.metrics.commits', message: 'Commits' })}
             value={snapshot.totalCommits.toLocaleString(numberLocale)}
+          />
+          <Metric
+            label={translate({ id: 'community.contributors.metrics.reviews', message: 'Reviews' })}
+            value={snapshot.totalReviews.toLocaleString(numberLocale)}
           />
         </section>
 
@@ -140,7 +169,12 @@ const ContributorsPage: React.FC = () => {
           aria-label={translate({ id: 'community.contributors.podium.aria', message: 'Contributor podium' })}
         >
           {topContributors.map(entry => (
-            <TopContributorCard key={`${snapshot.id}-top-${entry.rank}`} entry={entry} numberLocale={numberLocale} />
+            <TopContributorCard
+              key={`${snapshot.id}-top-${entry.rank}`}
+              entry={entry}
+              numberLocale={numberLocale}
+              sortBy={sortBy}
+            />
           ))}
         </section>
 
@@ -163,44 +197,92 @@ const ContributorsPage: React.FC = () => {
                 {' '}
                 {formatDate(contributorRankGeneratedAt, dateLocale)}
               </p>
+              <p className={styles.methodNote}>
+                <Translate id="community.contributors.method">
+                  Contributors include qualifying commit authors and reviewers. “New” means a first repository commit; reviews count once per contributor per merged pull request.
+                </Translate>
+              </p>
             </div>
-            <label className={styles.rangeSelectLabel}>
-              <span>
-                <Translate id="community.contributors.range.label">Range</Translate>
-              </span>
-              <select
-                className={styles.rangeSelect}
-                value={selectedRange}
-                aria-label={translate({
-                  id: 'community.contributors.range.aria',
-                  message: 'Contributor leaderboard release window',
-                })}
-                onChange={event => setSelectedRange(event.target.value as ContributorRankRange)}
-              >
-                {rangeOptions.map(option => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
+            <div className={styles.sectionControls}>
+              <label className={styles.rangeSelectLabel}>
+                <span>
+                  <Translate id="community.contributors.range.label">Range</Translate>
+                </span>
+                <select
+                  className={styles.rangeSelect}
+                  value={selectedRange}
+                  aria-label={translate({
+                    id: 'community.contributors.range.aria',
+                    message: 'Contributor leaderboard release window',
+                  })}
+                  onChange={event => setSelectedRange(event.target.value as ContributorRankRange)}
+                >
+                  {rangeOptions.map(option => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className={styles.rangeSelectLabel}>
+                <span>
+                  <Translate id="community.contributors.sort.label">Sort by</Translate>
+                </span>
+                <select
+                  className={styles.rangeSelect}
+                  value={sortBy}
+                  aria-label={translate({
+                    id: 'community.contributors.sort.aria',
+                    message: 'Contributor leaderboard sort order',
+                  })}
+                  onChange={event => setSortBy(event.target.value as SortBy)}
+                >
+                  <option value="commits">
+                    {translate({
+                      id: 'community.contributors.sort.commits',
+                      message: 'Commits',
+                    })}
                   </option>
-                ))}
-              </select>
-            </label>
+                  <option value="reviews">
+                    {translate({
+                      id: 'community.contributors.sort.reviews',
+                      message: 'Reviews',
+                    })}
+                  </option>
+                </select>
+              </label>
+            </div>
           </div>
 
           <div className={styles.rankListHeader} aria-hidden="true">
             <span><Translate id="community.contributors.table.rank">Rank</Translate></span>
             <span><Translate id="community.contributors.table.contributor">Contributor</Translate></span>
             <span><Translate id="community.contributors.table.commits">Commits</Translate></span>
-            <span><Translate id="community.contributors.table.share">Share</Translate></span>
-            <span><Translate id="community.contributors.table.latest">Latest</Translate></span>
+            <span><Translate id="community.contributors.table.reviews">Reviews</Translate></span>
+            <span>
+              {sortBy === 'reviews'
+                ? <Translate id="community.contributors.table.reviewShare">Review share</Translate>
+                : <Translate id="community.contributors.table.commitShare">Commit share</Translate>}
+            </span>
+            <span><Translate id="community.contributors.table.latest">Latest commit</Translate></span>
           </div>
 
           <div className={styles.rankList}>
-            {snapshot.entries.map(entry => (
-              <ContributorRow key={`${snapshot.id}-${entry.rank}-${entry.name}`} entry={entry} dateLocale={dateLocale} numberLocale={numberLocale} />
+            {rankedEntries.map(entry => (
+              <ContributorRow
+                key={`${snapshot.id}-${entry.rank}-${entry.name}`}
+                entry={entry}
+                dateLocale={dateLocale}
+                numberLocale={numberLocale}
+                showNewContributorStatus={selectedRange !== 'all'}
+                activityShare={sortBy === 'reviews'
+                  ? (snapshot.totalReviews > 0 ? entry.reviews / snapshot.totalReviews : 0)
+                  : entry.share}
+              />
             ))}
           </div>
         </section>
-      </main>
+      </CommunityLayout>
     </Layout>
   )
 }
@@ -212,33 +294,35 @@ const Metric: React.FC<{ label: string, value: string }> = ({ label, value }) =>
   </div>
 )
 
-const TopContributorCard: React.FC<{ entry: ContributorRankEntry, numberLocale: string }> = ({ entry, numberLocale }) => {
+const TopContributorCard: React.FC<{
+  entry: ContributorRankEntry
+  numberLocale: string
+  sortBy: SortBy
+}> = ({ entry, numberLocale, sortBy }) => {
   const profileUrl = entry.login ? `https://github.com/${entry.login}` : undefined
+  const activityCount = sortBy === 'reviews' ? entry.reviews : entry.commits
 
   return (
-    <article className={`${styles.podiumCard} ${getPodiumClass(entry.rank)}`}>
-      <div className={styles.podiumGlow} aria-hidden="true" />
+    <article className={styles.podiumCard}>
       <span className={styles.podiumRank}>{formatRankNumber(entry.rank)}</span>
-      <ContributorAvatar entry={entry} size="large" />
+      <ContributorAvatar entry={entry} />
       <div className={styles.podiumIdentity}>
-        <h3>{entry.name}</h3>
-        {profileUrl && entry.login
-          ? (
-              <a href={profileUrl} target="_blank" rel="noopener noreferrer">
-                <FaGithub aria-hidden="true" />
-                {entry.login}
-              </a>
-            )
-          : (
-              <span>
-                <Translate id="community.contributors.gitAuthor">Git author</Translate>
-              </span>
-            )}
+        <span className={styles.podiumName}>{entry.name}</span>
+        {profileUrl && entry.login && (
+          <a href={profileUrl} target="_blank" rel="noopener noreferrer">
+            <FaGithub aria-hidden="true" />
+            {entry.login}
+          </a>
+        )}
       </div>
-      <div className={styles.podiumStats}>
-        <strong>{entry.commits.toLocaleString(numberLocale)}</strong>
-        <span>{formatPercent(entry.share)}</span>
-      </div>
+      <span className={styles.podiumActivity}>
+        <strong>{activityCount.toLocaleString(numberLocale)}</strong>
+        <span>
+          {sortBy === 'reviews'
+            ? <Translate id="community.contributors.sort.reviews">Reviews</Translate>
+            : <Translate id="community.contributors.sort.commits">Commits</Translate>}
+        </span>
+      </span>
     </article>
   )
 }
@@ -247,23 +331,26 @@ const ContributorRow: React.FC<{
   entry: ContributorRankEntry
   numberLocale: string
   dateLocale: string
-}> = ({ entry, numberLocale, dateLocale }) => {
+  showNewContributorStatus: boolean
+  activityShare: number
+}> = ({ entry, numberLocale, dateLocale, showNewContributorStatus, activityShare }) => {
   const profileUrl = entry.login ? `https://github.com/${entry.login}` : undefined
-  const sharePercent = formatPercent(entry.share)
-  const barWidth = `${Math.max(entry.share * 100, 1.5)}%`
+  const sharePercent = formatPercent(activityShare)
+  const barWidth = activityShare > 0 ? `${Math.max(activityShare * 100, 1.5)}%` : '0%'
+  const isNewContributor = showNewContributorStatus && entry.isNewContributorSinceRelease
 
   return (
-    <article className={`${styles.rankItem} ${entry.isNewContributorSinceRelease ? styles.rankItemNew : ''}`}>
+    <article className={`${styles.rankItem} ${isNewContributor ? styles.rankItemNew : ''}`}>
       <span className={styles.rankBadge}>
         {formatRankNumber(entry.rank)}
       </span>
 
       <div className={styles.contributor}>
-        <ContributorAvatar entry={entry} size="compact" />
+        <ContributorAvatar entry={entry} />
         <div className={styles.identity}>
           <span className={styles.nameLine}>
             <span className={styles.name}>{entry.name}</span>
-            {entry.isNewContributorSinceRelease && (
+            {isNewContributor && (
               <span className={styles.newContributorPill}>
                 <Translate id="community.contributors.newContributor">New Contributor</Translate>
               </span>
@@ -289,6 +376,11 @@ const ContributorRow: React.FC<{
         <strong>{entry.commits.toLocaleString(numberLocale)}</strong>
       </div>
 
+      <div className={styles.statBlock}>
+        <span><Translate id="community.contributors.table.reviews">Reviews</Translate></span>
+        <strong>{entry.reviews.toLocaleString(numberLocale)}</strong>
+      </div>
+
       <div className={styles.share}>
         <span>{sharePercent}</span>
         <div className={styles.shareTrack} aria-hidden="true">
@@ -297,8 +389,8 @@ const ContributorRow: React.FC<{
       </div>
 
       <div className={styles.statBlock}>
-        <span><Translate id="community.contributors.table.latest">Latest</Translate></span>
-        <strong>{formatDate(entry.latestCommitDate, dateLocale)}</strong>
+        <span><Translate id="community.contributors.table.latest">Latest commit</Translate></span>
+        <strong>{entry.commits > 0 ? formatDate(entry.latestCommitDate, dateLocale) : '—'}</strong>
       </div>
     </article>
   )
@@ -306,8 +398,7 @@ const ContributorRow: React.FC<{
 
 const ContributorAvatar: React.FC<{
   entry: ContributorRankEntry
-  size: 'compact' | 'large'
-}> = ({ entry, size }) => {
+}> = ({ entry }) => {
   const [didFail, setDidFail] = useState(false)
   const fallbackUrl = createFallbackAvatar(entry.avatarSeed || entry.name)
   const githubAvatarUrl = entry.avatarUrl ?? (entry.avatarLogin ? `https://github.com/${entry.avatarLogin}.png?size=160` : undefined)
@@ -315,7 +406,7 @@ const ContributorAvatar: React.FC<{
 
   return (
     <img
-      className={`${styles.avatar} ${size === 'large' ? styles.avatarLarge : ''}`}
+      className={styles.avatar}
       src={avatarUrl}
       alt={translate({
         id: 'community.contributors.avatarAlt',
@@ -353,26 +444,6 @@ function formatPercent(value: number): string {
   }
 
   return `${(value * 100).toFixed(1)}%`
-}
-
-function getPodiumClass(rank: number): string {
-  if (rank === 1) {
-    return styles.podiumFirst
-  }
-
-  if (rank === 2) {
-    return styles.podiumSecond
-  }
-
-  if (rank === 3) {
-    return styles.podiumThird
-  }
-
-  if (rank === 4) {
-    return styles.podiumFourth
-  }
-
-  return styles.podiumFifth
 }
 
 function formatRankNumber(rank: number): string {

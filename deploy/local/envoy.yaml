@@ -1,3 +1,8 @@
+# Provider-neutral Envoy fixture for the dockerless local development stack.
+# It always forwards the router's selected model to the single local
+# OpenAI-compatible backend below. Provider-aware `vllm-sr serve` deployments
+# materialize their routes and clusters from the user config and model catalog;
+# do not add model-name or hosted-provider inventories to this file.
 static_resources:
   listeners:
   - name: listener_0
@@ -30,66 +35,66 @@ static_resources:
                   upstream_cluster: "%UPSTREAM_CLUSTER%"
                   upstream_local_address: "%UPSTREAM_LOCAL_ADDRESS%"
                   request_id: "%REQ(X-REQUEST-ID)%"
-                  selected_model: "%REQ(X-SELECTED-MODEL)%"
+                  selected_model: "%REQ(X-VSR-ROUTE-MODEL)%"
           route_config:
             name: local_route
             virtual_hosts:
             - name: local_service
               domains: ["*"]
-              # Security: strip internal headers from client requests to prevent
-              # looper bypass, identity spoofing, and credential leakage.
+              # Identity headers never reach the backend. Envoy removes them from
+              # the request it sends upstream, after the HTTP filters ran;
+              # client-sent identity is removed at ingress below.
               request_headers_to_remove:
-              - "x-vsr-looper-request"
-              - "x-vsr-looper-secret"
-              - "x-vsr-looper-decision"
-              - "x-vsr-looper-iteration"
               - "x-authz-user-id"
               - "x-authz-user-groups"
+              - "x-authz-team-id"
+              - "x-authz-tenant-id"
+              - "x-vsr-delegated-credential"
+              response_headers_to_add:
+              - header:
+                  key: "x-vsr-upstream-host"
+                  value: "%UPSTREAM_HOST%"
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
               routes:
-              # Anthropic API route (matches all claude-* models)
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      prefix: "claude-"
-                route:
-                  cluster: anthropic_api_cluster
-                  timeout: 300s
-                  host_rewrite_literal: "api.anthropic.com"
-              # OpenAI API route (matches gpt-* and o1-* and o3-* models)
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      safe_regex:
-                        regex: "^(gpt-|o1-|o3-|chatgpt-).*"
-                route:
-                  cluster: openai_api_cluster
-                  timeout: 300s
-                  host_rewrite_literal: "api.openai.com"
-              # Default route to the local vLLM cluster. ExtProc only emits the
-              # x-selected-model routing signal; Envoy owns endpoint load balancing.
+              # ExtProc emits the x-vsr-route-model routing signal; this local-only
+              # fixture deliberately has one upstream and needs no model inventory.
               - match:
                   prefix: "/"
                 route:
                   cluster: vllm_backend_cluster
                   timeout: 300s
           http_filters:
-          # ext_authz filter — validates Bearer token via Authorino (gRPC)
-          # On success, Authorino injects x-user-openai-key / x-user-anthropic-key headers
-          - name: envoy.filters.http.ext_authz
+          # No authenticator runs in front of this listener, so a client's
+          # identity headers are removed before the Router reads them.
+          - name: strip-client-identity
             typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-              grpc_service:
-                envoy_grpc:
-                  cluster_name: authorino_service
-              transport_api_version: V3
-              failure_mode_allow: false
+              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+              mutations:
+                request_mutations:
+                - remove: "x-authz-user-id"
+                - remove: "x-authz-user-groups"
+                - remove: "x-authz-team-id"
+                - remove: "x-authz-tenant-id"
+          # The delegated credential is an authenticator output, never a client
+          # input. Remove any client copy before ext_proc sees the request; the
+          # route-level removal above only runs at the router filter. This
+          # fixture runs no authenticator, and a custom
+          # global.services.authz.delegated_credential.header must be added here.
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  request_handle:headers():remove("x-vsr-delegated-credential")
+                end
           - name: envoy.filters.http.ext_proc
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+              # A decision's reliability block reaches Envoy's router through these
+              # per-request headers; ext_proc may set no other x-envoy-* header.
+              mutation_rules:
+                allow_expression:
+                  regex: "^x-envoy-(upstream-rq-timeout-ms|upstream-rq-per-try-timeout-ms|max-retries|retry-on|retriable-status-codes)$"
               grpc_service:
                 envoy_grpc:
                   cluster_name: extproc_service
@@ -101,6 +106,8 @@ static_resources:
                 response_body_mode: "BUFFERED"
                 request_trailer_mode: "SKIP"
                 response_trailer_mode: "SKIP"
+              response_attributes:
+              - "upstream.address"
               failure_mode_allow: true
               message_timeout: 300s
           - name: envoy.filters.http.router
@@ -160,70 +167,6 @@ static_resources:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
           http_protocol_options: {}
-
-  # Authorino authorization service (gRPC)
-  - name: authorino_service
-    connect_timeout: 5s
-    type: STRICT_DNS
-    lb_policy: ROUND_ROBIN
-    typed_extension_protocol_options:
-      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-        explicit_http_config:
-          http2_protocol_options: {}
-    load_assignment:
-      cluster_name: authorino_service
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 50052
-
-  # OpenAI API cluster
-  - name: openai_api_cluster
-    type: LOGICAL_DNS
-    dns_lookup_family: V4_ONLY
-    connect_timeout: 60s
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: openai_api_cluster
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: api.openai.com
-                port_value: 443
-            hostname: "api.openai.com"
-    transport_socket:
-      name: envoy.transport_sockets.tls
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: api.openai.com
-
-  # Anthropic API cluster
-  - name: anthropic_api_cluster
-    type: LOGICAL_DNS
-    dns_lookup_family: V4_ONLY
-    connect_timeout: 60s
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: anthropic_api_cluster
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: api.anthropic.com
-                port_value: 443
-            hostname: "api.anthropic.com"
-    transport_socket:
-      name: envoy.transport_sockets.tls
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: api.anthropic.com
 
 admin:
   address:

@@ -8,7 +8,8 @@ spec:
   defaultModel: "deepseek-v3"
   models:
     - name: "deepseek-v3"
-      reasoningFamily: "deepseek"
+      reasoning:
+        family: "deepseek"
       pricing:
         inputTokenPrice: 0.00000027  # $0.27 per 1M input tokens - efficient for semantic matching
         outputTokenPrice: 0.0000011  # $1.1 per 1M output tokens
@@ -17,7 +18,8 @@ spec:
           description: "Customer support specialist"
 
     - name: "deepseek-r1"
-      reasoningFamily: "deepseek"
+      reasoning:
+        family: "deepseek"
       pricing:
         inputTokenPrice: 0.00000055  # $0.55 per 1M input tokens - better reasoning
         outputTokenPrice: 0.0000022  # $2.2 per 1M output tokens
@@ -33,21 +35,15 @@ metadata:
   namespace: default
 spec:
   signals:
-    embeddings:
+    keywords:
       - name: "customer_support"
-        threshold: 0.75
-        candidates:
-          - "I need help with my account"
-          - "Can you assist me with a problem?"
-          - "I have a question about my order"
-        aggregationMethod: "max"
+        operator: "OR"
+        keywords: ["I need help with my account", "Can you assist me with a problem?", "I have a question about my order"]
+        caseSensitive: false
       - name: "technical_issue"
-        threshold: 0.80
-        candidates:
-          - "The system is not working properly"
-          - "I'm experiencing technical difficulties"
-          - "There's a bug in the application"
-        aggregationMethod: "mean"
+        operator: "OR"
+        keywords: ["The system is not working properly", "I'm experiencing technical difficulties", "There's a bug in the application"]
+        caseSensitive: false
 
   decisions:
     - name: "tech_troubleshoot"
@@ -56,7 +52,7 @@ spec:
       signals:
         operator: "AND"
         conditions:
-          - type: "embedding"
+          - type: "keyword"
             name: "technical_issue"
       modelRefs:
         - model: "deepseek-r1"
@@ -70,7 +66,7 @@ spec:
       signals:
         operator: "AND"
         conditions:
-          - type: "embedding"
+          - type: "keyword"
             name: "customer_support"
       modelRefs:
         - model: "deepseek-v3"

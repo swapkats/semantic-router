@@ -12,7 +12,10 @@ HELM_VALUES_FILE ?=
 HELM_SET_VALUES ?=
 HELM_TIMEOUT ?= 10m
 HELM_TEMPLATE_OUTPUT ?= /tmp/semantic-router-helm/default-template.yaml
+HELM_BACKEND_TARGET_VALUES ?= deploy/helm/testdata/backend-target-values.yaml
+HELM_BACKEND_TARGET_OUTPUT ?= /tmp/semantic-router-helm/backend-target-template.yaml
 HELM_REPO_UPDATE ?= true
+HELM_DEPENDENCIES_CACHED ?=
 
 # ── Remote OCI chart registry ────────────────────────────────────────────────
 # Used by helm-install-version, helm-upgrade-version, and related targets.
@@ -23,7 +26,7 @@ HELM_OCI_CHART    ?= $(HELM_OCI_REGISTRY)/semantic-router
 # CHART_VERSION: pin to an exact chart version for remote install/upgrade.
 #
 # Release channels:
-#   CHART_VERSION=0.3.0              specific release — recommended for production
+#   CHART_VERSION=0.4.0              specific release — recommended for production
 #   CHART_VERSION=0.0.0-latest       latest main-branch build
 #   CHART_VERSION=0.0.0-nightly.YYYYMMDD  specific nightly
 #
@@ -52,8 +55,8 @@ _assert-chart-version:
 	@if [ -z "$(CHART_VERSION)" ]; then \
 		echo "$(RED)[ERROR]$(NC) CHART_VERSION is required for this target."; \
 		echo "$(BLUE)[INFO]$(NC) Set it to a specific release, e.g.:"; \
-		echo "  make helm-install-version  CHART_VERSION=0.3.0"; \
-		echo "  make helm-upgrade-version  CHART_VERSION=0.3.0"; \
+		echo "  make helm-install-version  CHART_VERSION=0.4.0"; \
+		echo "  make helm-upgrade-version  CHART_VERSION=0.4.0"; \
 		echo "  make helm-install-version  CHART_VERSION=0.0.0-nightly.20260115"; \
 		exit 1; \
 	fi
@@ -121,30 +124,19 @@ helm-template:
 helm-ci-setup: ## Prepare Helm repositories and chart dependencies for CI-style validation
 helm-ci-setup:
 	@$(LOG_TARGET)
-	@if [ "$(HELM_REPO_UPDATE)" = "true" ]; then \
-		helm repo add bitnami https://charts.bitnami.com/bitnami --force-update; \
-		helm repo add milvus https://milvus-io.github.io/milvus-helm/ --force-update; \
-		helm repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update; \
-		helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update; \
-		helm repo add grafana https://grafana.github.io/helm-charts --force-update; \
-		helm repo update; \
-		helm dependency build $(HELM_CHART_PATH); \
-	else \
-		echo "$(YELLOW)[WARN]$(NC) Skipping helm repo add/update; using Chart.lock dependency versions"; \
-		helm dependency build $(HELM_CHART_PATH) --skip-refresh; \
-	fi
+	@HELM_REPO_UPDATE="$(HELM_REPO_UPDATE)" HELM_DEPENDENCIES_CACHED="$(HELM_DEPENDENCIES_CACHED)" \
+		deploy/helm/fetch-dependencies.sh $(HELM_CHART_PATH)
 
 helm-ci-validate: ## Run the CI Helm lint and template validation flow
-helm-ci-validate: helm-ci-setup
+helm-ci-validate: helm-ci-setup $(HARNESS_VENV_DEPS)
 	@$(LOG_TARGET)
 	@$(MAKE) helm-lint
-	@mkdir -p "$$(dirname "$(HELM_TEMPLATE_OUTPUT)")"
+	@mkdir -p "$$(dirname "$(HELM_TEMPLATE_OUTPUT)")" "$$(dirname "$(HELM_BACKEND_TARGET_OUTPUT)")"
 	@helm template $(HELM_RELEASE_NAME) $(HELM_CHART_PATH) \
 		$(if $(HELM_VALUES_FILE),-f $(HELM_VALUES_FILE)) \
 		$(if $(HELM_SET_VALUES),--set $(HELM_SET_VALUES)) \
 		--namespace $(HELM_NAMESPACE) > "$(HELM_TEMPLATE_OUTPUT)"
-	@python3 -c "import yamllint" >/dev/null 2>&1 || python3 -m pip install --user yamllint
-	@python3 -m yamllint -d '{extends: default, rules: {line-length: {max: 120}, indentation: {spaces: 2}}}' "$(HELM_TEMPLATE_OUTPUT)" || echo "Some yamllint warnings are expected for Helm templates"
+	@"$(AGENT_PYTHON)" -m yamllint -d '{extends: default, rules: {line-length: {max: 120}, indentation: {spaces: 2}}}' "$(HELM_TEMPLATE_OUTPUT)" || echo "Some yamllint warnings are expected for Helm templates"
 	@required_resources="ServiceAccount PersistentVolumeClaim ConfigMap Deployment Service"; \
 	for resource in $$required_resources; do \
 		if grep -q "kind: $$resource" "$(HELM_TEMPLATE_OUTPUT)"; then \
@@ -154,6 +146,35 @@ helm-ci-validate: helm-ci-setup
 			exit 1; \
 		fi; \
 	done
+	@helm template backend-target-release $(HELM_CHART_PATH) \
+		-f "$(HELM_BACKEND_TARGET_VALUES)" \
+		--namespace $(HELM_NAMESPACE) > "$(HELM_BACKEND_TARGET_OUTPUT)"
+	@for field in \
+		"endpoint: https://provider.example/v1" \
+		"provider_model_id: provider/model-id" \
+		"api_key_env: PROVIDER_API_KEY" \
+		"X-Tenant: production" \
+		"chat_path: /chat/completions" \
+		"weight: 75"; do \
+		if ! grep -q "$$field" "$(HELM_BACKEND_TARGET_OUTPUT)"; then \
+			echo "Backend target field was not preserved: $$field"; \
+			exit 1; \
+		fi; \
+		done
+	@"$(AGENT_PYTHON)" tools/ci/check_backend_target_compatibility.py \
+		--rendered-helm "$(HELM_BACKEND_TARGET_OUTPUT)"
+	@echo "Backend target compatibility rendering verified"
+	@helm template model-runtime-release $(HELM_CHART_PATH) \
+		-f deploy/helm/testdata/model-runtime-values.yaml \
+		> "$(dir $(HELM_TEMPLATE_OUTPUT))model-runtime-template.yaml"
+	@"$(AGENT_PYTHON)" deploy/helm/check-model-runtime.py "$(dir $(HELM_TEMPLATE_OUTPUT))model-runtime-template.yaml"
+	@echo "Model deployment and recipe binding rendering verified"
+	@"$(AGENT_PYTHON)" deploy/helm/check-gateway-mode.py $(HELM_CHART_PATH)
+	@echo "Standalone and extproc gateway modes verified"
+	@"$(AGENT_PYTHON)" -m unittest discover -s deploy/helm -p test_data_volume.py -v
+	@"$(AGENT_PYTHON)" -m unittest discover -s deploy/helm -p test_shutdown_grace.py -v
+	@"$(AGENT_PYTHON)" -m unittest discover -s deploy/helm -p test_grafana_live.py -v
+	@"$(AGENT_PYTHON)" -m unittest discover -s deploy/helm -p test_fetch_dependencies.py -v
 	@echo "$(GREEN)[SUCCESS]$(NC) Helm CI validation completed successfully"
 
 helm-safety-validate: ## Validate Helm schema and local-state safety guards
@@ -326,13 +347,13 @@ helm-test: _check-k8s
 	@echo "$(GREEN)[SUCCESS]$(NC) Helm release test completed"
 
 helm-package: ## Package the Helm chart
-helm-package:
+helm-package: helm-ci-setup
 	@$(LOG_TARGET)
 	@mkdir -p ./dist
 	@tmp_dir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	cp -a $(HELM_CHART_PATH) "$$tmp_dir/chart"; \
-	helm package -u "$$tmp_dir/chart" --destination ./dist
+	helm package "$$tmp_dir/chart" --destination ./dist
 	@echo "$(GREEN)[SUCCESS]$(NC) Helm chart packaged successfully"
 	@ls -lh ./dist/semantic-router-*.tgz
 
@@ -444,8 +465,8 @@ _check-k8s:
 		echo "  - For remote clusters: check your kubeconfig and cluster connection"; \
 		echo ""; \
 		echo "$(YELLOW)[TIP]$(NC) You can use the following commands to start a local cluster:"; \
-		echo "  - minikube: make kube-up"; \
-		echo "  - kind: make kind-cluster-create"; \
+		echo "  - minikube: minikube start"; \
+		echo "  - kind: make create-cluster"; \
 		exit 1; \
 	fi
 	@echo "$(GREEN)[✓]$(NC) Kubernetes cluster is accessible"

@@ -1,47 +1,46 @@
 package classification
 
 import (
-	"fmt"
-	"runtime"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/embedding"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
 
 type classifierOptionBuilder struct {
-	cfg                *config.RouterConfig
-	options            []option
-	multiModalInitOnce sync.Once
-	multiModalInitErr  error
+	cfg              *config.RouterConfig
+	models           *classifierModelRuntime
+	embeddingSet     *embedding.Set
+	ownsEmbeddingSet bool
+	options          []option
+	providerInitOnce sync.Once
+	providerErr      error
 }
 
 func newClassifierOptionBuilder(cfg *config.RouterConfig, options []option) *classifierOptionBuilder {
 	return &classifierOptionBuilder{cfg: cfg, options: options}
 }
 
-func (b *classifierOptionBuilder) build(categoryMapping *CategoryMapping) ([]option, error) {
+func (b *classifierOptionBuilder) build() ([]option, error) {
+	if err := b.prepareEmbeddingSet(); err != nil {
+		return nil, err
+	}
+	if b.cfg.IsDefaultRecipe(b.cfg.RoutingScope) && !b.cfg.IsRecipeReachableForRouting(b.cfg.RoutingScope) {
+		return b.options, nil
+	}
 	steps := []func() (option, error){
 		b.buildKeywordClassifierOption,
-		b.buildEmbeddingClassifierOption,
 		b.buildContextClassifierOption,
-		b.buildStructureClassifierOption,
-		b.buildReaskClassifierOption,
-		b.buildComplexityClassifierOption,
-		b.buildContrastiveJailbreakClassifiersOption,
 		b.buildAuthzClassifierOption,
-		b.buildKBClassifiersOption,
-		b.buildEventClassifierOption,
 	}
 	parallelOptions, err := b.buildParallelOptions(steps)
+	b.options = append(b.options, parallelOptions...)
 	if err != nil {
 		return nil, err
 	}
-	b.options = append(b.options, parallelOptions...)
-	b.addCategoryClassifier(categoryMapping)
-	b.addMCPCategoryClassifier()
 	return b.options, nil
 }
 
@@ -67,9 +66,7 @@ func (b *classifierOptionBuilder) buildParallelOptions(steps []func() (option, e
 		})
 	}
 
-	if err := group.Wait(); err != nil {
-		return nil, err
-	}
+	err := group.Wait()
 
 	options := make([]option, 0, len(results))
 	for _, opt := range results {
@@ -77,64 +74,26 @@ func (b *classifierOptionBuilder) buildParallelOptions(steps []func() (option, e
 			options = append(options, opt)
 		}
 	}
-	return options, nil
+	return options, err
 }
 
-func classifierBuildParallelism(stepCount int) int {
-	if stepCount <= 1 {
-		return 1
-	}
-	backend := embeddingBackendOverride()
-	if backend == "" || backend == "candle" {
-		return 1
-	}
-	parallelism := runtime.NumCPU()
-	if parallelism <= 0 {
-		parallelism = 1
-	}
-	if parallelism > stepCount {
-		parallelism = stepCount
-	}
-	return parallelism
-}
-
-func (b *classifierOptionBuilder) initMultiModalIfNeeded(reason string) error {
-	b.multiModalInitOnce.Do(func() {
-		mmPath := config.ResolveModelPath(b.cfg.MultiModalModelPath)
-		if mmPath == "" {
-			b.multiModalInitErr = fmt.Errorf("%s requires embedding_models.multimodal_model_path to be set", reason)
-			return
+// Options carry ownership into the final classifier. A failed build applies
+// the completed options to an unpublished shell solely to release that same
+// ownership, including successful parallel steps after a sibling failed.
+func (b *classifierOptionBuilder) closePending() {
+	classifier := &Classifier{Config: b.cfg, embeddingSet: b.embeddingSet, ownsEmbeddingSet: b.ownsEmbeddingSet}
+	for _, option := range b.options {
+		if option != nil {
+			option(classifier)
 		}
-		if err := initMultiModalModel(mmPath, b.cfg.UseCPU); err != nil {
-			b.multiModalInitErr = fmt.Errorf("failed to initialize multimodal model for %s: %w", reason, err)
-			return
-		}
-		logging.ComponentEvent("classifier", "multimodal_embedding_initialized", map[string]interface{}{
-			"reason":    reason,
-			"model_ref": mmPath,
-			"use_cpu":   b.cfg.UseCPU,
-		})
-	})
-	return b.multiModalInitErr
-}
-
-func (b *classifierOptionBuilder) defaultEmbeddingModelType() string {
-	modelType := b.cfg.EmbeddingConfig.ModelType
-	if modelType == "" {
-		return "qwen3"
 	}
-	return modelType
+	_ = classifier.Close()
 }
 
 func (c *Classifier) logHeuristicClassifierInitialization() {
 	if c.contextClassifier != nil {
 		logging.ComponentEvent("classifier", "context_classifier_initialized", map[string]interface{}{
 			"rules": len(c.contextClassifier.rules),
-		})
-	}
-	if c.structureClassifier != nil {
-		logging.ComponentEvent("classifier", "structure_classifier_initialized", map[string]interface{}{
-			"rules": len(c.structureClassifier.rules),
 		})
 	}
 }
